@@ -237,27 +237,34 @@ class BatteryEnvMasked(gym.Env):
 
         # I check for real Long/Short imbalance settlement prices
         if 'long' in self.df.columns and 'short' in self.df.columns:
-            # Long price = what you receive for positive imbalance (like best_bid)
-            # Short price = what you pay for negative imbalance (like best_ask)
             long_price = row.get('long', dam_price)
             short_price = row.get('short', dam_price)
 
-            # I handle placeholder values (163.8 = constant from 2021-2024 data)
-            # If Long/Short are constant placeholders, use mFRR or synthetic
-            if abs(long_price - 163.8) < 0.1 and abs(short_price - 163.8) < 0.1:
-                # Placeholder data - try mFRR as fallback
-                if 'mfrr_up' in self.df.columns and 'mfrr_down' in self.df.columns:
-                    short_price = row.get('mfrr_up', dam_price * 1.15)
-                    long_price = row.get('mfrr_down', dam_price * 0.85)
-                else:
-                    # Synthetic spread based on DAM price
-                    long_price = dam_price * 0.85   # 15% below DAM for long
-                    short_price = dam_price * 1.15  # 15% above DAM for short
+            # I check if Long/Short are actually differentiated (useful data)
+            # If Long = Short (or placeholder 163.8), I create synthetic spread from mFRR
+            needs_synthetic = (
+                abs(long_price - short_price) < 0.1 or  # Long = Short (useless)
+                (abs(long_price - 163.8) < 0.1 and abs(short_price - 163.8) < 0.1)  # 2021-2024 placeholder
+            )
+
+            if needs_synthetic:
+                # I create realistic synthetic spread based on mFRR activation prices
+                # mFRR_Up = cost to activate upward reserves (system short)
+                # mFRR_Down = cost to activate downward reserves (system long)
+                mfrr_up = row.get('mfrr_up', dam_price * 1.3)
+                mfrr_down = row.get('mfrr_down', dam_price * 0.7)
+
+                # Synthetic spread: 30% of the distance to mFRR prices
+                # Short penalty: move toward mFRR_Up (you pay more when system needs power)
+                # Long penalty: move toward mFRR_Down (you receive less when system has excess)
+                spread_factor = 0.30
+                short_price = dam_price + spread_factor * abs(mfrr_up - dam_price)
+                long_price = dam_price - spread_factor * abs(dam_price - mfrr_down)
 
             # I ensure reasonable bounds
             # Short price should be >= DAM (penalty for being short)
             short_price = max(short_price, dam_price)
-            # Long price should be <= DAM (penalty for being long)
+            # Long price should be <= DAM (less favorable for surplus)
             long_price = min(long_price, dam_price)
             # No negative prices
             long_price = max(0.1, long_price)
@@ -314,6 +321,8 @@ class BatteryEnvMasked(gym.Env):
         # Get market state and calculate reward
         row = self.df.iloc[self.current_step]
         dam_comm_mw = row.get('dam_commitment', 0.0)
+        # I clip DAM commitment to battery's physical limits (data may have impossible values)
+        dam_comm_mw = np.clip(dam_comm_mw, -self.max_power_mw, self.max_power_mw)
         market = self._get_market_state()
 
         violation_mw = abs(req_phy_mw - actual_phy_mw)
@@ -325,7 +334,10 @@ class BatteryEnvMasked(gym.Env):
         for i in range(1, 13):  # I fixed: was range(1,5), now matches 12h observation lookahead
             step_offset = int(i / self.time_step_hours)
             target = min(self.current_step + step_offset, len(self.df) - 1)
-            dam_commitments.append(self.df.iloc[target].get('dam_commitment', 0.0))
+            future_dam = self.df.iloc[target].get('dam_commitment', 0.0)
+            # I clip future DAM to battery limits too
+            future_dam = np.clip(future_dam, -self.max_power_mw, self.max_power_mw)
+            dam_commitments.append(future_dam)
 
         shortfall_info = self.feature_engine.calculate_shortfall_risk(
             battery_soc=self.current_soc,
@@ -439,11 +451,14 @@ class BatteryEnvMasked(gym.Env):
             mean_24h = self.price_mean_24h[self.current_step] * (1 + np.random.normal(0, self.forecast_err_24h))
         
         # DAM Commitments - Extended to 12 hours for better planning
+        # I clip all DAM commitments to battery's physical limits
         dam_commitments = []
         for i in range(1, 13):  # 12 steps ahead
             step_offset = int(i / self.time_step_hours)
             target = min(self.current_step + step_offset, len(self.df)-1)
-            dam_commitments.append(self.df.iloc[target].get('dam_commitment', 0.0))
+            future_dam = self.df.iloc[target].get('dam_commitment', 0.0)
+            future_dam = np.clip(future_dam, -self.max_power_mw, self.max_power_mw)
+            dam_commitments.append(future_dam)
 
         # Price Lookahead - 12 hours of future prices for strategic planning
         # v14: Use ML forecaster if available, otherwise use standard method
@@ -471,11 +486,14 @@ class BatteryEnvMasked(gym.Env):
         afrr_up = row.get('afrr_up_mw', 600.0)
         afrr_down = row.get('afrr_down_mw', 130.0)
 
+        # I clip current DAM commitment to battery limits
+        current_dam = np.clip(row.get('dam_commitment', 0.0), -self.max_power_mw, self.max_power_mw)
+
         market_state = MarketStateDTO(
             timestamp=pd.Timestamp(row.name),
             price=current_price,
             spread=self.base_spread,
-            dam_commitment_now=row.get('dam_commitment', 0.0),
+            dam_commitment_now=current_dam,
             next_price=next_price,
             price_max_24h=max_24h,
             price_min_24h=min_24h,
