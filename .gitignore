@@ -1,0 +1,31 @@
+# Environment
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+logs/
+logs_daily/
+*.log
+nul
+
+# Large files
+*.zip
+*.pkl
+models/checkpoints/
+
+# Temporary
+*.tmp
+*.bak
+
+# Data (keep structure, ignore large CSVs)
+# data/*.csv
+
+# Claude session files
+.claude/
