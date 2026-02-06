@@ -52,7 +52,9 @@ class BatteryEnvMasked(gym.Env):
         reward_config: dict = None,
         # v14: Use ML forecaster for price lookahead (realistic training)
         use_ml_forecaster: bool = False,
-        forecaster_path: str = "models/intraday_forecaster.pkl"
+        forecaster_path: str = "models/intraday_forecaster.pkl",
+        # v20: Price awareness features (adds 2 extra obs features)
+        include_price_awareness: bool = True
     ):
         super().__init__()
 
@@ -104,26 +106,30 @@ class BatteryEnvMasked(gym.Env):
         self.action_space = spaces.Discrete(self.n_actions)
         self.action_levels = np.linspace(-1.0, 1.0, self.n_actions)
         
-        # Observation space (38 features):
-        # Battery(3) + Market(3) + Time(2) + Price Lookahead(12) + DAM Lookahead(12) + Imbalance Risk(3) + Shortfall Risk(1) + aFRR(2)
+        # Observation space (44 features):
+        # Battery(3) + Market(3) + Time(2) + Price Lookahead(12) + DAM Lookahead(12)
+        # + Imbalance Risk(3) + Shortfall Risk(1) + aFRR(2) + Timing(4) + Price Awareness(2)
         self.lookahead_hours = 12  # Extended lookahead for better planning
         self.strategic_lookahead_hours = 24  # Strategic price horizon in hours
         self.lookahead_steps = int(self.lookahead_hours / self.time_step_hours)  # 12 for hourly
         self.strategic_lookahead = int(self.strategic_lookahead_hours / self.time_step_hours)  # 24 for hourly
-        feature_count = 42  # v13: 8 base + 12 price + 12 DAM + 6 risk/aFRR + 4 timing
+        # I track whether to include v20 price awareness features (2 extra obs)
+        self.include_price_awareness = include_price_awareness
+        feature_count = 44 if include_price_awareness else 42
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(feature_count,), dtype=np.float32)
-        
+
         # Feature Engineer
         from agent.feature_engineer import FeatureEngineer
         self.feature_engine = FeatureEngineer(config={
             'capacity_mwh': self.capacity_mwh,
             'max_power_mw': self.max_power_mw,
             'efficiency': self.efficiency,
-            'time_step_hours': self.time_step_hours
+            'time_step_hours': self.time_step_hours,
+            'include_price_awareness': include_price_awareness
         })
         
-        # Pre-compute statistics for each step
-        self._precompute_24h_stats()
+        # Pre-compute BACKWARD statistics for each step (v21: no future data leakage)
+        self._precompute_backward_stats()
         
         # Pre-compute imbalance data for FeatureEngineer
         self._prepare_imbalance_data()
@@ -146,23 +152,98 @@ class BatteryEnvMasked(gym.Env):
             forecast_mode = f"REALISTIC (err_1h={self.forecast_err_1h:.0%}, err_24h={self.forecast_err_24h:.0%})"
         print(f"Masked Environment Initialized: {self.n_actions} actions | {time_res} | lookahead={self.lookahead_steps} steps | Forecast: {forecast_mode}")
 
-    def _precompute_24h_stats(self):
-        """Pre-compute 24h rolling statistics for strategic lookahead."""
+    def _precompute_backward_stats(self):
+        """
+        v21: Pre-compute BACKWARD-LOOKING statistics (past-only).
+
+        I replaced the original _precompute_24h_stats() which looked at FUTURE prices
+        (data leakage). Now all statistics use only past data, which is what a real
+        trader would have access to in production.
+
+        Computes:
+        - price_max_24h[i]: max price in past 24h (or available history)
+        - price_min_24h[i]: min price in past 24h (or available history)
+        - price_mean_24h[i]: mean price in past 24h (or available history)
+        - price_vs_typical_hour[i]: current vs 30-day mean at this hour
+        - trade_worthiness[i]: 30-day avg daily spread / 100
+        """
         prices = self.df['price'].values if 'price' in self.df.columns else np.ones(len(self.df)) * 100
         n = len(prices)
-        
-        self.price_max_24h = np.zeros(n)
-        self.price_min_24h = np.zeros(n)
-        self.price_mean_24h = np.zeros(n)
-        
+        window = self.strategic_lookahead  # 24 steps (hours)
+
+        # I use vectorized rolling for backward stats (efficient)
+        price_series = pd.Series(prices)
+        # I use min_periods=1 so early steps still get valid stats from available history
+        rolling = price_series.rolling(window=window, min_periods=1)
+
+        self.price_max_24h = rolling.max().values
+        self.price_min_24h = rolling.min().values
+        self.price_mean_24h = rolling.mean().values
+
+        # v21: Trader-inspired feature 1 — price_vs_typical_hour
+        # I compute the 30-day rolling mean price for each hour of day.
+        # "How does the current price compare to what this hour usually costs?"
+        self.price_vs_typical_hour = np.zeros(n)
+
+        # I extract hour-of-day from the DataFrame index or from step position
+        if hasattr(self.df.index, 'hour'):
+            hours = self.df.index.hour
+        else:
+            hours = np.array([(i % 24) for i in range(n)])
+
+        # I build a 30-day (720 steps) rolling mean per hour
+        # For efficiency, I compute the running average for each hour bucket
+        hourly_sums = np.zeros(24)
+        hourly_counts = np.zeros(24)
+        typical_price_by_hour = np.full(24, np.nan)
+
+        lookback_30d = int(30 * 24 / self.time_step_hours)  # 720 for hourly
+
         for i in range(n):
-            end_idx = min(i + self.strategic_lookahead, n)
-            future_prices = prices[i+1:end_idx] if i+1 < end_idx else [prices[i]]
-            if len(future_prices) == 0:
-                future_prices = [prices[i]]
-            self.price_max_24h[i] = np.max(future_prices)
-            self.price_min_24h[i] = np.min(future_prices)
-            self.price_mean_24h[i] = np.mean(future_prices)
+            h = hours[i]
+            hourly_sums[h] += prices[i]
+            hourly_counts[h] += 1
+
+            # I remove values older than 30 days from the running average
+            if i >= lookback_30d:
+                old_h = hours[i - lookback_30d]
+                hourly_sums[old_h] -= prices[i - lookback_30d]
+                hourly_counts[old_h] -= 1
+
+            # I compute typical price for this hour
+            if hourly_counts[h] > 0:
+                typical = hourly_sums[h] / hourly_counts[h]
+                if typical > 1.0:
+                    self.price_vs_typical_hour[i] = np.clip(
+                        (prices[i] - typical) / typical, -1.0, 1.0
+                    )
+                else:
+                    self.price_vs_typical_hour[i] = 0.0
+            else:
+                self.price_vs_typical_hour[i] = 0.0
+
+        # v21: Trader-inspired feature 2 — trade_worthiness
+        # I compute the 30-day average daily spread (max-min per day).
+        # "Is this a volatile period where trading is profitable?"
+        self.trade_worthiness = np.zeros(n)
+        steps_per_day = int(24 / self.time_step_hours)
+
+        # I compute daily spreads, then rolling 30-day average
+        daily_spreads = []
+        for i in range(n):
+            # I look at the past 24h to compute today's spread so far
+            start = max(0, i - steps_per_day + 1)
+            day_prices = prices[start:i + 1]
+            daily_spread = np.max(day_prices) - np.min(day_prices)
+            daily_spreads.append(daily_spread)
+
+        daily_spreads = np.array(daily_spreads)
+        # I use a 30-day rolling mean of daily spreads
+        spread_series = pd.Series(daily_spreads)
+        avg_spread = spread_series.rolling(window=lookback_30d, min_periods=steps_per_day).mean().fillna(0).values
+
+        # I normalize by 100€ to keep in [0, 1] range
+        self.trade_worthiness = np.clip(avg_spread / 100.0, 0.0, 1.0)
 
     def _prepare_imbalance_data(self):
         """Pre-load data arrays for FeatureEngineer."""
@@ -361,11 +442,17 @@ class BatteryEnvMasked(gym.Env):
             # v13 timing rewards
             peak_sell_bonus=rc.get('peak_sell_bonus', 10.0),
             early_sell_penalty=rc.get('early_sell_penalty', 15.0),
-            early_sell_threshold=rc.get('early_sell_threshold', 1.3)
+            early_sell_threshold=rc.get('early_sell_threshold', 1.3),
+            # v16 price quartile awareness
+            quartile_sell_cheap_penalty=rc.get('quartile_sell_cheap_penalty', 15.0),
+            quartile_buy_expensive_penalty=rc.get('quartile_buy_expensive_penalty', 15.0),
+            quartile_good_trade_bonus=rc.get('quartile_good_trade_bonus', 8.0)
         )
 
-        # I get mean price for timing bonus calculation
+        # I get price stats for timing and quartile calculations
         mean_24h = self.price_mean_24h[self.current_step] if self.current_step < len(self.price_mean_24h) else 100.0
+        min_24h = self.price_min_24h[self.current_step] if self.current_step < len(self.price_min_24h) else 50.0
+        max_24h = self.price_max_24h[self.current_step] if self.current_step < len(self.price_max_24h) else 150.0
 
         # v13: Calculate max future price for lookahead timing reward
         max_future_price = row.get('price', 100.0)  # Default to current
@@ -387,7 +474,10 @@ class BatteryEnvMasked(gym.Env):
             price_mean_24h=mean_24h,
             # v13 lookahead timing
             max_future_price=max_future_price,
-            has_dam_now=has_dam_now
+            has_dam_now=has_dam_now,
+            # v16 price quartile awareness
+            price_min_24h=min_24h,
+            price_max_24h=max_24h
         )
         
         reward = reward_info['reward']
@@ -422,33 +512,20 @@ class BatteryEnvMasked(gym.Env):
         # Forecast components (Apply noise if needed)
         current_price = row.get('price', 100.0)
         
+        # v21: Backward stats are past-only, so they are always "known" — no perfect/noisy distinction needed
+        max_24h = self.price_max_24h[self.current_step]
+        min_24h = self.price_min_24h[self.current_step]
+        mean_24h = self.price_mean_24h[self.current_step]
+
         if self.use_perfect_forecast:
-            # PERFECT MODE
+            # PERFECT MODE — only next_price uses future data (forecast)
             next_price = self.df.iloc[min(self.current_step + 1, len(self.df) - 1)].get('price', current_price)
-            max_24h = self.price_max_24h[self.current_step]
-            min_24h = self.price_min_24h[self.current_step]
-            mean_24h = self.price_mean_24h[self.current_step]
         else:
-            # NOISY MODE (Simplified for readability, logic matches previous implementation)
-            # Re-implementing simplified noise injection here or moving to FeatureEngineer?
-            # Ideally, Env handles "Sensors" (adding noise), FeatureEngineer handles "Processing".
-            # So we keep noise injection HERE.
-            
-            # ... (Noise injection logic omitted for brevity, assuming perfect for now or copying) ...
-            # For this refactor, let's keep it simple and assume the noise logic stays here 
-            # OR we pass noise parameters to FeatureEngineer?
-            # Better: Keep raw noisy values here.
-            
-            # --- Quick Noisy Logic Re-implementation ---
+            # NOISY MODE — I add noise to the 1-step forecast
             next_price_raw = self.df.iloc[min(self.current_step + 1, len(self.df) - 1)].get('price', current_price)
             vol = self.price_volatility[self.current_step]
             err = self.forecast_err_1h * (1 + vol/50.0)
             next_price = next_price_raw * (1 + np.random.normal(0, err))
-            
-            # 24h stats noise
-            max_24h = self.price_max_24h[self.current_step] * (1 + np.random.normal(0, self.forecast_err_24h))
-            min_24h = self.price_min_24h[self.current_step] * (1 + np.random.normal(0, self.forecast_err_24h))
-            mean_24h = self.price_mean_24h[self.current_step] * (1 + np.random.normal(0, self.forecast_err_24h))
         
         # DAM Commitments - Extended to 12 hours for better planning
         # I clip all DAM commitments to battery's physical limits
@@ -489,6 +566,10 @@ class BatteryEnvMasked(gym.Env):
         # I clip current DAM commitment to battery limits
         current_dam = np.clip(row.get('dam_commitment', 0.0), -self.max_power_mw, self.max_power_mw)
 
+        # v21: I pass trader-inspired signals from backward pre-computation
+        pvt = self.price_vs_typical_hour[self.current_step]
+        tw = self.trade_worthiness[self.current_step]
+
         market_state = MarketStateDTO(
             timestamp=pd.Timestamp(row.name),
             price=current_price,
@@ -502,7 +583,9 @@ class BatteryEnvMasked(gym.Env):
             price_lookahead=price_lookahead,
             volatility=self.price_volatility[self.current_step],
             afrr_up_mw=afrr_up,
-            afrr_down_mw=afrr_down
+            afrr_down_mw=afrr_down,
+            price_vs_typical_hour=pvt,
+            trade_worthiness=tw
         )
         
         # 2. Get History Slices for Imbalance Risk

@@ -20,10 +20,11 @@ class MarketStateDTO:
     # Forecast (Next Step)
     next_price: float
 
-    # Forecast (24h Statistics)
-    price_max_24h: float
-    price_min_24h: float
-    price_mean_24h: float
+    # v21: Backward-looking statistics (past-only, no data leakage)
+    # I replaced forward-looking price_max/min/mean_24h with backward stats
+    price_max_24h: float   # Past 24h max (backward-looking)
+    price_min_24h: float   # Past 24h min (backward-looking)
+    price_mean_24h: float  # Past 24h mean (backward-looking)
 
     # Lookahead (DAM Commitments) - Extended to 12 hours
     dam_commitments: List[float]  # Next 12 hours
@@ -39,6 +40,11 @@ class MarketStateDTO:
     # High aFRR_Down = system expects surplus = good for charge
     afrr_up_mw: float = 600.0
     afrr_down_mw: float = 130.0
+
+    # v21: Trader-inspired signals (past-only, no leakage)
+    # I compute these from historical data, not future prices
+    price_vs_typical_hour: float = 0.0   # Current vs 30-day mean at this hour [-1, 1]
+    trade_worthiness: float = 0.0        # 30-day avg daily spread / 100 [0, 1]
 
     def __post_init__(self):
         if self.price_lookahead is None:
@@ -59,7 +65,10 @@ class FeatureEngineer:
         self.max_power_mw = self.config.get('max_power_mw', 30.0)
         self.efficiency = self.config.get('efficiency', 0.94)
         self.time_step_hours = self.config.get('time_step_hours', 1.0)
-        
+
+        # v20: I control whether price awareness features are included
+        self.include_price_awareness = self.config.get('include_price_awareness', True)
+
         # SoC constraints
         self.min_soc = 0.05
         self.max_soc = 0.95
@@ -310,5 +319,23 @@ class FeatureEngineer:
                 dam_slot_ratio = dam_slot_price / max(current_price, 1.0)
                 break
         obs.append(min(dam_slot_ratio, 2.0) / 2.0)  # 26. DAM slot ratio (cap at 2x)
+
+        # 27-28. v21 TRADER-INSPIRED SIGNALS (conditional, past-only)
+        # I replaced v20's leaky price_percentile/price_vs_mean with causal features.
+        # These use ONLY past data — no future price information leaks into observations.
+        if self.include_price_awareness:
+            # Feature 43: price_vs_typical_hour
+            # I compare current price to the 30-day mean at this hour of day.
+            # A trader would know "electricity at 18:00 usually costs 85€, now it's 120€".
+            # Positive = expensive for this hour (sell), Negative = cheap (buy).
+            price_vs_typical = max(-1.0, min(1.0, market.price_vs_typical_hour))
+            obs.append(price_vs_typical)  # 27. Price vs typical hour [-1, 1]
+
+            # Feature 44: trade_worthiness
+            # I use the 30-day average daily spread (max-min per day) as a measure of
+            # "is today a good day to trade?". High spread = volatile = profitable day.
+            # Normalized by 100€ to keep in [0, 1] range.
+            trade_worth = max(0.0, min(1.0, market.trade_worthiness))
+            obs.append(trade_worth)  # 28. Trade worthiness [0, 1]
 
         return np.array(obs, dtype=np.float32)
