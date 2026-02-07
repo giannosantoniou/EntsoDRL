@@ -54,7 +54,7 @@ class BatteryController:
         # Get normalization config from provider
         self.norm_config = data_provider.get_normalization_config()
         
-        print(f"🎮 BatteryController initialized")
+        print(f" BatteryController initialized")
         print(f"   Data Provider: {type(data_provider).__name__}")
         print(f"   Strategy: {strategy.name}")
         print(f"   Actions: {n_actions}")
@@ -163,7 +163,7 @@ class BatteryController:
             interval_seconds: Time between cycles (default 15 minutes)
             max_cycles: Maximum number of cycles (None = infinite)
         """
-        print(f"\n🚀 Starting continuous control loop")
+        print(f"\n Starting continuous control loop")
         print(f"   Interval: {interval_seconds}s ({interval_seconds/60:.1f} min)")
         print(f"   Max cycles: {max_cycles or 'infinite'}")
         print("=" * 50)
@@ -177,15 +177,15 @@ class BatteryController:
                 print(f"\n--- Cycle {cycle_count} ---")
                 result = self.run_cycle()
                 
-                print(f"  📊 Price: {result.price:.2f}€/MWh")
-                print(f"  🔋 SoC: {result.soc:.2%}")
-                print(f"  ⚡ Action: {result.action_index} ({result.mw_setpoint:+.1f} MW)")
-                print(f"  🧠 Strategy: {result.strategy_name}")
+                print(f"   Price: {result.price:.2f}€/MWh")
+                print(f"   SoC: {result.soc:.2%}")
+                print(f"   Action: {result.action_index} ({result.mw_setpoint:+.1f} MW)")
+                print(f"   Strategy: {result.strategy_name}")
                 
                 # Advance to next step (for simulation)
                 has_more = self.provider.step()
                 if not has_more:
-                    print("\n⚠️ No more data available. Stopping.")
+                    print("\n No more data available. Stopping.")
                     break
                 
                 # Wait for next cycle (skip in simulation)
@@ -193,6 +193,6 @@ class BatteryController:
                     time.sleep(interval_seconds)
                     
         except KeyboardInterrupt:
-            print("\n\n⛔ Control loop interrupted by user.")
+            print("\n\n Control loop interrupted by user.")
         
-        print(f"\n✅ Control loop completed. Total cycles: {cycle_count}")
+        print(f"\n Control loop completed. Total cycles: {cycle_count}")

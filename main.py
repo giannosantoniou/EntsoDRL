@@ -31,7 +31,7 @@ CONFIG = {
     # Mode: TRAINING (CSV simulation) or PRODUCTION (Live API)
     "MODE": "TRAINING",
     
-    # Strategy: AI, RULE_BASED, RANDOM, CONSERVATIVE
+    # Strategy: AI, RULE_BASED, RANDOM, CONSERVATIVE, AGGRESSIVE_HYBRID
     "STRATEGY": "AI",
     
     # Paths
@@ -62,8 +62,8 @@ def main():
     parser = argparse.ArgumentParser(description='Battery Trading System v2.0')
     parser.add_argument('--mode', choices=['training', 'production'], 
                         default='training', help='Operating mode')
-    parser.add_argument('--strategy', choices=['ai', 'rule', 'random', 'conservative'],
-                        default='ai', help='Decision strategy')
+    parser.add_argument('--strategy', choices=['ai', 'rule', 'random', 'conservative', 'hybrid'],
+                        default='ai', help='Decision strategy (hybrid = AggressiveHybrid from backtesting)')
     parser.add_argument('--model', type=str, default=None,
                         help='Path to AI model (overrides config)')
     parser.add_argument('--cycles', type=int, default=None,
@@ -74,8 +74,13 @@ def main():
     if args.mode:
         CONFIG["MODE"] = args.mode.upper()
     if args.strategy:
-        strategy_map = {'ai': 'AI', 'rule': 'RULE_BASED', 
-                       'random': 'RANDOM', 'conservative': 'CONSERVATIVE'}
+        strategy_map = {
+            'ai': 'AI',
+            'rule': 'RULE_BASED',
+            'random': 'RANDOM',
+            'conservative': 'CONSERVATIVE',
+            'hybrid': 'AGGRESSIVE_HYBRID'
+        }
         CONFIG["STRATEGY"] = strategy_map[args.strategy]
     if args.model:
         CONFIG["MODEL_PATH"] = args.model
@@ -83,7 +88,7 @@ def main():
         CONFIG["MAX_CYCLES"] = args.cycles
     
     print("=" * 60)
-    print("🔋 Battery Trading System v2.0")
+    print(" Battery Trading System v2.0")
     print("=" * 60)
     print(f"   Mode:     {CONFIG['MODE']}")
     print(f"   Strategy: {CONFIG['STRATEGY']}")
@@ -94,7 +99,7 @@ def main():
     # 1. SETUP DATA PROVIDER (THE BODY)
     # ------------------------------------------------
     if CONFIG["MODE"] == "TRAINING":
-        print("\n📊 Loading training data...")
+        print("\n Loading training data...")
         try:
             df = load_historical_data(CONFIG["DATA_FILE"])
             
@@ -114,7 +119,7 @@ def main():
             print(f"   Rows: {len(test_df):,}")
             
         except FileNotFoundError:
-            print(f"❌ Error: Data file {CONFIG['DATA_FILE']} not found.")
+            print(f" Error: Data file {CONFIG['DATA_FILE']} not found.")
             sys.exit(1)
         
         provider = SimulatedDataProvider(
@@ -124,8 +129,8 @@ def main():
         )
         
     else:  # PRODUCTION
-        print("\n🏭 Initializing production mode...")
-        print("⚠️  WARNING: LiveDataProvider requires API/PLC clients!")
+        print("\n Initializing production mode...")
+        print("  WARNING: LiveDataProvider requires API/PLC clients!")
         
         # In production, you would pass real clients here:
         # provider = LiveDataProvider(
@@ -134,14 +139,14 @@ def main():
         #     forecast_service=ForecastService(endpoint="...")
         # )
         
-        print("❌ Production mode not yet implemented.")
+        print(" Production mode not yet implemented.")
         print("   Please configure API clients in main.py")
         sys.exit(1)
 
     # ------------------------------------------------
     # 2. SETUP STRATEGY (THE BRAIN)
     # ------------------------------------------------
-    print(f"\n🧠 Loading strategy: {CONFIG['STRATEGY']}...")
+    print(f"\n Loading strategy: {CONFIG['STRATEGY']}...")
     try:
         strategy = create_strategy(
             strategy_type=CONFIG["STRATEGY"],
@@ -150,13 +155,13 @@ def main():
             n_actions=CONFIG["N_ACTIONS"]
         )
     except Exception as e:
-        print(f"❌ Error loading strategy: {e}")
+        print(f" Error loading strategy: {e}")
         sys.exit(1)
 
     # ------------------------------------------------
     # 3. SETUP CONTROLLER (THE NERVOUS SYSTEM)
     # ------------------------------------------------
-    print("\n🎮 Initializing controller...")
+    print("\n Initializing controller...")
     controller = BatteryController(
         data_provider=provider,
         strategy=strategy,
@@ -167,7 +172,7 @@ def main():
     # ------------------------------------------------
     # 4. RUN (LOOP)
     # ------------------------------------------------
-    print(f"\n🚀 System Online!")
+    print(f"\n System Online!")
     print(f"   Interval: {CONFIG['CYCLE_INTERVAL']}s")
     print(f"   Max Cycles: {CONFIG['MAX_CYCLES'] or 'infinite'}")
     
@@ -177,9 +182,9 @@ def main():
             max_cycles=CONFIG["MAX_CYCLES"]
         )
     except KeyboardInterrupt:
-        print("\n\n⛔ System stopped by user.")
+        print("\n\n System stopped by user.")
     
-    print("\n✅ Battery Trading System shutdown complete.")
+    print("\n Battery Trading System shutdown complete.")
 
 
 if __name__ == "__main__":
