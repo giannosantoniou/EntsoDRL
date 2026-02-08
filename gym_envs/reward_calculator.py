@@ -40,7 +40,21 @@ class RewardCalculator:
         # v13: Lookahead timing rewards
         peak_sell_bonus: float = 10.0,              # Bonus for selling at/near peak
         early_sell_penalty: float = 15.0,           # Penalty for selling when better prices coming
-        early_sell_threshold: float = 1.3           # Penalty if max_future > current * threshold
+        early_sell_threshold: float = 1.3,          # Penalty if max_future > current * threshold
+        # v16: Price quartile awareness - penalize bad price decisions (ADDITIVE - deprecated)
+        quartile_sell_cheap_penalty: float = 15.0,  # Penalty for selling in Q1 (cheap)
+        quartile_buy_expensive_penalty: float = 15.0,  # Penalty for buying in Q4 (expensive)
+        quartile_good_trade_bonus: float = 8.0,      # Bonus for good quartile trades
+        # v18: MULTIPLICATIVE approach - scales with profit magnitude
+        use_multiplicative_quartile: bool = False,  # Enable v18 multiplicative mode
+        bad_trade_profit_multiplier: float = 0.3,   # Reduce profit by 70% for bad trades
+        good_trade_profit_multiplier: float = 1.5,  # Boost profit by 50% for good trades
+        # v19: Direct charge cost manipulation - affects actual balancing revenue
+        use_charge_cost_scaling: bool = False,      # Enable v19 charge cost scaling
+        expensive_charge_multiplier: float = 1.5,   # Multiply charge cost when price > 70th percentile
+        cheap_charge_multiplier: float = 0.7,       # Multiply charge cost when price < 30th percentile
+        charge_expensive_threshold: float = 0.7,    # Price percentile above which charging is "expensive"
+        charge_cheap_threshold: float = 0.3         # Price percentile below which charging is "cheap"
     ):
         self.deg_cost_per_mwh = deg_cost_per_mwh
         self.violation_penalty = violation_penalty
@@ -55,6 +69,20 @@ class RewardCalculator:
         self.peak_sell_bonus = peak_sell_bonus
         self.early_sell_penalty = early_sell_penalty
         self.early_sell_threshold = early_sell_threshold
+        # v16 price quartile awareness (additive)
+        self.quartile_sell_cheap_penalty = quartile_sell_cheap_penalty
+        self.quartile_buy_expensive_penalty = quartile_buy_expensive_penalty
+        self.quartile_good_trade_bonus = quartile_good_trade_bonus
+        # v18 multiplicative approach
+        self.use_multiplicative_quartile = use_multiplicative_quartile
+        self.bad_trade_profit_multiplier = bad_trade_profit_multiplier
+        self.good_trade_profit_multiplier = good_trade_profit_multiplier
+        # v19 direct charge cost scaling
+        self.use_charge_cost_scaling = use_charge_cost_scaling
+        self.expensive_charge_multiplier = expensive_charge_multiplier
+        self.cheap_charge_multiplier = cheap_charge_multiplier
+        self.charge_expensive_threshold = charge_expensive_threshold
+        self.charge_cheap_threshold = charge_cheap_threshold
 
     def calculate(
         self,
@@ -67,7 +95,10 @@ class RewardCalculator:
         price_mean_24h: float = None, # I added this for price timing bonus (v10)
         # v13: Lookahead info for timing rewards
         max_future_price: float = None,  # Max price in next 12 hours
-        has_dam_now: bool = False        # Whether current hour has DAM commitment
+        has_dam_now: bool = False,       # Whether current hour has DAM commitment
+        # v16: Price range for quartile calculation
+        price_min_24h: float = None,
+        price_max_24h: float = None
     ) -> dict:
         """
         Calculate P&L with proper imbalance settlement.
@@ -147,6 +178,33 @@ class RewardCalculator:
             # Perfect execution
             balancing_revenue = 0.0
 
+        # v19: Direct charge cost scaling
+        # I manipulate the ACTUAL cost of charging based on price percentile
+        # This affects net_profit directly, not as a separate penalty
+        charge_cost_multiplier = 1.0
+        if self.use_charge_cost_scaling and actual_physical < -0.5:  # Charging
+            # Calculate price percentile if we have the data
+            if price_min_24h is not None and price_max_24h is not None:
+                current_price = market_state.dam_price
+                price_range = price_max_24h - price_min_24h
+                if price_range > 1.0:
+                    price_pct = (current_price - price_min_24h) / price_range
+                    price_pct = max(0.0, min(1.0, price_pct))
+
+                    # Only apply to IntraDay (no DAM commitment)
+                    if not has_dam_now:
+                        if price_pct > self.charge_expensive_threshold:
+                            # Charging at expensive prices - increase perceived cost
+                            charge_cost_multiplier = self.expensive_charge_multiplier
+                        elif price_pct < self.charge_cheap_threshold:
+                            # Charging at cheap prices - decrease perceived cost
+                            charge_cost_multiplier = self.cheap_charge_multiplier
+
+            # Apply multiplier to balancing_revenue (which is negative for charging)
+            # Multiplying negative by >1 makes it more negative (higher cost)
+            # Multiplying negative by <1 makes it less negative (lower cost)
+            balancing_revenue = balancing_revenue * charge_cost_multiplier
+
         # 3. Degradation Cost (only for ACTUAL physical activity)
         degradation = abs(actual_physical) * self.deg_cost_per_mwh
 
@@ -215,8 +273,63 @@ class RewardCalculator:
                 upside_missed = (price_ratio - 1.0)  # e.g., 0.5 for 50% upside
                 lookahead_timing = -self.early_sell_penalty * upside_missed * (actual_physical / 30.0)
 
-        # 11. Total Reward
-        total_reward = net_profit + penalty - proactive_penalty + soc_bonus + timing_bonus + lookahead_timing
+        # 11. v16/v18: Price Quartile Awareness
+        # I penalize selling in Q1 (cheap) and buying in Q4 (expensive)
+        # This teaches the agent to respect basic buy-low-sell-high logic
+        quartile_adjustment = 0.0
+        price_percentile = 0.5  # Default to middle
+        profit_multiplier = 1.0  # v18: multiplicative approach
+
+        if price_min_24h is not None and price_max_24h is not None:
+            current_price = market_state.dam_price
+            price_range = price_max_24h - price_min_24h
+
+            if price_range > 1.0:  # Avoid division by zero
+                price_percentile = (current_price - price_min_24h) / price_range
+                price_percentile = max(0.0, min(1.0, price_percentile))  # Clamp to [0, 1]
+
+                # Only apply to IntraDay trades (no DAM commitment)
+                if not has_dam_now:
+                    is_bad_trade = False
+                    is_good_trade = False
+
+                    if actual_physical > 0.5:  # Discharging (selling)
+                        if price_percentile < 0.25:
+                            is_bad_trade = True  # Selling cheap
+                        elif price_percentile > 0.75:
+                            is_good_trade = True  # Selling expensive
+
+                    elif actual_physical < -0.5:  # Charging (buying)
+                        if price_percentile > 0.75:
+                            is_bad_trade = True  # Buying expensive
+                        elif price_percentile < 0.25:
+                            is_good_trade = True  # Buying cheap
+
+                    # v18: Apply MULTIPLICATIVE penalty/bonus
+                    if self.use_multiplicative_quartile:
+                        if is_bad_trade:
+                            # I reduce the profit significantly for bad trades
+                            profit_multiplier = self.bad_trade_profit_multiplier
+                        elif is_good_trade:
+                            # I boost the profit for good trades
+                            profit_multiplier = self.good_trade_profit_multiplier
+                    else:
+                        # v16: Original ADDITIVE approach
+                        if actual_physical > 0.5:  # Selling
+                            if price_percentile < 0.25:
+                                quartile_adjustment = -self.quartile_sell_cheap_penalty * (0.25 - price_percentile) * 4
+                            elif price_percentile > 0.75:
+                                quartile_adjustment = self.quartile_good_trade_bonus * (price_percentile - 0.75) * 4
+                        elif actual_physical < -0.5:  # Buying
+                            if price_percentile > 0.75:
+                                quartile_adjustment = -self.quartile_buy_expensive_penalty * (price_percentile - 0.75) * 4
+                            elif price_percentile < 0.25:
+                                quartile_adjustment = self.quartile_good_trade_bonus * (0.25 - price_percentile) * 4
+
+        # 12. Total Reward
+        # v18: Apply multiplicative factor to net_profit before adding other components
+        adjusted_profit = net_profit * profit_multiplier
+        total_reward = adjusted_profit + penalty - proactive_penalty + soc_bonus + timing_bonus + lookahead_timing + quartile_adjustment
 
         return {
             "reward": total_reward / 100.0,  # Scale for NN
@@ -230,7 +343,12 @@ class RewardCalculator:
                 "soc_bonus": soc_bonus,
                 "timing_bonus": timing_bonus,  # v10
                 "lookahead_timing": lookahead_timing,  # v13 - peak/early sell reward
-                "net_profit": net_profit,
+                "quartile_adj": quartile_adjustment,  # v16 - price quartile penalty/bonus
+                "price_pct": price_percentile,  # v16 - for debugging
+                "profit_mult": profit_multiplier,  # v18 - multiplicative factor applied
+                "charge_cost_mult": charge_cost_multiplier,  # v19 - charge cost scaling factor
+                "net_profit": net_profit,  # Original profit before multiplier
+                "adjusted_profit": adjusted_profit,  # v18 - profit after multiplier
                 "spread": spread,
                 "spread_loss": spread_loss,
                 "imbalance_mw": imbalance_mw,
