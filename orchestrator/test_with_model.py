@@ -128,15 +128,35 @@ def test_with_trained_model():
         # Expand to 15-min resolution
         base_prices = np.repeat(hourly_pattern, 4)
 
-    # Add realistic variation
-    intraday_prices = base_prices + np.random.uniform(-15, 15, 96)
+    # Add realistic variation (simulate IntraDay prices different from DAM)
+    # IntraDay prices typically have more volatility and can deviate from DAM
+    np.random.seed(123)  # For reproducibility
+    id_variation = np.random.uniform(-20, 20, 96)
+    intraday_prices = base_prices + id_variation
     orchestrator.update_intraday_prices(intraday_prices)
 
-    id_result = orchestrator.run_intraday(datetime.now())
+    # Start IntraDay session
+    orchestrator.start_intraday_session(tomorrow)
+
+    # Run IntraDay with auto-execution
+    id_result = orchestrator.run_intraday(
+        current_time=datetime.now(),
+        auto_execute=True,
+        min_profit_eur=5.0,
+    )
+
     print(f"  IntraDay opportunities found: {id_result['total_opportunities']}")
+    print(f"  Orders executed: {id_result['executed_orders']}")
+    print(f"  Session P&L: {id_result['session_pnl_eur']:+.0f} EUR")
+
+    if id_result['executed_details']:
+        print("  Executed orders:")
+        for order in id_result['executed_details'][:5]:
+            print(f"    {order['delivery']}: {order['power_mw']:+.1f} MW @ "
+                  f"{order['fill_price']:.1f} EUR (P&L: {order['pnl_eur']:+.1f} EUR)")
 
     if id_result['top_opportunities']:
-        print("  Top 3 opportunities:")
+        print("  Top 3 remaining opportunities:")
         for i, opp in enumerate(id_result['top_opportunities'][:3]):
             print(f"    {i+1}. {opp['delivery_time'].strftime('%H:%M')}: "
                   f"{opp['action']} (spread: {opp['spread']:+.1f} EUR)")
@@ -226,13 +246,18 @@ def test_with_trained_model():
     print(f"  mFRR Bought:  {mfrr_buy:7.1f} MWh")
     print(f"  Avg aFRR:     {avg_afrr:7.1f} MW")
 
+    # Close IntraDay session and get P&L
+    id_session = orchestrator.close_intraday_session()
+    total_intraday_pnl = id_session.get('total_pnl_eur', 0)
+
     print(f"\nRevenue Breakdown:")
-    print(f"  DAM Revenue:  {total_dam_revenue:+10.0f} EUR")
-    print(f"  mFRR Revenue: {total_mfrr_revenue:+10.0f} EUR")
-    print(f"  aFRR Value:   {total_afrr_value:+10.0f} EUR")
-    print(f"  -----------------------------")
-    total_revenue = total_dam_revenue + total_mfrr_revenue + total_afrr_value
-    print(f"  TOTAL:        {total_revenue:+10.0f} EUR")
+    print(f"  DAM Revenue:     {total_dam_revenue:+10.0f} EUR")
+    print(f"  IntraDay P&L:    {total_intraday_pnl:+10.0f} EUR")
+    print(f"  mFRR Revenue:    {total_mfrr_revenue:+10.0f} EUR")
+    print(f"  aFRR Value:      {total_afrr_value:+10.0f} EUR")
+    print(f"  --------------------------------")
+    total_revenue = total_dam_revenue + total_intraday_pnl + total_mfrr_revenue + total_afrr_value
+    print(f"  TOTAL:           {total_revenue:+10.0f} EUR")
 
     # Annual projection
     annual_projection = total_revenue * 365

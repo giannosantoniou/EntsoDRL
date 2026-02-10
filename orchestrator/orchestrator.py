@@ -181,18 +181,25 @@ class BatteryOrchestrator(IOrchestrator):
         """
         self._intraday_prices = prices
 
-    def run_intraday(self, current_time: datetime) -> Dict:
-        """Run IntraDay position optimization.
+    def run_intraday(
+        self,
+        current_time: datetime,
+        auto_execute: bool = True,
+        min_profit_eur: float = 10.0,
+    ) -> Dict:
+        """Run IntraDay position optimization and execution.
 
-        I evaluate adjustment opportunities and return recommendations.
+        I evaluate adjustment opportunities and optionally execute them.
         This should be called periodically during IntraDay trading window
         (typically D-1 14:00 to D-0 H-1).
 
         Args:
             current_time: Current timestamp
+            auto_execute: Whether to automatically execute orders
+            min_profit_eur: Minimum profit threshold for execution
 
         Returns:
-            Dict with opportunities and recommendations
+            Dict with opportunities, executed orders, and P&L
         """
         if self._intraday_trader is None:
             return {'enabled': False, 'opportunities': []}
@@ -206,18 +213,86 @@ class BatteryOrchestrator(IOrchestrator):
             battery_state=self._battery_state,
         )
 
-        # Get top opportunities
-        top_opportunities = opportunities[:5]
+        # Execute if enabled
+        executed_orders = []
+        if auto_execute and opportunities:
+            executed_orders = self._intraday_trader.execute_opportunities(
+                intraday_prices=self._intraday_prices,
+                battery_state=self._battery_state,
+                current_time=current_time,
+                min_profit_eur=min_profit_eur,
+            )
+
+        # Get session summary
+        session_summary = self._intraday_trader.get_session_summary()
 
         return {
             'enabled': True,
             'timestamp': current_time,
             'total_opportunities': len(opportunities),
-            'top_opportunities': top_opportunities,
+            'top_opportunities': opportunities[:5],
+            'executed_orders': len(executed_orders),
+            'executed_details': [
+                {
+                    'delivery': o.delivery_start.strftime('%H:%M'),
+                    'power_mw': o.power_mw,
+                    'fill_price': o.fill_price,
+                    'pnl_eur': o.pnl_eur,
+                }
+                for o in executed_orders
+            ],
+            'session_pnl_eur': session_summary.get('total_pnl_eur', 0),
             'position_summary': self._intraday_trader.get_position_summary(
                 current_time.date() if hasattr(current_time, 'date') else current_time
             ),
         }
+
+    def start_intraday_session(self, delivery_date: date) -> Dict:
+        """Start IntraDay trading session for a delivery date.
+
+        Call this after DAM results are known (typically D-1 14:00).
+
+        Args:
+            delivery_date: The delivery date
+
+        Returns:
+            Session info
+        """
+        if self._intraday_trader is None:
+            return {'enabled': False}
+
+        session = self._intraday_trader.start_session(delivery_date)
+        return {
+            'enabled': True,
+            'delivery_date': session.delivery_date,
+            'session_start': session.session_start,
+        }
+
+    def close_intraday_session(self) -> Dict:
+        """Close IntraDay session and get final P&L.
+
+        Returns:
+            Session summary with P&L
+        """
+        if self._intraday_trader is None:
+            return {'enabled': False}
+
+        return self._intraday_trader.close_session()
+
+    def get_net_position(self, delivery_time: datetime) -> float:
+        """Get net position for delivery period (DAM + IntraDay).
+
+        Args:
+            delivery_time: Delivery period start
+
+        Returns:
+            Net position in MW
+        """
+        if self._intraday_trader is None:
+            # No IntraDay, return DAM commitment
+            return self.executor.get_commitment(delivery_time)
+
+        return self._intraday_trader.get_net_position(delivery_time)
 
     def update_market_data(self, market_data: Dict) -> None:
         """Update real-time market data for balancing decisions.

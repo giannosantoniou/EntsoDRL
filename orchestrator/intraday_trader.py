@@ -34,7 +34,22 @@ class IntraDayOrder:
     power_mw: float             # Power (positive=sell, negative=buy)
     price_limit: float          # Price limit (max buy, min sell)
     order_type: str = "limit"   # "limit" or "market"
-    status: str = "pending"     # pending, filled, partial, cancelled
+    status: str = "pending"     # pending, filled, partial, cancelled, expired
+    fill_price: float = 0.0     # Actual fill price
+    fill_time: Optional[datetime] = None
+    pnl_eur: float = 0.0        # Profit/loss from this order
+
+
+@dataclass
+class IntraDaySession:
+    """IntraDay trading session for a delivery day."""
+    delivery_date: date
+    session_start: datetime      # When ID trading opens (D-1 14:00)
+    gate_closure_hours: float = 1.0  # Hours before delivery
+    total_orders: int = 0
+    filled_orders: int = 0
+    total_pnl_eur: float = 0.0
+    is_active: bool = True
 
 
 @dataclass
@@ -99,9 +114,19 @@ class IntraDayTrader:
         # DAM prices (from commitment)
         self._dam_prices: Dict[datetime, float] = {}
 
+        # Session tracking
+        self._session: Optional[IntraDaySession] = None
+
+        # Execution settings
+        self.auto_execute = True
+        self.gate_closure_hours = 1.0  # Close 1h before delivery
+        self.max_orders_per_interval = 3  # Max orders per delivery period
+        self.execution_probability = 0.85  # Simulated fill probability
+
         print(f"IntraDay Trader initialized")
         print(f"  Min spread: {min_spread_eur} EUR")
         print(f"  Max position change: {max_position_change:.0%}")
+        print(f"  Gate closure: {self.gate_closure_hours}h before delivery")
 
     def load_dam_commitment(
         self,
@@ -411,6 +436,260 @@ class IntraDayTrader:
         opportunities.sort(key=lambda x: x.get('potential_profit_eur', 0), reverse=True)
 
         return opportunities
+
+
+    def start_session(self, delivery_date: date) -> IntraDaySession:
+        """Start IntraDay trading session for a delivery date.
+
+        IntraDay trading typically opens D-1 14:00 after DAM results.
+
+        Args:
+            delivery_date: The delivery date
+
+        Returns:
+            New IntraDaySession
+        """
+        # Session starts D-1 14:00 (after DAM results)
+        session_start = datetime.combine(
+            delivery_date - timedelta(days=1),
+            datetime.min.time().replace(hour=14)
+        )
+
+        self._session = IntraDaySession(
+            delivery_date=delivery_date,
+            session_start=session_start,
+            gate_closure_hours=self.gate_closure_hours,
+        )
+
+        print(f"IntraDay session started for {delivery_date}")
+        print(f"  Session start: {session_start}")
+        print(f"  Gate closure: {self.gate_closure_hours}h before each delivery")
+
+        return self._session
+
+    def is_gate_open(self, delivery_time: datetime, current_time: datetime) -> bool:
+        """Check if IntraDay gate is still open for a delivery period.
+
+        Args:
+            delivery_time: Delivery period start
+            current_time: Current time
+
+        Returns:
+            True if gate is open (can still trade)
+        """
+        gate_closure = delivery_time - timedelta(hours=self.gate_closure_hours)
+        return current_time < gate_closure
+
+    def execute_opportunities(
+        self,
+        intraday_prices: np.ndarray,
+        battery_state: BatteryState,
+        current_time: datetime,
+        max_orders: int = 5,
+        min_profit_eur: float = 10.0,
+    ) -> List[IntraDayOrder]:
+        """Automatically execute IntraDay trading opportunities.
+
+        I find the best opportunities and execute them automatically,
+        respecting gate closure times and position limits.
+
+        Args:
+            intraday_prices: Current IntraDay prices (96 values)
+            battery_state: Current battery state
+            current_time: Current time
+            max_orders: Maximum orders to place
+            min_profit_eur: Minimum potential profit to execute
+
+        Returns:
+            List of executed orders
+        """
+        if not self.auto_execute:
+            return []
+
+        # Find opportunities
+        opportunities = self.get_adjustment_opportunities(
+            intraday_prices=intraday_prices,
+            battery_state=battery_state,
+        )
+
+        executed_orders = []
+
+        for opp in opportunities[:max_orders]:
+            # Check minimum profit
+            if opp.get('potential_profit_eur', 0) < min_profit_eur:
+                continue
+
+            # Check gate closure
+            if not self.is_gate_open(opp['delivery_time'], current_time):
+                continue
+
+            # Check if already have too many orders for this interval
+            existing_orders = len(self._positions[opp['delivery_time']].orders)
+            if existing_orders >= self.max_orders_per_interval:
+                continue
+
+            # Determine power and price
+            if opp['action'] in ('sell_more', 'reduce_buy'):
+                power_mw = opp['recommended_mw']
+                # For selling, set price slightly below market to ensure fill
+                price_limit = opp['intraday_price'] * 0.99
+            else:  # buy_more, reduce_sell
+                power_mw = -opp['recommended_mw']
+                # For buying, set price slightly above market
+                price_limit = opp['intraday_price'] * 1.01
+
+            # Create and execute order
+            order = self.create_order(
+                delivery_time=opp['delivery_time'],
+                power_mw=power_mw,
+                price_limit=price_limit,
+                order_type="limit",
+            )
+
+            # Simulate execution (in production, this would go to exchange)
+            fill_success = self._simulate_execution(order, opp['intraday_price'])
+
+            if fill_success:
+                # Calculate P&L
+                dam_price = self._dam_prices.get(opp['delivery_time'], opp['intraday_price'])
+                pnl = self._calculate_order_pnl(order, dam_price)
+                order.pnl_eur = pnl
+
+                executed_orders.append(order)
+
+                if self._session:
+                    self._session.total_orders += 1
+                    self._session.filled_orders += 1
+                    self._session.total_pnl_eur += pnl
+
+        return executed_orders
+
+    def _simulate_execution(
+        self,
+        order: IntraDayOrder,
+        market_price: float,
+    ) -> bool:
+        """Simulate order execution (for backtesting/paper trading).
+
+        In production, this would connect to the actual exchange.
+
+        Args:
+            order: Order to execute
+            market_price: Current market price
+
+        Returns:
+            True if order was filled
+        """
+        import random
+
+        # Check if price is acceptable
+        if order.power_mw > 0:  # Selling
+            if market_price < order.price_limit:
+                order.status = "cancelled"
+                return False
+        else:  # Buying
+            if market_price > order.price_limit:
+                order.status = "cancelled"
+                return False
+
+        # Simulate fill probability
+        if random.random() < self.execution_probability:
+            # Add some slippage
+            slippage = random.uniform(-0.5, 0.5)
+            fill_price = market_price + slippage
+
+            self.fill_order(order, fill_price)
+            return True
+        else:
+            order.status = "partial"
+            return False
+
+    def _calculate_order_pnl(
+        self,
+        order: IntraDayOrder,
+        dam_price: float,
+    ) -> float:
+        """Calculate P&L for an IntraDay order.
+
+        P&L = (ID_price - DAM_price) * energy * direction
+
+        For selling in ID at higher price than DAM: profit
+        For buying in ID at lower price than DAM: profit
+
+        Args:
+            order: Filled order
+            dam_price: Original DAM price
+
+        Returns:
+            P&L in EUR
+        """
+        energy_mwh = abs(order.power_mw) * 0.25  # 15-min interval
+        price_diff = order.fill_price - dam_price
+
+        if order.power_mw > 0:  # Selling
+            # Selling at higher ID price than DAM = profit
+            pnl = price_diff * energy_mwh
+        else:  # Buying
+            # Buying at lower ID price than DAM = profit (we pay less)
+            pnl = -price_diff * energy_mwh
+
+        return pnl
+
+    def get_session_summary(self) -> Dict:
+        """Get summary of current IntraDay session.
+
+        Returns:
+            Dict with session statistics
+        """
+        if not self._session:
+            return {'status': 'no_active_session'}
+
+        return {
+            'delivery_date': self._session.delivery_date,
+            'session_start': self._session.session_start,
+            'total_orders': self._session.total_orders,
+            'filled_orders': self._session.filled_orders,
+            'fill_rate': (
+                self._session.filled_orders / self._session.total_orders
+                if self._session.total_orders > 0 else 0
+            ),
+            'total_pnl_eur': self._session.total_pnl_eur,
+            'is_active': self._session.is_active,
+        }
+
+    def close_session(self) -> Dict:
+        """Close IntraDay session and return final summary.
+
+        Returns:
+            Final session summary
+        """
+        if not self._session:
+            return {'status': 'no_session'}
+
+        self._session.is_active = False
+
+        summary = self.get_session_summary()
+        summary['status'] = 'closed'
+
+        print(f"\nIntraDay Session Closed")
+        print(f"  Orders: {self._session.filled_orders}/{self._session.total_orders} filled")
+        print(f"  P&L: {self._session.total_pnl_eur:+.0f} EUR")
+
+        return summary
+
+    def get_net_position(self, delivery_time: datetime) -> float:
+        """Get net position for a delivery period after IntraDay adjustments.
+
+        Args:
+            delivery_time: Delivery period start
+
+        Returns:
+            Net position in MW (DAM + IntraDay adjustments)
+        """
+        if delivery_time not in self._positions:
+            return 0.0
+
+        return self._positions[delivery_time].net_position_mw
 
 
 # Factory function
