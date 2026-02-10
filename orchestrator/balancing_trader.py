@@ -109,10 +109,136 @@ class BalancingTrader(IBalancingTrader):
         # VecNormalize for observation normalization (if using AI)
         self._vec_normalize = None
 
+        # Historical price data for lag features
+        self._price_history = None
+        self._load_price_history()
+
         print(f"Balancing Trader initialized")
         print(f"  Strategy: {strategy_type}")
         print(f"  aFRR: {'enabled' if afrr_enabled else 'disabled'}")
         print(f"  mFRR: {'enabled' if mfrr_enabled else 'disabled'}")
+
+    def _load_price_history(self):
+        """Load historical mFRR price data for lag features.
+
+        I load the mfrr_features_clean.csv which contains pre-computed
+        lag features that match what the model was trained on.
+        """
+        import pandas as pd
+
+        data_paths = [
+            "data/mfrr_features_clean.csv",
+            "data/feasible_data_with_dam.csv",
+        ]
+
+        for path in data_paths:
+            if Path(path).exists():
+                try:
+                    df = pd.read_csv(path, index_col=0, parse_dates=True)
+                    self._price_history = df
+                    # Calculate statistics for normalization
+                    self._price_mean = df['mfrr_price_up'].mean()
+                    self._price_std = df['mfrr_price_up'].std()
+                    self._spread_mean = df['mfrr_spread'].mean() if 'mfrr_spread' in df.columns else 30.0
+                    self._spread_std = df['mfrr_spread'].std() if 'mfrr_spread' in df.columns else 20.0
+                    print(f"  Loaded price history from {path} ({len(df)} rows)")
+                    print(f"    Price mean={self._price_mean:.1f}, std={self._price_std:.1f}")
+                    return
+                except Exception as e:
+                    print(f"  Warning: Could not load {path}: {e}")
+
+        # Fallback values if no data found
+        self._price_mean = 80.0
+        self._price_std = 40.0
+        self._spread_mean = 30.0
+        self._spread_std = 20.0
+        print(f"  Warning: No price history found, using default normalization")
+
+    def _get_historical_features(self, timestamp: datetime) -> dict:
+        """Get historical features for a given timestamp.
+
+        I look up the closest matching row in the price history
+        to get proper lag features instead of using placeholders.
+        """
+        if self._price_history is None:
+            return {}
+
+        try:
+            # Find the closest timestamp in history
+            # Convert timestamp to match index format
+            import pandas as pd
+            ts = pd.Timestamp(timestamp)
+
+            # Try exact match first
+            if ts in self._price_history.index:
+                row = self._price_history.loc[ts]
+            else:
+                # Find nearest hour
+                ts_hour = ts.replace(minute=0, second=0, microsecond=0)
+                if ts_hour in self._price_history.index:
+                    row = self._price_history.loc[ts_hour]
+                else:
+                    # Use last available data point
+                    idx = self._price_history.index.get_indexer([ts], method='ffill')[0]
+                    if idx >= 0:
+                        row = self._price_history.iloc[idx]
+                    else:
+                        return {}
+
+            # Extract features
+            return {
+                'price_lag_1h': row.get('price_up_lag_1h', None),
+                'price_lag_4h': row.get('price_up_lag_4h', None),
+                'price_lag_24h': row.get('price_up_lag_24h', None),
+                'price_rolling_mean': row.get('price_up_mean_24h', None),
+                'price_momentum': row.get('price_up_change_1h', None),
+                'price_volatility': row.get('price_up_std_24h', None),
+                'spread_lag_1h': row.get('spread_mean_24h', None),  # Use 24h mean as approximation
+                'spread_lag_4h': row.get('spread_mean_24h', None),
+            }
+        except Exception as e:
+            return {}
+
+    def _find_vec_normalize_path(self) -> Optional[str]:
+        """Find VecNormalize file for the model.
+
+        I search multiple locations because VecNormalize files
+        can have different naming conventions:
+        - vec_normalize.pkl (in model directory)
+        - vec_normalize_final.pkl (in model directory)
+        - model_name_vec_normalize.pkl (next to model)
+
+        Returns:
+            Path to VecNormalize file or None
+        """
+        if not self.model_path:
+            return None
+
+        model_path = Path(self.model_path)
+
+        # Build list of candidate paths
+        candidates = []
+
+        # 1. Look in model's directory for standard names
+        model_dir = model_path.parent
+        candidates.extend([
+            model_dir / "vec_normalize.pkl",
+            model_dir / "vec_normalize_final.pkl",
+        ])
+
+        # 2. Old naming convention: model_vec_normalize.pkl
+        model_stem = model_path.stem  # e.g., "best_model"
+        candidates.append(model_dir / f"{model_stem}_vec_normalize.pkl")
+
+        # 3. Same directory with .pkl extension instead of .zip
+        candidates.append(model_path.with_suffix('.pkl').parent / (model_path.stem + '_vec_normalize.pkl'))
+
+        # Search and return first match
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+
+        return None
 
     def _load_strategy(self):
         """Lazy load the decision strategy."""
@@ -130,8 +256,8 @@ class BalancingTrader(IBalancingTrader):
 
         # Try to load VecNormalize if it exists
         if self.model_path and self.strategy_type == "AI":
-            vec_norm_path = self.model_path.replace('.zip', '_vec_normalize.pkl')
-            if Path(vec_norm_path).exists():
+            vec_norm_path = self._find_vec_normalize_path()
+            if vec_norm_path:
                 try:
                     from stable_baselines3.common.vec_env import VecNormalize
                     import pickle
@@ -142,6 +268,8 @@ class BalancingTrader(IBalancingTrader):
                     print(f"  Loaded VecNormalize from {vec_norm_path}")
                 except Exception as e:
                     print(f"  Warning: Could not load VecNormalize: {e}")
+            else:
+                print(f"  Warning: No VecNormalize found for model")
 
     def decide_action(
         self,
@@ -313,7 +441,10 @@ class BalancingTrader(IBalancingTrader):
 
         # Normalize observation if VecNormalize is available
         if self._vec_normalize is not None:
-            obs = self._vec_normalize.normalize_obs(obs)
+            # VecNormalize expects 2D array (batch_size, obs_dim)
+            obs_2d = obs.reshape(1, -1)
+            obs_normalized = self._vec_normalize.normalize_obs(obs_2d)
+            obs = obs_normalized.flatten()
 
         # Get action from strategy
         action_idx = self._strategy.predict_action(obs, action_mask)
@@ -331,46 +462,153 @@ class BalancingTrader(IBalancingTrader):
     ) -> np.ndarray:
         """Build observation for the DRL model.
 
-        I create a simplified observation matching what the
-        model was trained on. The full 44-feature observation
-        would need more market data.
+        I create a 23-feature observation matching what the
+        threshold_v2 model was trained on.
+
+        Features (23 total):
+        - Core state (3): soc, max_discharge, max_charge
+        - Price features (7): normalized, very_low, very_high, negative, magnitude, percentile
+        - Spread features (2): normalized, high
+        - SoC flags (2): low, high
+        - Time (2): hour_sin, hour_cos
+        - Price lags (3): 1h, 4h, 24h
+        - Price dynamics (3): rolling_mean, momentum, volatility
+        - Spread lags (2): 1h, 4h
         """
         # Extract values with defaults
         soc = battery_state.soc
         price = market_data.get('mfrr_price_up', 100.0)
         price_down = market_data.get('mfrr_price_down', 80.0)
+        spread = price - price_down
 
-        # Time features (from timestamp)
+        # Calculate physical limits
+        max_discharge_mw = min(self.max_power_mw, soc * self.capacity_mwh)
+        max_charge_mw = min(self.max_power_mw, (1 - soc) * self.capacity_mwh)
+
+        # Normalize features
+        soc_norm = soc
+        max_discharge_norm = max_discharge_mw / self.max_power_mw
+        max_charge_norm = max_charge_mw / self.max_power_mw
+
+        # Price normalization (using actual data statistics)
+        price_mean = getattr(self, '_price_mean', 80.0)
+        price_std = getattr(self, '_price_std', 40.0)
+        price_normalized = np.clip((price - price_mean) / (price_std + 1e-8), -5, 5)
+
+        # Price thresholds (matching training environment: battery_env_threshold_v2.py)
+        price_low_threshold = 40.0   # Training default
+        price_high_threshold = 140.0  # Training default
+
+        # Binary flags
+        price_very_low = 1.0 if price < price_low_threshold else 0.0
+        price_very_high = 1.0 if price > price_high_threshold else 0.0
+        negative_price_flag = 1.0 if price < 0 else 0.0
+
+        # Price magnitude
+        if price > price_high_threshold:
+            price_magnitude = (price - price_high_threshold) / 100.0
+        elif price < price_low_threshold:
+            price_magnitude = (price - price_low_threshold) / 100.0
+        else:
+            price_magnitude = 0.0
+
+        # Price percentile (estimate based on typical distribution)
+        price_percentile = np.clip((price - 20) / 180, 0, 1)  # Assume range 20-200
+
+        # Spread features (using actual data statistics)
+        spread_mean = getattr(self, '_spread_mean', 30.0)
+        spread_std = getattr(self, '_spread_std', 20.0)
+        spread_normalized = np.clip((spread - spread_mean) / (spread_std + 1e-8), -3, 3)
+        spread_high = 1.0 if spread > 50.0 else 0.0  # Training default
+
+        # SoC flags (matching training environment thresholds)
+        soc_low = 1.0 if soc < 0.27 else 0.0    # Training default: 0.27
+        soc_high = 1.0 if soc > 0.79 else 0.0   # Training default: 0.79
+
+        # Time features
         hour = battery_state.timestamp.hour
         hour_sin = np.sin(2 * np.pi * hour / 24)
         hour_cos = np.cos(2 * np.pi * hour / 24)
 
-        dow = battery_state.timestamp.weekday()
-        dow_sin = np.sin(2 * np.pi * dow / 7)
-        dow_cos = np.cos(2 * np.pi * dow / 7)
+        # Get historical features from mFRR data
+        hist = self._get_historical_features(battery_state.timestamp)
 
-        # Normalized features
+        # Price lags (from historical data or current price as fallback)
+        if hist.get('price_lag_1h') is not None:
+            price_lag_1h = np.clip((hist['price_lag_1h'] - price_mean) / (price_std + 1e-8), -5, 5)
+        else:
+            price_lag_1h = price_normalized
+
+        if hist.get('price_lag_4h') is not None:
+            price_lag_4h = np.clip((hist['price_lag_4h'] - price_mean) / (price_std + 1e-8), -5, 5)
+        else:
+            price_lag_4h = price_normalized
+
+        if hist.get('price_lag_24h') is not None:
+            price_lag_24h = np.clip((hist['price_lag_24h'] - price_mean) / (price_std + 1e-8), -5, 5)
+        else:
+            price_lag_24h = price_normalized
+
+        # Price dynamics (from historical data)
+        if hist.get('price_rolling_mean') is not None:
+            price_rolling_mean = np.clip((hist['price_rolling_mean'] - price_mean) / (price_std + 1e-8), -5, 5)
+        else:
+            price_rolling_mean = price_normalized
+
+        if hist.get('price_momentum') is not None:
+            price_momentum = np.clip(hist['price_momentum'] / (price_std + 1e-8), -3, 3)
+        else:
+            price_momentum = 0.0
+
+        if hist.get('price_volatility') is not None:
+            price_volatility = np.clip(hist['price_volatility'] / (price_std + 1e-8), 0, 3)
+        else:
+            price_volatility = 0.3
+
+        # Spread lags (from historical data)
+        if hist.get('spread_lag_1h') is not None:
+            spread_lag_1h = np.clip((hist['spread_lag_1h'] - spread_mean) / (spread_std + 1e-8), -3, 3)
+        else:
+            spread_lag_1h = spread_normalized
+
+        if hist.get('spread_lag_4h') is not None:
+            spread_lag_4h = np.clip((hist['spread_lag_4h'] - spread_mean) / (spread_std + 1e-8), -3, 3)
+        else:
+            spread_lag_4h = spread_normalized
+
+        # Build observation (23 features)
         obs = np.array([
-            soc,                                    # 0: SoC
-            1.0,                                    # 1: max_discharge (normalized)
-            1.0,                                    # 2: max_charge (normalized)
-            price / self.mfrr_price_scale,          # 3: price (normalized)
-            0.0,                                    # 4: dam_commitment
-            hour_sin,                               # 5: hour_sin
-            hour_cos,                               # 6: hour_cos
-            # Price lookahead (4 values)
-            price / self.mfrr_price_scale,          # 7-10: price lookahead
-            price / self.mfrr_price_scale,
-            price / self.mfrr_price_scale,
-            price / self.mfrr_price_scale,
-            # DAM lookahead (4 values)
-            0.0, 0.0, 0.0, 0.0,                     # 11-14: dam lookahead
-            # Extended features
-            dow_sin,                                # 15: dow_sin
-            dow_cos,                                # 16: dow_cos
-            (price - price_down) / self.mfrr_price_scale,  # 17: spread
-            0.0,                                    # 18: imbalance
-            0.0,                                    # 19: volatility
+            # Core state (3)
+            soc_norm,
+            max_discharge_norm,
+            max_charge_norm,
+            # Price features (6)
+            price_normalized,
+            price_very_low,
+            price_very_high,
+            negative_price_flag,
+            price_magnitude,
+            price_percentile,
+            # Spread features (2)
+            spread_normalized,
+            spread_high,
+            # SoC flags (2)
+            soc_low,
+            soc_high,
+            # Time (2)
+            hour_sin,
+            hour_cos,
+            # Price lags (3)
+            price_lag_1h,
+            price_lag_4h,
+            price_lag_24h,
+            # Price dynamics (3)
+            price_rolling_mean,
+            price_momentum,
+            price_volatility,
+            # Spread lags (2)
+            spread_lag_1h,
+            spread_lag_4h,
         ], dtype=np.float32)
 
         return obs

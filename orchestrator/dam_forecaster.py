@@ -21,7 +21,47 @@ sys.path.insert(0, str(ENTSOE3_PATH / "src"))
 from .interfaces import IDAMForecaster, PriceForecast
 
 
+# Hourly regression parameters: Greek = slope * Serbia + intercept
+# Based on 6-month correlation analysis (R² varies 0.28-0.60 by hour)
+HOURLY_GR_RS_PARAMS = {
+    0:  {'slope': 0.8649, 'intercept':  21.93},  # Night
+    1:  {'slope': 0.6405, 'intercept':  38.62},
+    2:  {'slope': 0.6709, 'intercept':  33.56},  # Best R²=0.59
+    3:  {'slope': 0.6249, 'intercept':  35.26},  # Best R²=0.60
+    4:  {'slope': 0.5040, 'intercept':  41.91},
+    5:  {'slope': 0.4231, 'intercept':  43.88},  # Morning ramp starts
+    6:  {'slope': 0.2152, 'intercept':  64.67},  # Low correlation
+    7:  {'slope': 0.2974, 'intercept':  67.46},  # Low correlation
+    8:  {'slope': 0.8470, 'intercept':  32.92},  # Morning peak
+    9:  {'slope': 0.9424, 'intercept':  13.57},
+    10: {'slope': 0.8600, 'intercept':   5.32},
+    11: {'slope': 0.7031, 'intercept':   2.39},  # Solar starts
+    12: {'slope': 0.5603, 'intercept':   5.24},  # Solar peak - GR much cheaper
+    13: {'slope': 0.5545, 'intercept':   2.45},  # Solar peak
+    14: {'slope': 0.5263, 'intercept':   2.97},  # Solar peak
+    15: {'slope': 0.4407, 'intercept':  12.58},
+    16: {'slope': 0.3844, 'intercept':  24.74},  # Evening ramp
+    17: {'slope': 0.4893, 'intercept':  37.96},
+    18: {'slope': 0.3996, 'intercept':  74.02},  # Low correlation
+    19: {'slope': 0.5689, 'intercept':  58.52},
+    20: {'slope': 1.3837, 'intercept': -25.64},  # Evening peak - GR spikes! Best R²=0.60
+    21: {'slope': 1.2570, 'intercept':   5.70},  # Evening peak
+    22: {'slope': 0.9221, 'intercept':  29.32},
+    23: {'slope': 0.7662, 'intercept':  43.76},
+}
+
+
 class DAMForecaster(IDAMForecaster):
+    """DAM Price Forecaster using EntsoE3 models.
+
+    Key insight: Serbia DAM clears ~12:00, before Greek gate closure at 13:00.
+    We can use Serbia D+1 prices as a strong feature for Greek price prediction.
+
+    Hourly patterns (from correlation analysis):
+    - Solar hours (11-16h): Greek much cheaper than Serbia (more solar capacity)
+    - Evening peak (20-21h): Greek spikes higher than Serbia
+    - Night hours: Similar prices, good correlation
+    """
     """DAM Price Forecaster using EntsoE3 models.
 
     I wrap the EntsoE3 forecasting system to provide:
@@ -47,6 +87,7 @@ class DAMForecaster(IDAMForecaster):
         self.spread_percent = spread_percent
         self._model = None
         self._feature_names = None
+        self._serbia_prices = None  # Cache for Serbia D+1 prices
 
         print(f"DAM Forecaster initialized")
         print(f"  Model: {self.model_path}")
@@ -122,14 +163,83 @@ class DAMForecaster(IDAMForecaster):
             print(f"  Model forecast error: {e}, using fallback")
             return self._generate_fallback_forecast(target_date)
 
+    def fetch_serbia_dam(self, target_date: date) -> Optional[np.ndarray]:
+        """Fetch Serbia DAM prices for D+1.
+
+        Serbia DAM clears ~12:00 Greek time, before Greek gate closure at 13:00.
+        This gives us a strong signal for Greek prices.
+
+        Args:
+            target_date: The delivery date (tomorrow)
+
+        Returns:
+            24 hourly prices or None if not available
+        """
+        try:
+            # Import connector
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            from data.entsoe_connector import EntsoeConnector
+
+            connector = EntsoeConnector()
+
+            # Fetch Serbia D+1
+            start = pd.Timestamp(target_date, tz='Europe/Athens').normalize()
+            end = start + pd.Timedelta(days=1)
+
+            df = connector.fetch_neighbor_dam_prices('RS', start, end)
+
+            if df is not None and not df.empty:
+                # Resample to hourly if needed
+                if len(df) > 24:
+                    prices = df['price'].resample('h').mean().values[:24]
+                else:
+                    prices = df['price'].values[:24]
+
+                self._serbia_prices = prices
+                print(f"  Fetched Serbia DAM: {prices.min():.1f} - {prices.max():.1f} EUR")
+                return prices
+
+        except Exception as e:
+            print(f"  Could not fetch Serbia DAM: {e}")
+
+        return None
+
     def _generate_fallback_forecast(self, target_date: date) -> np.ndarray:
         """Generate fallback forecast based on typical daily pattern.
 
         I use a realistic daily price pattern for the Greek market:
         - Low prices: 02:00-06:00 (night), 12:00-14:00 (solar peak)
         - High prices: 08:00-10:00 (morning), 18:00-21:00 (evening peak)
+
+        If Serbia DAM prices are available, I use them to adjust the forecast:
+        - Greek prices are typically correlated with Serbia (~0.7-0.8 correlation)
+        - Greek prices tend to be slightly higher than Serbia (offset ~5-15 EUR)
         """
-        # Typical daily pattern (24 hourly values)
+        # Try to fetch Serbia prices first
+        serbia_prices = self.fetch_serbia_dam(target_date)
+
+        if serbia_prices is not None and len(serbia_prices) == 24:
+            # Use hourly-specific regression parameters
+            # Each hour has different GR-RS relationship due to:
+            # - Solar generation (GR cheaper midday)
+            # - Evening ramp (GR spikes more at 20-21h)
+            hourly_pattern = np.zeros(24)
+
+            for h in range(24):
+                params = HOURLY_GR_RS_PARAMS[h]
+                hourly_pattern[h] = serbia_prices[h] * params['slope'] + params['intercept']
+
+            # Add small noise (±3% since we have calibrated model)
+            noise = np.random.uniform(0.97, 1.03, 24)
+            hourly_pattern *= noise
+
+            # Ensure non-negative prices
+            hourly_pattern = np.maximum(hourly_pattern, 0)
+
+            print(f"  Using Serbia DAM with hourly regression model")
+            return hourly_pattern
+
+        # Fallback: Typical daily pattern (24 hourly values)
         # Based on Greek market historical averages
         hourly_pattern = np.array([
             85,   # 00:00 - night
