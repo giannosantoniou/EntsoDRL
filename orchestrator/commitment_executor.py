@@ -26,10 +26,17 @@ from .interfaces import (
 class ExecutionStatus:
     """Status of commitment execution for a single interval."""
     timestamp: datetime
-    committed_mw: float      # What we promised
-    executed_mw: float       # What we actually did
-    deviation_mw: float      # Difference (executed - committed)
-    is_executed: bool        # Whether this interval is complete
+    dam_committed_mw: float   # DAM commitment (binding contract)
+    mfrr_planned_mw: float    # mFRR action (intentional deviation)
+    total_planned_mw: float   # Combined plan (DAM + mFRR)
+    executed_mw: float        # What we actually did
+    deviation_mw: float       # Difference (executed - total_planned)
+    is_executed: bool         # Whether this interval is complete
+
+    # Legacy alias for backwards compatibility
+    @property
+    def committed_mw(self) -> float:
+        return self.dam_committed_mw
 
 
 @dataclass
@@ -40,16 +47,35 @@ class DailyExecutionLog:
 
     @property
     def total_deviation_mwh(self) -> float:
-        """Total energy deviation (positive = over-delivered)."""
+        """Total energy deviation from plan (positive = over-delivered)."""
         return sum(s.deviation_mw for s in self.intervals) * 0.25
 
     @property
     def execution_accuracy(self) -> float:
-        """Percentage of intervals executed within tolerance."""
+        """Percentage of intervals executed within tolerance of TOTAL PLAN (DAM + mFRR).
+
+        This measures how accurately the battery followed the combined dispatch plan,
+        NOT how closely it followed DAM alone (which would be wrong since mFRR is intentional).
+        """
         if not self.intervals:
             return 0.0
         within_tolerance = sum(1 for s in self.intervals if abs(s.deviation_mw) < 0.5)
         return within_tolerance / len(self.intervals)
+
+    @property
+    def dam_deviation_mwh(self) -> float:
+        """Total energy deviation from DAM commitment (for settlement purposes)."""
+        return sum(s.executed_mw - s.dam_committed_mw for s in self.intervals) * 0.25
+
+    @property
+    def mfrr_total_mwh(self) -> float:
+        """Total mFRR energy traded (absolute value)."""
+        return sum(abs(s.mfrr_planned_mw) for s in self.intervals) * 0.25
+
+    @property
+    def active_mfrr_intervals(self) -> int:
+        """Number of intervals with mFRR activity."""
+        return sum(1 for s in self.intervals if abs(s.mfrr_planned_mw) > 0.1)
 
 
 class CommitmentExecutor(ICommitmentExecutor):
@@ -170,25 +196,31 @@ class CommitmentExecutor(ICommitmentExecutor):
         self,
         timestamp: datetime,
         actual_power_mw: float,
+        mfrr_action_mw: float = 0.0,
     ) -> ExecutionStatus:
         """Record actual execution for an interval.
 
-        I compare what we promised vs what we actually did.
-        This is important for deviation tracking and penalty calculation.
+        I compare what we planned (DAM + mFRR) vs what we actually did.
+        The mFRR action is an INTENTIONAL deviation from DAM, so execution
+        accuracy measures adherence to the total plan, not DAM alone.
 
         Args:
             timestamp: Interval timestamp
             actual_power_mw: Actual power dispatched
+            mfrr_action_mw: Planned mFRR action (0 if no mFRR trading)
 
         Returns:
             ExecutionStatus with deviation info
         """
-        committed = self.get_current_commitment(timestamp)
-        deviation = actual_power_mw - committed
+        dam_committed = self.get_current_commitment(timestamp)
+        total_planned = dam_committed + mfrr_action_mw
+        deviation = actual_power_mw - total_planned
 
         status = ExecutionStatus(
             timestamp=timestamp,
-            committed_mw=committed,
+            dam_committed_mw=dam_committed,
+            mfrr_planned_mw=mfrr_action_mw,
+            total_planned_mw=total_planned,
             executed_mw=actual_power_mw,
             deviation_mw=deviation,
             is_executed=True,
@@ -199,11 +231,11 @@ class CommitmentExecutor(ICommitmentExecutor):
         if target_date in self._execution_log:
             self._execution_log[target_date].intervals.append(status)
 
-        # Warn if significant deviation
+        # Warn if significant deviation from TOTAL PLAN (not DAM alone)
         if abs(deviation) > self.deviation_tolerance:
-            print(f"  WARNING: Deviation at {timestamp.strftime('%H:%M')}: "
-                  f"committed={committed:.1f}, actual={actual_power_mw:.1f}, "
-                  f"deviation={deviation:.1f} MW")
+            print(f"  WARNING: Execution deviation at {timestamp.strftime('%H:%M')}: "
+                  f"planned={total_planned:.1f} (DAM={dam_committed:.1f}, mFRR={mfrr_action_mw:.1f}), "
+                  f"actual={actual_power_mw:.1f}, deviation={deviation:.1f} MW")
 
         return status
 
@@ -283,10 +315,16 @@ class CommitmentExecutor(ICommitmentExecutor):
         return {
             'date': target_date,
             'intervals_executed': len(log.intervals),
+            # Execution accuracy (vs total plan = DAM + mFRR)
+            'execution_accuracy': log.execution_accuracy,
             'total_deviation_mwh': log.total_deviation_mwh,
             'max_deviation_mw': max(abs(d) for d in deviations),
             'mean_deviation_mw': np.mean(np.abs(deviations)),
-            'execution_accuracy': log.execution_accuracy,
+            # mFRR activity
+            'mfrr_intervals': log.active_mfrr_intervals,
+            'mfrr_total_mwh': log.mfrr_total_mwh,
+            # DAM settlement info
+            'dam_deviation_mwh': log.dam_deviation_mwh,
         }
 
     def _get_interval_index(self, timestamp: datetime) -> Optional[int]:

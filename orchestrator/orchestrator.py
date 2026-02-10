@@ -452,12 +452,16 @@ class BatteryOrchestrator(IOrchestrator):
             'soc': self._battery_state.soc,
         }
 
+        # Store mFRR action for execute_interval
+        self._last_mfrr_action = balancing_action
+
         return result
 
     def execute_interval(
         self,
         timestamp: datetime,
         actual_power_mw: float,
+        mfrr_action_mw: float = None,
     ) -> Dict:
         """Record execution of an interval.
 
@@ -467,12 +471,19 @@ class BatteryOrchestrator(IOrchestrator):
         Args:
             timestamp: Interval timestamp
             actual_power_mw: Actual power delivered
+            mfrr_action_mw: mFRR action taken (if None, uses last known)
 
         Returns:
             Dict with execution status
         """
-        # Record execution
-        status = self.executor.record_execution(timestamp, actual_power_mw)
+        # Get mFRR action from last realtime result if not provided
+        if mfrr_action_mw is None:
+            mfrr_action_mw = getattr(self, '_last_mfrr_action', 0.0)
+
+        # Record execution with mFRR action
+        status = self.executor.record_execution(
+            timestamp, actual_power_mw, mfrr_action_mw
+        )
 
         # Update SoC estimate
         energy_mwh = actual_power_mw * 0.25
@@ -492,7 +503,9 @@ class BatteryOrchestrator(IOrchestrator):
 
         return {
             'timestamp': timestamp,
-            'committed_mw': status.committed_mw,
+            'dam_committed_mw': status.dam_committed_mw,
+            'mfrr_action_mw': status.mfrr_planned_mw,
+            'total_planned_mw': status.total_planned_mw,
             'executed_mw': status.executed_mw,
             'deviation_mw': status.deviation_mw,
             'new_soc': new_soc,

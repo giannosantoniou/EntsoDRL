@@ -266,10 +266,16 @@ def test_with_trained_model():
     # Execution quality
     summary = orchestrator.get_daily_summary(tomorrow)
     if summary:
-        print(f"\nExecution Quality:")
+        print(f"\nExecution Quality (vs Total Plan = DAM + mFRR):")
         print(f"  Intervals executed: {summary['intervals_executed']}")
         print(f"  Execution accuracy: {summary['execution_accuracy']:.1%}")
         print(f"  Max deviation: {summary['max_deviation_mw']:.2f} MW")
+        print(f"  Mean deviation: {summary['mean_deviation_mw']:.2f} MW")
+        print(f"\nmFRR Activity:")
+        print(f"  mFRR intervals: {summary['mfrr_intervals']}")
+        print(f"  mFRR total: {summary['mfrr_total_mwh']:.1f} MWh")
+        print(f"\nDAM Settlement:")
+        print(f"  DAM deviation: {summary['dam_deviation_mwh']:+.1f} MWh (intentional mFRR)")
 
     # Activity analysis
     active_intervals = sum(1 for r in results if abs(r['total_dispatch_mw']) > 0.5)
@@ -277,10 +283,6 @@ def test_with_trained_model():
 
     print(f"\nUtilization:")
     print(f"  Active intervals: {active_intervals}/96 ({utilization:.0%})")
-
-    # Strategy breakdown
-    ai_decisions = sum(1 for r in results if abs(r['mfrr_action_mw']) > 0.5)
-    print(f"  AI (mFRR) decisions: {ai_decisions}")
 
     print("\n" + "="*70)
     print("[OK] Integration test completed successfully!")
