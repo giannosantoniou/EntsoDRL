@@ -171,6 +171,93 @@ class IBalancingTrader(ABC):
         pass
 
 
+@dataclass
+class BalancingDecision:
+    """Decision for balancing market (aFRR + mFRR) trading.
+
+    Positive values = discharge/sell
+    Negative values = charge/buy
+    """
+    timestamp: datetime
+    afrr_commitment_mw: float  # aFRR capacity commitment
+    afrr_price_tier: int       # Bid aggressiveness (0-4)
+    mfrr_power_mw: float       # mFRR energy trading
+
+
+@dataclass
+class UnifiedDecision:
+    """
+    Decision for the unified multi-market trading model.
+
+    I combine DAM execution, aFRR commitment, and mFRR/IntraDay trading
+    into a single decision structure. This extends BalancingDecision
+    to include DAM compliance tracking.
+
+    Action Interpretation:
+    - afrr_commitment_level: 0-4 (0%, 25%, 50%, 75%, 100% of remaining capacity)
+    - afrr_price_tier: 0-4 (aggressive to conservative bidding)
+    - energy_action: 0-20 (-30 to +30 MW energy trading)
+    """
+    timestamp: datetime
+
+    # aFRR decisions
+    afrr_commitment_level: int  # Index 0-4
+    afrr_commitment_mw: float   # Actual MW committed
+    afrr_price_tier: int        # Index 0-4
+
+    # Energy trading
+    energy_action: int          # Index 0-20
+    energy_power_mw: float      # Actual MW traded
+
+    # DAM context (for compliance tracking)
+    dam_commitment_mw: float    # Current DAM commitment
+    remaining_capacity_mw: float  # Capacity after DAM
+
+    # Execution results
+    is_selected_for_afrr: bool = False
+    afrr_activated: bool = False
+    afrr_activation_direction: Optional[str] = None
+    actual_energy_mw: float = 0.0
+
+    @property
+    def total_power_mw(self) -> float:
+        """I return the total power including DAM and trading."""
+        return self.dam_commitment_mw + self.actual_energy_mw
+
+
+class IUnifiedTrader(ABC):
+    """Interface for unified multi-market trading."""
+
+    @abstractmethod
+    def decide_action(
+        self,
+        observation: np.ndarray,
+        action_mask: np.ndarray,
+        battery_state: BatteryState,
+        dam_commitment_mw: float,
+        market_data: dict
+    ) -> UnifiedDecision:
+        """
+        I decide on unified multi-market action.
+
+        Args:
+            observation: 58-feature observation vector
+            action_mask: Boolean mask for valid actions
+            battery_state: Current battery state
+            dam_commitment_mw: Current DAM commitment
+            market_data: Current market prices and signals
+
+        Returns:
+            UnifiedDecision with aFRR commitment and energy trading
+        """
+        pass
+
+    @abstractmethod
+    def load_model(self, model_path: str, normalizer_path: Optional[str] = None) -> None:
+        """Load the trained unified model."""
+        pass
+
+
 class IOrchestrator(ABC):
     """Interface for the main orchestrator."""
 
@@ -182,4 +269,26 @@ class IOrchestrator(ABC):
     @abstractmethod
     def run_realtime(self, timestamp: datetime) -> dict:
         """Run real-time process: execute commitment + balancing."""
+        pass
+
+
+class IUnifiedOrchestrator(IOrchestrator):
+    """Interface for the unified multi-market orchestrator."""
+
+    @abstractmethod
+    def run_unified_step(self, timestamp: datetime) -> UnifiedDecision:
+        """
+        I execute a single unified trading step.
+
+        This combines DAM execution, aFRR commitment, and mFRR trading
+        into a single coordinated decision.
+
+        Returns:
+            UnifiedDecision with all market actions
+        """
+        pass
+
+    @abstractmethod
+    def get_current_state(self) -> dict:
+        """I return the current state of all markets."""
         pass

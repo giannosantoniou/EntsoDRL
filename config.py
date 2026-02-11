@@ -1,12 +1,54 @@
 """
 Configuration for Training/Production mode switching.
+
+I also define configuration for unified multi-market trading.
 """
 from enum import Enum
+from dataclasses import dataclass
+from typing import Optional
 
 
 class Mode(Enum):
     TRAINING = "training"
     PRODUCTION = "production"
+
+
+class TradingMode(Enum):
+    """Trading mode determines which markets are active."""
+    DAM_ONLY = "dam_only"          # DAM + IntraDay only
+    BALANCING = "balancing"        # aFRR + mFRR only
+    UNIFIED = "unified"            # All markets (DAM + IntraDay + aFRR + mFRR)
+
+
+@dataclass
+class UnifiedModelConfig:
+    """Configuration for the unified multi-market model."""
+    # Model paths
+    model_path: str = "models/unified/final_model.zip"
+    normalizer_path: str = "models/unified/vec_normalize_unified.pkl"
+
+    # Battery parameters
+    capacity_mwh: float = 146.0
+    max_power_mw: float = 30.0
+    efficiency: float = 0.94
+    min_soc: float = 0.05
+    max_soc: float = 0.95
+
+    # aFRR configuration
+    afrr_selection_probability: float = 0.80
+    afrr_activation_rate: float = 0.15
+
+    # Reward configuration (for training)
+    degradation_cost: float = 15.0
+    dam_violation_penalty: float = 1500.0
+    afrr_nonresponse_penalty: float = 2000.0
+
+    # Training data
+    training_data_path: str = "data/unified_multimarket_training.csv"
+
+
+# I define default unified model configuration
+DEFAULT_UNIFIED_CONFIG = UnifiedModelConfig()
 
 
 # ============================================================================

@@ -385,8 +385,9 @@ def create_strategy(strategy_type: str, model_path: Optional[str] = None, **kwar
     Factory function to create the appropriate strategy.
 
     Args:
-        strategy_type: "AI", "RULE_BASED", "RANDOM", "CONSERVATIVE", or "AGGRESSIVE_HYBRID"
-        model_path: Path to model file (required for AI)
+        strategy_type: "AI", "RULE_BASED", "RANDOM", "CONSERVATIVE", "AGGRESSIVE_HYBRID",
+                       "UNIFIED", "UNIFIED_RULE_BASED", or "UNIFIED_CONSERVATIVE"
+        model_path: Path to model file (required for AI and UNIFIED)
         **kwargs: Additional arguments for specific strategies
 
     Returns:
@@ -429,6 +430,22 @@ def create_strategy(strategy_type: str, model_path: Optional[str] = None, **kwar
         strategy.load()
         return strategy
 
+    # I add unified multi-market strategies
+    elif strategy_type in ("UNIFIED", "UNIFIED_AI"):
+        from agent.unified_strategy import create_unified_strategy
+        return create_unified_strategy("AI", model_path, **kwargs)
+
+    elif strategy_type == "UNIFIED_RULE_BASED":
+        from agent.unified_strategy import create_unified_strategy
+        return create_unified_strategy("RULE_BASED", **kwargs)
+
+    elif strategy_type == "UNIFIED_CONSERVATIVE":
+        from agent.unified_strategy import create_unified_strategy
+        return create_unified_strategy("CONSERVATIVE", **kwargs)
+
     else:
-        raise ValueError(f"Unknown strategy type: {strategy_type}. "
-                         f"Valid options: AI, RULE_BASED, RANDOM, CONSERVATIVE, AGGRESSIVE_HYBRID")
+        raise ValueError(
+            f"Unknown strategy type: {strategy_type}. "
+            f"Valid options: AI, RULE_BASED, RANDOM, CONSERVATIVE, AGGRESSIVE_HYBRID, "
+            f"UNIFIED, UNIFIED_RULE_BASED, UNIFIED_CONSERVATIVE"
+        )
