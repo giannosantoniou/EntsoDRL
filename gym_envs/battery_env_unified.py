@@ -831,17 +831,37 @@ class BatteryEnvUnified(gym.Env):
             features.append(future_dam / self.max_power_mw)
 
         # =====================================================================
-        # 5. PRICE LOOKAHEAD (12 features)
+        # 5. PRICE LOOKAHEAD (12 features) - HEnEx compliant
         # =====================================================================
-        # I use noisy forecasts (not perfect lookahead)
+        # DAM prices are published at 14:00 for the NEXT day:
+        # - If hour >= 14:00: I know today + tomorrow prices
+        # - If hour < 14:00: I only know today prices
+        # For unknown prices, I use persistence forecast (last known price)
+        current_hour = hour
+        from datetime import timedelta
+
+        # I determine the last day for which DAM prices are known
+        if current_hour >= 14:
+            # After 14:00: prices for tomorrow are published
+            last_known_day = (ts + timedelta(days=1)).date()
+        else:
+            # Before 14:00: only today's prices known
+            last_known_day = current_day
+
         for i in range(1, 13):
             target = min(self.current_step + i, len(self.df) - 1)
-            future_price = self.df.iloc[target].get('price', dam_price)
-            # I add forecast noise
-            horizon_factor = i / 12.0
-            noise = np.random.normal(0, 0.08 + 0.12 * horizon_factor)
-            noisy_price = future_price * (1 + noise)
-            features.append(noisy_price / 100.0)
+            target_ts = self.df.index[target]
+            target_day = target_ts.date()
+
+            if target_day <= last_known_day:
+                # Price is known (DAM already published)
+                future_price = self.df.iloc[target].get('price', dam_price)
+            else:
+                # Price NOT known yet - use persistence forecast
+                # I use same hour from last known day as forecast
+                future_price = dam_price  # Simple persistence: use current price
+
+            features.append(future_price / 100.0)
 
         # =====================================================================
         # 6. aFRR STATE (8 features)
