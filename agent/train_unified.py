@@ -38,7 +38,6 @@ from stable_baselines3.common.monitor import Monitor
 
 # I use MaskablePPO for action masking support
 from sb3_contrib import MaskablePPO
-from sb3_contrib.common.wrappers import ActionMasker
 
 from gym_envs.battery_env_unified import BatteryEnvUnified
 
@@ -78,23 +77,63 @@ class DegradationCurriculumCallback(BaseCallback):
 
 
 class TensorboardLoggingCallback(BaseCallback):
-    """I log additional metrics to Tensorboard."""
+    """I log additional metrics to Tensorboard including per-market statistics."""
 
     def __init__(self, verbose: int = 0):
         super().__init__(verbose)
+        # I track episode-level metrics
         self.episode_profits = []
         self.episode_cycles = []
+
+        # I track per-market profits
+        self.dam_profits = []
+        self.afrr_capacity_profits = []
+        self.afrr_energy_profits = []
+        self.mfrr_profits = []
+
+        # I track participation counts per episode
+        self.afrr_bids_per_ep = []
+        self.afrr_selections_per_ep = []
+        self.afrr_activations_per_ep = []
+
+        # I track step-level counts (reset each logging period)
+        self.step_afrr_bids = 0
+        self.step_afrr_selections = 0
+        self.step_afrr_activations = 0
+        self.step_count = 0
 
     def _on_step(self) -> bool:
         # I extract info from the environment
         for info in self.locals.get('infos', []):
+            self.step_count += 1
+
+            # I track step-level aFRR participation
+            if info.get('afrr_commitment', 0) > 0.1:
+                self.step_afrr_bids += 1
+            if info.get('is_selected', False):
+                self.step_afrr_selections += 1
+            if info.get('afrr_activated', False):
+                self.step_afrr_activations += 1
+
+            # I check for episode end (when total_profit is reported)
             if 'total_profit' in info:
                 self.episode_profits.append(info['total_profit'])
             if 'total_cycles' in info:
                 self.episode_cycles.append(info['total_cycles'])
 
+            # I track per-market profits
+            if 'dam_profit' in info:
+                self.dam_profits.append(info['dam_profit'])
+            if 'afrr_capacity_profit' in info:
+                self.afrr_capacity_profits.append(info['afrr_capacity_profit'])
+            if 'afrr_energy_profit' in info:
+                self.afrr_energy_profits.append(info['afrr_energy_profit'])
+            if 'mfrr_profit' in info:
+                self.mfrr_profits.append(info['mfrr_profit'])
+
         # I log periodically
         if self.num_timesteps % 10000 == 0 and len(self.episode_profits) > 0:
+            # I log overall metrics
             avg_profit = np.mean(self.episode_profits[-100:])
             avg_cycles = np.mean(self.episode_cycles[-100:])
             self.logger.record('custom/avg_profit', avg_profit)
@@ -102,14 +141,50 @@ class TensorboardLoggingCallback(BaseCallback):
             if avg_cycles > 0:
                 self.logger.record('custom/profit_per_cycle', avg_profit / avg_cycles)
 
+            # I log per-market profits
+            if len(self.dam_profits) > 0:
+                self.logger.record('markets/dam_profit', np.mean(self.dam_profits[-100:]))
+            if len(self.afrr_capacity_profits) > 0:
+                self.logger.record('markets/afrr_capacity_profit', np.mean(self.afrr_capacity_profits[-100:]))
+            if len(self.afrr_energy_profits) > 0:
+                self.logger.record('markets/afrr_energy_profit', np.mean(self.afrr_energy_profits[-100:]))
+            if len(self.mfrr_profits) > 0:
+                self.logger.record('markets/mfrr_profit', np.mean(self.mfrr_profits[-100:]))
+
+            # I log participation rates
+            if self.step_count > 0:
+                self.logger.record('participation/afrr_bid_rate', self.step_afrr_bids / self.step_count)
+                self.logger.record('participation/afrr_selection_rate', self.step_afrr_selections / self.step_count)
+                self.logger.record('participation/afrr_activation_rate', self.step_afrr_activations / self.step_count)
+
+                # I calculate conditional rates
+                if self.step_afrr_bids > 0:
+                    self.logger.record('participation/selection_given_bid',
+                                       self.step_afrr_selections / self.step_afrr_bids)
+                if self.step_afrr_selections > 0:
+                    self.logger.record('participation/activation_given_selection',
+                                       self.step_afrr_activations / self.step_afrr_selections)
+
+            # I reset step counters
+            self.step_afrr_bids = 0
+            self.step_afrr_selections = 0
+            self.step_afrr_activations = 0
+            self.step_count = 0
+
         return True
 
 
-def make_mask_fn(env):
-    """I create the action mask function for MaskablePPO."""
-    def mask_fn(env):
-        return env.action_masks()
-    return mask_fn
+class MaskableVecEnv(DummyVecEnv):
+    """
+    I extend DummyVecEnv to properly support action masking with VecNormalize.
+
+    MaskablePPO calls env_method("action_masks") which needs to work through
+    the VecNormalize wrapper. This class ensures action_masks is accessible.
+    """
+
+    def action_masks(self):
+        """I return action masks from all environments."""
+        return np.array([env.action_masks() for env in self.envs])
 
 
 def create_training_env(
@@ -140,7 +215,7 @@ def create_training_env(
             'reward_scale': 0.001
         }
 
-    # I create environment
+    # I create environment (it already implements action_masks())
     env = BatteryEnvUnified(
         df=df,
         capacity_mwh=battery_params['capacity_mwh'],
@@ -153,9 +228,6 @@ def create_training_env(
 
     # I wrap with Monitor for logging
     env = Monitor(env)
-
-    # I wrap with ActionMasker for MaskablePPO
-    env = ActionMasker(env, make_mask_fn(env))
 
     return env
 
@@ -184,7 +256,6 @@ def create_eval_env(
     )
 
     env = Monitor(env)
-    env = ActionMasker(env, make_mask_fn(env))
 
     return env
 
@@ -193,6 +264,7 @@ def train_unified_model(
     data_path: str = "data/unified_multimarket_training.csv",
     output_dir: str = "models/unified",
     total_timesteps: int = 5_000_000,
+    n_envs: int = 8,  # I use 8 parallel environments for speedup
     learning_rate: float = 3e-4,
     n_steps: int = 2048,
     batch_size: int = 256,
@@ -211,6 +283,7 @@ def train_unified_model(
         data_path: Path to unified training data
         output_dir: Directory to save model and logs
         total_timesteps: Total training steps
+        n_envs: Number of parallel environments for speedup
         learning_rate: Learning rate for optimizer
         n_steps: Steps per update
         batch_size: Batch size for updates
@@ -236,17 +309,34 @@ def train_unified_model(
 
     print(f"Output directory: {model_dir}")
     print(f"Training timesteps: {total_timesteps:,}")
+    print(f"Parallel environments: {n_envs}")
 
     # I resolve data path
     if not Path(data_path).exists():
         data_path = project_root / data_path
 
-    # I create training environment
-    print("\nCreating training environment...")
-    train_env = create_training_env(data_path)
+    # I load data once to share across environments
+    df = pd.read_csv(data_path, index_col=0, parse_dates=True)
+    print(f"Loaded training data: {len(df)} rows")
 
-    # I wrap in DummyVecEnv for VecNormalize
-    train_env = DummyVecEnv([lambda: train_env])
+    # I create multiple parallel training environments for speedup
+    print(f"\nCreating {n_envs} parallel training environments...")
+
+    def make_train_env(env_id: int):
+        """I create a training environment with unique random seed."""
+        def _init():
+            env = BatteryEnvUnified(
+                df=df,
+                episode_length=168,  # 1 week episodes
+                random_start=True
+            )
+            # I set unique seed for each environment
+            env.reset(seed=seed + env_id if seed else env_id)
+            return env
+        return _init
+
+    # I create vectorized environment with multiple parallel envs
+    train_env = MaskableVecEnv([make_train_env(i) for i in range(n_envs)])
 
     # I add VecNormalize for observation normalization
     train_env = VecNormalize(
@@ -257,10 +347,17 @@ def train_unified_model(
         clip_reward=10.0
     )
 
-    # I create evaluation environment
+    # I create evaluation environment (single env is fine for eval)
     print("Creating evaluation environment...")
-    eval_env = create_eval_env(data_path)
-    eval_env = DummyVecEnv([lambda: eval_env])
+
+    def make_eval_env():
+        return BatteryEnvUnified(
+            df=df,
+            episode_length=336,  # 2 weeks for eval
+            random_start=True
+        )
+
+    eval_env = MaskableVecEnv([make_eval_env])
     eval_env = VecNormalize(
         eval_env,
         norm_obs=True,
@@ -486,6 +583,8 @@ if __name__ == "__main__":
                         help="Output directory")
     parser.add_argument("--timesteps", type=int, default=5_000_000,
                         help="Total training timesteps")
+    parser.add_argument("--n_envs", type=int, default=8,
+                        help="Number of parallel environments (default: 8)")
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="Learning rate")
     parser.add_argument("--seed", type=int, default=42,
@@ -506,6 +605,7 @@ if __name__ == "__main__":
             data_path=args.data,
             output_dir=args.output,
             total_timesteps=args.timesteps,
+            n_envs=args.n_envs,
             learning_rate=args.lr,
             seed=args.seed,
             device=args.device
