@@ -427,12 +427,61 @@ class BatteryEnvUnified(gym.Env):
             afrr_activated, afrr_direction = self._check_afrr_activation(row)
 
         # =====================================================================
-        # 4. ENERGY ACTION (mFRR/IntraDay)
+        # 4. EXECUTE DAM COMMITMENT (MANDATORY - binding commitment)
+        # =====================================================================
+        # I MUST execute the DAM commitment first - this is a regulatory requirement
+        actual_energy_mw = 0.0
+        dam_executed_mw = 0.0
+
+        if abs(dam_commitment) > 0.1:
+            # I calculate available energy for DAM execution
+            available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
+            available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
+
+            if dam_commitment > 0:  # Must discharge
+                max_dam_discharge = min(
+                    abs(dam_commitment),
+                    available_discharge_mwh * self.eff_sqrt / self.time_step_hours
+                )
+                dam_executed_mw = max_dam_discharge
+
+                # I execute the discharge
+                energy_mwh = dam_executed_mw * self.time_step_hours
+                soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
+                self.soc = max(self.min_soc, self.soc - soc_delta)
+
+                # I track cycling from DAM
+                cycle_fraction = energy_mwh / self.capacity_mwh
+                self.total_cycles += cycle_fraction
+                self.daily_cycles += cycle_fraction
+
+            else:  # Must charge (dam_commitment < 0)
+                max_dam_charge = min(
+                    abs(dam_commitment),
+                    available_charge_mwh / self.eff_sqrt / self.time_step_hours
+                )
+                dam_executed_mw = -max_dam_charge  # Negative for charging
+
+                # I execute the charge
+                energy_mwh = max_dam_charge * self.time_step_hours
+                soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
+                self.soc = min(self.max_soc, self.soc + soc_delta)
+
+                # I track cycling from DAM
+                cycle_fraction = energy_mwh / self.capacity_mwh
+                self.total_cycles += cycle_fraction
+                self.daily_cycles += cycle_fraction
+
+            actual_energy_mw = dam_executed_mw
+            self.dam_profit += dam_executed_mw * row.get('price', 100.0) * self.time_step_hours
+
+        # =====================================================================
+        # 5. ENERGY ACTION (mFRR/IntraDay) - with REMAINING capacity after DAM
         # =====================================================================
         energy_level = self.energy_levels[energy_action]
         requested_power = energy_level * remaining_capacity
 
-        # I calculate physical limits
+        # I recalculate physical limits AFTER DAM execution
         available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
         available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
 
@@ -446,9 +495,8 @@ class BatteryEnvUnified(gym.Env):
         )
 
         # =====================================================================
-        # 5. EXECUTE aFRR IF ACTIVATED (takes priority!)
+        # 6. EXECUTE aFRR IF ACTIVATED (takes priority over mFRR!)
         # =====================================================================
-        actual_energy_mw = 0.0
         mfrr_energy_mw = 0.0
 
         if afrr_activated:
@@ -495,7 +543,7 @@ class BatteryEnvUnified(gym.Env):
                     afrr_energy_delivered = -actual_energy / self.time_step_hours  # Negative for charge
 
             self.afrr_energy_profit += afrr_energy_revenue
-            actual_energy_mw = afrr_energy_delivered
+            actual_energy_mw += afrr_energy_delivered  # ADD to DAM execution, not replace!
 
             # I reduce available capacity for mFRR
             remaining_after_afrr = remaining_capacity - abs(afrr_energy_delivered)
@@ -504,7 +552,7 @@ class BatteryEnvUnified(gym.Env):
             remaining_after_afrr = remaining_capacity
 
         # =====================================================================
-        # 6. EXECUTE mFRR/IntraDay TRADE (if capacity remains)
+        # 7. EXECUTE mFRR/IntraDay TRADE (if capacity remains)
         # =====================================================================
         if not afrr_activated and abs(requested_power) > 0.1:
             # I recalculate limits (SoC may have changed from aFRR)
@@ -557,7 +605,7 @@ class BatteryEnvUnified(gym.Env):
                 actual_energy_mw += actual_mfrr
 
         # =====================================================================
-        # 7. CALCULATE REWARD
+        # 8. CALCULATE REWARD
         # =====================================================================
         # I need to also account for DAM compliance
         # If we have a DAM commitment, actual_energy_mw should include that
@@ -605,7 +653,7 @@ class BatteryEnvUnified(gym.Env):
         self.episode_profit += reward_info['components'].get('net_profit', 0)
 
         # =====================================================================
-        # 8. ADVANCE STEP
+        # 9. ADVANCE STEP
         # =====================================================================
         self.current_step += 1
 
