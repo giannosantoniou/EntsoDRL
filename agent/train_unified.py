@@ -265,14 +265,14 @@ def train_unified_model(
     output_dir: str = "models/unified",
     total_timesteps: int = 5_000_000,
     n_envs: int = 8,  # I use 8 parallel environments for speedup
-    learning_rate: float = 3e-4,
+    learning_rate: float = 1e-4,
     n_steps: int = 2048,
     batch_size: int = 256,
     n_epochs: int = 10,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
     clip_range: float = 0.2,
-    ent_coef: float = 0.01,
+    ent_coef: float = 0.03,
     seed: int = 42,
     device: str = "auto"
 ) -> str:
@@ -585,8 +585,10 @@ if __name__ == "__main__":
                         help="Total training timesteps")
     parser.add_argument("--n_envs", type=int, default=8,
                         help="Number of parallel environments (default: 8)")
-    parser.add_argument("--lr", type=float, default=3e-4,
+    parser.add_argument("--lr", type=float, default=1e-4,
                         help="Learning rate")
+    parser.add_argument("--ent_coef", type=float, default=0.03,
+                        help="Entropy coefficient")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--device", type=str, default="auto",
@@ -607,6 +609,7 @@ if __name__ == "__main__":
             total_timesteps=args.timesteps,
             n_envs=args.n_envs,
             learning_rate=args.lr,
+            ent_coef=args.ent_coef,
             seed=args.seed,
             device=args.device
         )
