@@ -274,7 +274,8 @@ def train_unified_model(
     clip_range: float = 0.2,
     ent_coef: float = 0.03,
     seed: int = 42,
-    device: str = "auto"
+    device: str = "auto",
+    resume_from: str = None
 ) -> str:
     """
     I train the unified multi-market model.
@@ -398,43 +399,73 @@ def train_unified_model(
         logging_callback
     ])
 
-    # I create the model
-    print("\nCreating MaskablePPO model...")
-    print(f"  Learning rate: {learning_rate}")
-    print(f"  N steps: {n_steps}")
-    print(f"  Batch size: {batch_size}")
-    print(f"  Gamma: {gamma}")
-    print(f"  Entropy coefficient: {ent_coef}")
+    # I create or load the model
+    if resume_from:
+        # I resume training from a saved checkpoint
+        resume_path = Path(resume_from)
+        model_file = resume_path / "final_model.zip" if resume_path.is_dir() else resume_path
+        vec_file = resume_path.parent / "vec_normalize_unified.pkl" if not resume_path.is_dir() else resume_path / "vec_normalize_unified.pkl"
 
-    model = MaskablePPO(
-        "MlpPolicy",
-        train_env,
-        learning_rate=learning_rate,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        n_epochs=n_epochs,
-        gamma=gamma,
-        gae_lambda=gae_lambda,
-        clip_range=clip_range,
-        ent_coef=ent_coef,
-        verbose=1,
-        tensorboard_log=str(model_dir / "tensorboard"),
-        seed=seed,
-        device=device,
-        policy_kwargs={
-            "net_arch": dict(pi=[256, 256], vf=[256, 256])
-        }
-    )
+        print(f"\nResuming training from: {model_file}")
+        model = MaskablePPO.load(
+            str(model_file),
+            env=train_env,
+            device=device,
+            tensorboard_log=str(model_dir / "tensorboard")
+        )
+
+        # I load VecNormalize stats to continue with the same normalization
+        if vec_file.exists():
+            import pickle
+            with open(vec_file, 'rb') as f:
+                old_vec = pickle.load(f)
+            train_env.obs_rms = old_vec.obs_rms
+            train_env.ret_rms = old_vec.ret_rms
+            print(f"  Loaded VecNormalize stats from: {vec_file}")
+
+        print(f"  Learning rate: {model.learning_rate}")
+        print(f"  Entropy coefficient: {model.ent_coef}")
+    else:
+        print("\nCreating MaskablePPO model...")
+        print(f"  Learning rate: {learning_rate}")
+        print(f"  N steps: {n_steps}")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Gamma: {gamma}")
+        print(f"  Entropy coefficient: {ent_coef}")
+
+        model = MaskablePPO(
+            "MlpPolicy",
+            train_env,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            clip_range=clip_range,
+            ent_coef=ent_coef,
+            verbose=1,
+            tensorboard_log=str(model_dir / "tensorboard"),
+            seed=seed,
+            device=device,
+            policy_kwargs={
+                "net_arch": dict(pi=[256, 256], vf=[256, 256])
+            }
+        )
 
     # I train the model
+    reset_timesteps = resume_from is None
     print(f"\nStarting training for {total_timesteps:,} timesteps...")
+    if resume_from:
+        print("Continuing from previous checkpoint (reset_num_timesteps=False)")
     print("This will take several hours. Check tensorboard for progress.")
 
     try:
         model.learn(
             total_timesteps=total_timesteps,
             callback=callbacks,
-            progress_bar=True
+            progress_bar=True,
+            reset_num_timesteps=reset_timesteps
         )
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.")
@@ -593,6 +624,8 @@ if __name__ == "__main__":
                         help="Random seed")
     parser.add_argument("--device", type=str, default="auto",
                         help="Training device (auto/cpu/cuda)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to model directory to resume training from")
     parser.add_argument("--eval", type=str, default=None,
                         help="Path to model for evaluation (skip training)")
 
@@ -611,7 +644,8 @@ if __name__ == "__main__":
             learning_rate=args.lr,
             ent_coef=args.ent_coef,
             seed=args.seed,
-            device=args.device
+            device=args.device,
+            resume_from=args.resume
         )
 
         # I run evaluation on trained model
