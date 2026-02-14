@@ -1,14 +1,18 @@
 """
 Create Unified Multi-Market Training Dataset
 
-I merge DAM data (feasible_data_with_dam.csv) with aFRR/mFRR data (afrr_mfrr_combined_v2.csv)
-to create a single unified training dataset for the multi-market environment.
+I merge DAM data with balancing market data to create a single unified training
+dataset for the multi-market environment.
 
-The unified dataset contains all features needed for:
-- DAM commitment tracking
-- IntraDay price trading
-- aFRR capacity bidding and activation
-- mFRR energy trading
+Two modes:
+1. ADMIE-based (preferred): Real ADMIE balancing data + DAM prices
+   - Uses admie_market_data_combined.csv + dam_prices_2021_2026.csv
+   - Real mFRR energy/aFRR capacity prices, system load, RES, imbalance
+   - Only IntraDay is synthetic (no XBID data available)
+
+2. Synthetic fallback: feasible_data_with_dam.csv + afrr_mfrr_combined_v2.csv
+   - All balancing data synthesized via OU processes
+   - Used when ADMIE data is not available
 
 Output: data/unified_multimarket_training.csv
 """
@@ -66,6 +70,181 @@ def load_afrr_mfrr_data(path: str = "afrr_mfrr_combined_v2.csv") -> pd.DataFrame
     return df
 
 
+def create_unified_dataset_from_admie(
+    dam_path: str = 'dam_prices_2021_2026.csv',
+    admie_path: str = 'admie_market_data_combined.csv',
+    output_path: str = 'unified_multimarket_training.csv'
+) -> pd.DataFrame:
+    """
+    I create a unified training dataset from real ADMIE balancing data + DAM prices.
+
+    This replaces synthetic balancing data with actual market data from ADMIE,
+    which has realistic price levels (mFRR spread ~380 EUR vs synthetic ~80 EUR)
+    and real system features (load, RES production, imbalance).
+
+    Only IntraDay (XBID) prices remain synthetic since no real data is available.
+    """
+    data_dir = Path(__file__).parent
+
+    # Step 1: I load DAM prices and normalize to hourly timezone-naive index
+    print("=" * 60)
+    print("CREATING UNIFIED DATASET FROM REAL ADMIE DATA")
+    print("=" * 60)
+
+    dam_filepath = data_dir / dam_path
+    print(f"\nLoading DAM prices from {dam_filepath}...")
+    dam_df = pd.read_csv(dam_filepath, index_col=0)
+
+    # I parse timestamps as UTC (handles mixed +02:00/+03:00 DST offsets),
+    # convert to Athens local time, then strip tz to get naive local timestamps
+    dam_df.index = pd.to_datetime(dam_df.index, utc=True)
+    dam_df.index = dam_df.index.tz_convert('Europe/Athens')
+    dam_df.index = dam_df.index.tz_localize(None)
+
+    # I resample to hourly (DAM data may have sub-hourly resolution at the tail)
+    dam_df = dam_df.resample('h').mean().dropna()
+    dam_df.columns = ['price']  # I ensure consistent column name
+    print(f"  DAM: {len(dam_df)} hourly rows, {dam_df.index.min()} to {dam_df.index.max()}")
+    print(f"  DAM price: mean={dam_df['price'].mean():.2f}, std={dam_df['price'].std():.2f}")
+
+    # Step 2: I load ADMIE balancing market data
+    admie_filepath = data_dir / admie_path
+    print(f"\nLoading ADMIE data from {admie_filepath}...")
+    admie_df = pd.read_csv(admie_filepath, parse_dates=['timestamp'])
+    admie_df = admie_df.set_index('timestamp')
+
+    # I strip timezone if present (ADMIE is typically naive)
+    if admie_df.index.tz is not None:
+        admie_df.index = admie_df.index.tz_localize(None)
+
+    print(f"  ADMIE: {len(admie_df)} rows, {admie_df.index.min()} to {admie_df.index.max()}")
+
+    # Step 3: I inner join on timestamp (overlap: 2024-01-01 → 2026-01-17)
+    print("\nJoining DAM + ADMIE on timestamp...")
+    unified = dam_df.join(admie_df, how='inner')
+    print(f"  Overlap: {len(unified)} rows, {unified.index.min()} to {unified.index.max()}")
+
+    # Step 4: I map ADMIE columns → environment column names
+    # I rename mFRR energy activation prices (the high-value spreads the agent trades)
+    # Note: ADMIE's 'mfrr_price_up/down' are *capacity* prices (~0.65 EUR),
+    #        while 'mfrr_energy_price_up/down' are *energy activation* prices (~586/206 EUR)
+    column_mapping = {
+        'mfrr_energy_price_up': 'mfrr_price_up',
+        'mfrr_energy_price_down': 'mfrr_price_down',
+        'afrr_price_up': 'afrr_cap_up_price',
+        'afrr_price_down': 'afrr_cap_down_price',
+        'afrr_requirements_up': 'afrr_cap_up_qty',
+        'afrr_requirements_down': 'afrr_cap_down_qty',
+        'system_load_mw': 'load_mw',
+        'res_production_mw': 'res_total_mw',
+        'system_deviation_mwh': 'net_imbalance_mw',
+    }
+
+    # I drop ADMIE's own mfrr_price_up/down (capacity) before renaming
+    # to avoid collision with the energy prices I'm mapping in
+    admie_cap_cols = ['mfrr_price_up', 'mfrr_price_down']
+    for col in admie_cap_cols:
+        if col in unified.columns:
+            unified = unified.rename(columns={col: f'mfrr_cap_{col.split("_", 1)[1]}'})
+
+    unified = unified.rename(columns=column_mapping)
+
+    # Step 5: I derive aFRR energy prices from imbalance_price
+    # I use imbalance_price as aFRR energy up proxy, 30% as down proxy
+    if 'imbalance_price' in unified.columns:
+        unified['afrr_up'] = unified['imbalance_price']
+        unified['afrr_down'] = unified['imbalance_price'] * 0.3
+        unified['afrr_down'] = unified['afrr_down'].clip(lower=0)
+    else:
+        unified['afrr_up'] = 80.0
+        unified['afrr_down'] = 24.0
+
+    # I compute mFRR spread from real energy prices
+    unified['mfrr_spread'] = unified['mfrr_price_up'] - unified['mfrr_price_down']
+
+    # Step 6: I estimate solar/wind split from total RES + time-of-day
+    # ADMIE provides total RES but not the breakdown
+    if 'res_total_mw' in unified.columns:
+        hours = unified.index.hour.values
+        # I estimate solar with a bell curve centered at noon (hours 6-18)
+        solar_fraction = np.maximum(0, np.sin(np.pi * (hours - 5) / 13))
+        # I adjust the fraction: solar is ~60% of RES during daylight, 0% at night
+        solar_fraction = solar_fraction * 0.6
+        solar_fraction[hours < 6] = 0.0
+        solar_fraction[hours > 19] = 0.0
+
+        unified['solar'] = unified['res_total_mw'] * solar_fraction
+        unified['wind_onshore'] = unified['res_total_mw'] * (1 - solar_fraction)
+    else:
+        unified['solar'] = 0.0
+        unified['wind_onshore'] = 0.0
+
+    # Step 7: I initialize dam_commitment to 0 (agent learns this via DAM market)
+    unified['dam_commitment'] = 0.0
+
+    # Step 8: I add rolling statistics BEFORE synthesizing IntraDay
+    # (IntraDay synthesis uses price_std_24h if available)
+    unified['price_mean_24h'] = unified['price'].rolling(24, min_periods=1).mean()
+    unified['price_std_24h'] = unified['price'].rolling(24, min_periods=1).std().fillna(10)
+    unified['price_min_24h'] = unified['price'].rolling(24, min_periods=1).min()
+    unified['price_max_24h'] = unified['price'].rolling(24, min_periods=1).max()
+
+    # Step 9: I synthesize IntraDay data (no real XBID data available)
+    # I use the existing synthesis function calibrated to real DAM prices
+    all_mask = pd.Series(True, index=unified.index)
+    unified = _synthesize_intraday_data(unified, all_mask)
+
+    # Step 10: I add all derived features (lags, rolling stats, time features)
+    unified = _add_derived_features(unified)
+
+    # Step 11: I validate the final dataset
+    _validate_dataset(unified)
+
+    # I print comparison statistics for verification
+    _print_admie_vs_synthetic_stats(unified)
+
+    # I save the output
+    output_filepath = data_dir / output_path
+    unified.to_csv(output_filepath)
+    print(f"\nSaved unified ADMIE-based dataset to {output_filepath}")
+    print(f"Dataset shape: {unified.shape}")
+
+    # I save a sample for inspection
+    sample_path = data_dir / "unified_multimarket_sample.csv"
+    unified.head(100).to_csv(sample_path)
+    print(f"Saved sample (100 rows) to {sample_path}")
+
+    return unified
+
+
+def _print_admie_vs_synthetic_stats(df: pd.DataFrame) -> None:
+    """I print key statistics to verify real data quality vs old synthetic levels."""
+    print("\n" + "=" * 60)
+    print("REAL ADMIE DATA STATISTICS (compare vs old synthetic)")
+    print("=" * 60)
+
+    stats = {
+        'DAM price': ('price', None),
+        'mFRR up (energy)': ('mfrr_price_up', 'was ~145 synthetic'),
+        'mFRR down (energy)': ('mfrr_price_down', 'was ~65 synthetic'),
+        'mFRR spread': ('mfrr_spread', 'was ~80 synthetic'),
+        'aFRR cap up': ('afrr_cap_up_price', 'was ~22 synthetic'),
+        'aFRR cap down': ('afrr_cap_down_price', 'was ~15 synthetic'),
+        'aFRR up (energy)': ('afrr_up', 'was ~105 synthetic'),
+        'System load': ('load_mw', 'was ~5000 synthetic'),
+        'RES total': ('res_total_mw', 'was missing'),
+        'Net imbalance': ('net_imbalance_mw', 'was simulated'),
+    }
+
+    for label, (col, note) in stats.items():
+        if col in df.columns:
+            note_str = f"  ({note})" if note else ""
+            print(f"  {label}: mean={df[col].mean():.1f}, "
+                  f"std={df[col].std():.1f}, "
+                  f"min={df[col].min():.1f}, "
+                  f"max={df[col].max():.1f}{note_str}")
+
+
 def create_unified_dataset(dam_df: pd.DataFrame, afrr_df: pd.DataFrame) -> pd.DataFrame:
     """
     I merge DAM and aFRR/mFRR datasets into a unified training dataset.
@@ -115,6 +294,10 @@ def create_unified_dataset(dam_df: pd.DataFrame, afrr_df: pd.DataFrame) -> pd.Da
     if missing_mask.sum() > 0:
         unified = _synthesize_balancing_data(unified, missing_mask)
 
+    # I synthesize IntraDay data for ALL rows (no real IntraDay data available)
+    all_mask = pd.Series(True, index=unified.index)
+    unified = _synthesize_intraday_data(unified, all_mask)
+
     # I add derived features for training
     unified = _add_derived_features(unified)
 
@@ -126,51 +309,173 @@ def create_unified_dataset(dam_df: pd.DataFrame, afrr_df: pd.DataFrame) -> pd.Da
 
 def _synthesize_balancing_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
     """
-    I synthesize realistic aFRR/mFRR data based on DAM prices.
+    I synthesize realistic aFRR/mFRR data with independent dynamics.
 
-    This is based on observed correlations:
-    - aFRR prices correlate with DAM prices (~0.7-0.8)
-    - mFRR spreads are typically 30-80 EUR
-    - Capacity prices are 10-50 EUR/MW/h
-    - Activation correlates with price volatility
+    Key design: mFRR/aFRR prices are partially correlated with DAM (~0.5-0.6)
+    but have significant independent variation from:
+    - Ornstein-Uhlenbeck mean-reverting spread process
+    - Regime shifts (scarcity events, low-demand periods)
+    - RES forecast error driving imbalance prices
+    - Temporal autocorrelation (prices don't jump randomly hour-to-hour)
     """
     dam_prices = df.loc[mask, 'price'].values
     hours = df.loc[mask].index.hour.values if hasattr(df.index, 'hour') else np.zeros(mask.sum())
+    n = len(dam_prices)
 
-    # I add noise proportional to price level
-    noise_factor = 0.15
+    # I generate an independent Ornstein-Uhlenbeck spread process
+    # This ensures mFRR spread has temporal autocorrelation but is NOT
+    # deterministically derived from DAM
+    ou_theta = 0.15  # Mean reversion speed
+    ou_mu_up = 45.0  # Long-run mean spread (upward)
+    ou_mu_down = 30.0  # Long-run mean spread (downward)
+    ou_sigma = 15.0  # Volatility of spread
 
-    # aFRR prices: typically slightly above DAM
-    df.loc[mask, 'afrr_up'] = dam_prices * (1.0 + np.random.uniform(0.02, 0.15, len(dam_prices)))
-    df.loc[mask, 'afrr_down'] = dam_prices * (1.0 - np.random.uniform(0.05, 0.20, len(dam_prices)))
+    spread_up = np.zeros(n)
+    spread_down = np.zeros(n)
+    spread_up[0] = ou_mu_up + np.random.normal(0, ou_sigma)
+    spread_down[0] = ou_mu_down + np.random.normal(0, ou_sigma)
 
-    # mFRR prices: wider spreads than DAM
-    base_spread = 40 + 30 * np.sin(2 * np.pi * hours / 24)  # I vary by time of day
-    df.loc[mask, 'mfrr_price_up'] = dam_prices + base_spread * np.random.uniform(0.8, 1.5, len(dam_prices))
-    df.loc[mask, 'mfrr_price_down'] = dam_prices - base_spread * np.random.uniform(0.5, 1.0, len(dam_prices))
-    df.loc[mask, 'mfrr_price_down'] = df.loc[mask, 'mfrr_price_down'].clip(lower=0)  # No negative prices
+    for i in range(1, n):
+        # I add mean-reverting dynamics with regime shifts
+        spread_up[i] = spread_up[i-1] + ou_theta * (ou_mu_up - spread_up[i-1]) + ou_sigma * np.random.normal() * np.sqrt(1.0)
+        spread_down[i] = spread_down[i-1] + ou_theta * (ou_mu_down - spread_down[i-1]) + ou_sigma * np.random.normal() * np.sqrt(1.0)
+
+    # I add regime shifts — scarcity events where spreads spike
+    # These happen ~5% of hours and are unpredictable from DAM alone
+    scarcity_events = np.random.random(n) < 0.05
+    spread_up[scarcity_events] *= np.random.uniform(2.0, 4.0, scarcity_events.sum())
+
+    # I add time-of-day modulation (smaller effect than before)
+    tod_factor = 1.0 + 0.3 * np.sin(2 * np.pi * hours / 24)
+
+    # I clip spreads to realistic range
+    spread_up = np.clip(spread_up * tod_factor, 5, 200)
+    spread_down = np.clip(spread_down * tod_factor, 3, 150)
+
+    # I compute mFRR prices: DAM correlation ~0.5 + independent spread
+    # I add an independent price component that doesn't track DAM
+    independent_level = np.cumsum(np.random.normal(0, 2.0, n))  # Random walk
+    independent_level -= np.convolve(independent_level, np.ones(168)/168, mode='same')  # I detrend weekly
+    independent_component = np.clip(independent_level, -40, 40)
+
+    df.loc[mask, 'mfrr_price_up'] = dam_prices + spread_up + independent_component
+    df.loc[mask, 'mfrr_price_down'] = np.clip(dam_prices - spread_down + independent_component * 0.5, 0, None)
     df.loc[mask, 'mfrr_spread'] = df.loc[mask, 'mfrr_price_up'] - df.loc[mask, 'mfrr_price_down']
 
-    # aFRR capacity prices: typically 10-50 EUR/MW/h
+    # aFRR prices: partial DAM correlation + independent dynamics
+    afrr_independent = np.cumsum(np.random.normal(0, 1.5, n))
+    afrr_independent -= np.convolve(afrr_independent, np.ones(168)/168, mode='same')
+    afrr_independent = np.clip(afrr_independent, -20, 20)
+
+    df.loc[mask, 'afrr_up'] = dam_prices * (1.0 + np.random.uniform(0.02, 0.15, n)) + afrr_independent
+    df.loc[mask, 'afrr_down'] = np.clip(dam_prices * (1.0 - np.random.uniform(0.05, 0.20, n)) + afrr_independent * 0.5, 0, None)
+
+    # aFRR capacity prices: independent OU process (not DAM-derived)
+    cap_ou = np.zeros(n)
+    cap_mu = 22.0
+    cap_ou[0] = cap_mu
+    for i in range(1, n):
+        cap_ou[i] = cap_ou[i-1] + 0.1 * (cap_mu - cap_ou[i-1]) + 5.0 * np.random.normal()
+
     peak_hours = (hours >= 17) & (hours <= 21)
-    base_cap_price = np.where(peak_hours, 30, 15)
-    df.loc[mask, 'afrr_cap_up_price'] = base_cap_price * np.random.uniform(0.5, 2.0, len(dam_prices))
-    df.loc[mask, 'afrr_cap_down_price'] = base_cap_price * np.random.uniform(0.3, 1.5, len(dam_prices))
+    cap_peak_boost = np.where(peak_hours, 10.0, 0.0)
+    df.loc[mask, 'afrr_cap_up_price'] = np.clip(cap_ou + cap_peak_boost + np.random.normal(0, 3, n), 2, 80)
+    df.loc[mask, 'afrr_cap_down_price'] = np.clip(cap_ou * 0.7 + np.random.normal(0, 3, n), 1, 60)
 
     # Capacity quantities: typical reserve needs
-    df.loc[mask, 'afrr_cap_up_qty'] = np.random.uniform(200, 800, len(dam_prices))
-    df.loc[mask, 'afrr_cap_down_qty'] = np.random.uniform(100, 300, len(dam_prices))
+    df.loc[mask, 'afrr_cap_up_qty'] = np.random.uniform(200, 800, n)
+    df.loc[mask, 'afrr_cap_down_qty'] = np.random.uniform(100, 300, n)
 
     # System state: net imbalance correlates with RES variability
-    solar = df.loc[mask, 'solar'].values if 'solar' in df.columns else np.zeros(len(dam_prices))
-    wind = df.loc[mask, 'wind_onshore'].values if 'wind_onshore' in df.columns else np.zeros(len(dam_prices))
+    solar = df.loc[mask, 'solar'].values if 'solar' in df.columns else np.zeros(n)
+    wind = df.loc[mask, 'wind_onshore'].values if 'wind_onshore' in df.columns else np.zeros(n)
     res_total = solar + wind
 
     # I create imbalance based on RES forecast error simulation
-    forecast_error = np.random.normal(0, 0.1, len(dam_prices)) * (res_total + 100)
+    forecast_error = np.random.normal(0, 0.1, n) * (res_total + 100)
     df.loc[mask, 'net_imbalance_mw'] = forecast_error
     df.loc[mask, 'res_total_mw'] = res_total
-    df.loc[mask, 'load_mw'] = 5000 + 2000 * np.sin(2 * np.pi * hours / 24) + np.random.normal(0, 200, len(dam_prices))
+    df.loc[mask, 'load_mw'] = 5000 + 2000 * np.sin(2 * np.pi * hours / 24) + np.random.normal(0, 200, n)
+
+    return df
+
+
+def _synthesize_intraday_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
+    """
+    I synthesize realistic IntraDay (XBID/HEnEx) market data with independent dynamics.
+
+    Key design: IntraDay prices are partially correlated with DAM (~0.6-0.7)
+    but have significant independent variation from:
+    - Ornstein-Uhlenbeck deviation process (autocorrelated, not white noise)
+    - RES forecast updates between DAM and IntraDay gate
+    - Liquidity-driven spread dynamics
+    - Regime shifts (e.g., unexpected weather changes)
+    """
+    dam_prices = df.loc[mask, 'price'].values
+    hours = df.loc[mask].index.hour.values if hasattr(df.index, 'hour') else np.zeros(mask.sum())
+    n = len(dam_prices)
+
+    # I generate an independent OU deviation process
+    # This represents market information arriving AFTER DAM clearing
+    # (RES forecast updates, cross-border flow changes, outages)
+    # I scale sigma proportionally to DAM price level for realistic deviation
+    ou_theta = 0.05  # Slow mean reversion — deviations persist for many hours
+    ou_sigma_base = 8.0  # Base EUR volatility per sqrt(hour)
+    deviation = np.zeros(n)
+    deviation[0] = np.random.normal(0, ou_sigma_base)
+
+    for i in range(1, n):
+        # I scale volatility by price level — higher prices have larger deviations
+        price_scale = max(dam_prices[i] / 100.0, 0.3)
+        sigma_i = ou_sigma_base * price_scale
+        deviation[i] = deviation[i-1] + ou_theta * (0 - deviation[i-1]) + sigma_i * np.random.normal()
+
+    # I add regime shifts — sudden forecast changes (~5% of hours)
+    forecast_shocks = np.random.random(n) < 0.05
+    shock_scale = np.abs(dam_prices[forecast_shocks]) * 0.15  # 15% of DAM price
+    deviation[forecast_shocks] += np.random.normal(0, 1.0, forecast_shocks.sum()) * shock_scale
+
+    # I add time-of-day effects (smaller than before)
+    peak_premium = np.where((hours >= 17) & (hours <= 21), 2.0, 0.0)
+    solar_discount = np.where((hours >= 9) & (hours <= 15), -1.5, 0.0)
+
+    # I compute IntraDay mid: DAM + independent_deviation + small_tod_effect
+    intraday_mid = dam_prices + deviation + peak_premium + solar_discount
+
+    # I generate spread with independent OU dynamics
+    spread_ou = np.zeros(n)
+    spread_mu = 3.0  # Mean spread
+    spread_ou[0] = spread_mu
+    for i in range(1, n):
+        spread_ou[i] = spread_ou[i-1] + 0.12 * (spread_mu - spread_ou[i-1]) + 1.0 * abs(np.random.normal())
+
+    # I modulate spread by liquidity hours
+    is_liquid = ((hours >= 8) & (hours <= 20)).astype(float)
+    liquidity_factor = np.where(is_liquid, 0.7, 1.5)
+
+    # I add volatility-based spread widening
+    price_std = df.loc[mask, 'price_std_24h'].values if 'price_std_24h' in df.columns else np.full(n, 15.0)
+    volatility_factor = np.clip(price_std / 30.0, 0.5, 2.0)
+
+    spread = spread_ou * liquidity_factor * volatility_factor
+    spread = np.clip(spread, 0.5, 15.0)
+
+    # I calculate bid and ask from mid and spread
+    df.loc[mask, 'intraday_bid'] = intraday_mid - spread / 2.0
+    df.loc[mask, 'intraday_ask'] = intraday_mid + spread / 2.0
+    df.loc[mask, 'intraday_spread'] = spread
+
+    # I calculate volume with independent dynamics
+    vol_ou = np.zeros(n)
+    vol_mu = 0.55
+    vol_ou[0] = vol_mu
+    for i in range(1, n):
+        vol_ou[i] = vol_ou[i-1] + 0.1 * (vol_mu - vol_ou[i-1]) + 0.08 * np.random.normal()
+
+    peak_boost = np.where((hours >= 17) & (hours <= 21), 0.15, 0.0)
+    liquid_boost = np.where(is_liquid, 0.1, -0.1)
+    volume = vol_ou + peak_boost + liquid_boost
+    df.loc[mask, 'intraday_volume'] = np.clip(volume, 0.1, 1.0)
 
     return df
 
@@ -190,6 +495,11 @@ def _add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[f'{col}_lag_1h'] = df[col].shift(1)
             df[f'{col}_lag_4h'] = df[col].shift(4)
+
+    # I add IntraDay lagged features (avoid lookahead)
+    for col in ['intraday_bid', 'intraday_ask', 'intraday_spread', 'intraday_volume']:
+        if col in df.columns:
+            df[f'{col}_lag_1h'] = df[col].shift(1)
 
     # I add rolling statistics (backward-looking only!)
     df['price_mean_24h'] = df['price'].rolling(24, min_periods=1).mean()
@@ -220,6 +530,7 @@ def _validate_dataset(df: pd.DataFrame) -> None:
     # I check for required columns
     required_columns = [
         'price', 'dam_commitment',  # DAM
+        'intraday_bid', 'intraday_ask', 'intraday_spread',  # IntraDay
         'afrr_up', 'afrr_down',  # aFRR energy
         'afrr_cap_up_price', 'afrr_cap_down_price',  # aFRR capacity
         'mfrr_price_up', 'mfrr_price_down', 'mfrr_spread',  # mFRR
@@ -252,33 +563,52 @@ def _validate_dataset(df: pd.DataFrame) -> None:
     print(f"  aFRR down: mean={df['afrr_down'].mean():.2f}")
     print(f"  mFRR spread: mean={df['mfrr_spread'].mean():.2f}")
 
+    if 'intraday_bid' in df.columns:
+        print(f"  IntraDay bid: mean={df['intraday_bid'].mean():.2f}")
+        print(f"  IntraDay ask: mean={df['intraday_ask'].mean():.2f}")
+        print(f"  IntraDay spread: mean={df['intraday_spread'].mean():.2f}")
+
     if 'afrr_cap_up_price' in df.columns:
         print(f"  aFRR cap price: mean={df['afrr_cap_up_price'].mean():.2f}")
 
 
 def main():
-    """I create and save the unified training dataset."""
-    print("=" * 60)
-    print("CREATING UNIFIED MULTI-MARKET TRAINING DATASET")
-    print("=" * 60)
+    """
+    I create and save the unified training dataset.
 
-    # I load both datasets
-    dam_df = load_dam_data()
-    afrr_df = load_afrr_mfrr_data()
+    I default to ADMIE-based creation (real market data) when the ADMIE CSV
+    exists, falling back to synthetic generation otherwise.
+    """
+    data_dir = Path(__file__).parent
+    admie_path = data_dir / "admie_market_data_combined.csv"
+    dam_path = data_dir / "dam_prices_2021_2026.csv"
 
-    # I create the unified dataset
-    unified_df = create_unified_dataset(dam_df, afrr_df)
+    if admie_path.exists() and dam_path.exists():
+        print("ADMIE data found — using real market data")
+        unified_df = create_unified_dataset_from_admie()
+    else:
+        print("ADMIE data not found — falling back to synthetic generation")
+        print("=" * 60)
+        print("CREATING UNIFIED MULTI-MARKET TRAINING DATASET (SYNTHETIC)")
+        print("=" * 60)
 
-    # I save the unified dataset
-    output_path = Path(__file__).parent / "unified_multimarket_training.csv"
-    unified_df.to_csv(output_path)
-    print(f"\nSaved unified dataset to {output_path}")
-    print(f"Dataset shape: {unified_df.shape}")
+        # I load both datasets
+        dam_df = load_dam_data()
+        afrr_df = load_afrr_mfrr_data()
 
-    # I also save a sample for inspection
-    sample_path = Path(__file__).parent / "unified_multimarket_sample.csv"
-    unified_df.head(100).to_csv(sample_path)
-    print(f"Saved sample (100 rows) to {sample_path}")
+        # I create the unified dataset
+        unified_df = create_unified_dataset(dam_df, afrr_df)
+
+        # I save the unified dataset
+        output_path = data_dir / "unified_multimarket_training.csv"
+        unified_df.to_csv(output_path)
+        print(f"\nSaved unified dataset to {output_path}")
+        print(f"Dataset shape: {unified_df.shape}")
+
+        # I also save a sample for inspection
+        sample_path = data_dir / "unified_multimarket_sample.csv"
+        unified_df.head(100).to_csv(sample_path)
+        print(f"Saved sample (100 rows) to {sample_path}")
 
     return unified_df
 
