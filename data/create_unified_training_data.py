@@ -179,8 +179,10 @@ def create_unified_dataset_from_admie(
         unified['solar'] = 0.0
         unified['wind_onshore'] = 0.0
 
-    # Step 7: I initialize dam_commitment to 0 (agent learns this via DAM market)
-    unified['dam_commitment'] = 0.0
+    # Step 7: I generate realistic DAM commitments based on daily price patterns
+    # In reality, operators submit bids to DAM by 12:00 D-1 for next-day delivery.
+    # Accepted bids become mandatory commitments the battery must fulfill.
+    unified['dam_commitment'] = _generate_dam_commitments(unified)
 
     # Step 8: I add rolling statistics BEFORE synthesizing IntraDay
     # (IntraDay synthesis uses price_std_24h if available)
@@ -398,6 +400,88 @@ def _synthesize_balancing_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFram
     df.loc[mask, 'load_mw'] = 5000 + 2000 * np.sin(2 * np.pi * hours / 24) + np.random.normal(0, 200, n)
 
     return df
+
+
+def _generate_dam_commitments(df: pd.DataFrame) -> np.ndarray:
+    """
+    I generate realistic DAM commitments based on daily price profiles.
+
+    In the real market, a battery operator would:
+    1. Forecast next-day DAM prices (submitted by 12:00 D-1)
+    2. Bid to charge during the cheapest hours (solar midday, night)
+    3. Bid to discharge during the most expensive hours (evening peak)
+    4. Not every day has commitments (sometimes prices are flat, or operator is cautious)
+
+    I use actual DAM prices as a proxy for "perfect forecast" — this represents
+    what a well-informed operator would have committed. Randomization adds
+    training diversity and prevents the agent from overfitting to a fixed pattern.
+    """
+    max_power_mw = 30.0  # Battery inverter rating
+    commitments = np.zeros(len(df))
+
+    # I group by date and generate commitments per day
+    dates = df.index.normalize().unique()
+
+    for date in dates:
+        day_mask = df.index.normalize() == date
+        day_prices = df.loc[day_mask, 'price'].values
+        day_hours = df.loc[day_mask].index.hour.values
+        n_hours = len(day_prices)
+
+        if n_hours < 12:
+            continue
+
+        # I skip ~15% of days randomly (operator caution, maintenance, etc.)
+        if np.random.random() < 0.15:
+            continue
+
+        # I rank hours by price within the day
+        price_rank = np.argsort(np.argsort(day_prices))  # 0=cheapest, n-1=most expensive
+
+        # I select charge hours (cheapest 4-6 hours) and discharge hours (most expensive 4-6 hours)
+        n_charge = np.random.randint(3, 6)
+        n_discharge = np.random.randint(3, 6)
+
+        charge_threshold = n_charge
+        discharge_threshold = n_hours - n_discharge
+
+        # I determine commitment size with randomization (50-100% of max power)
+        charge_power = max_power_mw * np.random.uniform(0.5, 1.0)
+        discharge_power = max_power_mw * np.random.uniform(0.5, 1.0)
+
+        day_commitments = np.zeros(n_hours)
+
+        for i in range(n_hours):
+            if price_rank[i] < charge_threshold:
+                # I commit to charge (buy) — negative = charge
+                day_commitments[i] = -charge_power * np.random.uniform(0.6, 1.0)
+            elif price_rank[i] >= discharge_threshold:
+                # I commit to discharge (sell) — positive = discharge
+                day_commitments[i] = discharge_power * np.random.uniform(0.6, 1.0)
+
+        # I ensure net energy balance is roughly feasible within the day
+        # (total charge ≥ total discharge / efficiency)
+        total_charge = abs(day_commitments[day_commitments < 0].sum())
+        total_discharge = day_commitments[day_commitments > 0].sum()
+
+        if total_charge < total_discharge * 1.1:
+            # I scale down discharge to maintain feasibility
+            scale = total_charge / (total_discharge * 1.1 + 1e-6)
+            day_commitments[day_commitments > 0] *= scale
+
+        commitments[day_mask] = day_commitments
+
+    # I clip to inverter limits
+    commitments = np.clip(commitments, -max_power_mw, max_power_mw)
+
+    n_active = np.sum(np.abs(commitments) > 0.1)
+    n_charge = np.sum(commitments < -0.1)
+    n_discharge = np.sum(commitments > 0.1)
+    print(f"  DAM commitments: {n_active} active hours "
+          f"({n_charge} charge, {n_discharge} discharge), "
+          f"{len(commitments) - n_active} idle")
+
+    return commitments
 
 
 def _synthesize_intraday_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
