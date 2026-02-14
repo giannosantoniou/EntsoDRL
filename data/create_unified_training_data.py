@@ -179,10 +179,19 @@ def create_unified_dataset_from_admie(
         unified['solar'] = 0.0
         unified['wind_onshore'] = 0.0
 
-    # Step 7: I generate realistic DAM commitments based on daily price patterns
-    # In reality, operators submit bids to DAM by 12:00 D-1 for next-day delivery.
-    # Accepted bids become mandatory commitments the battery must fulfill.
-    unified['dam_commitment'] = _generate_dam_commitments(unified)
+    # Step 7: I generate DAM commitments from EntsoE3 D-1 price forecasts
+    # In production, the EntsoE3 forecaster predicts DAM prices at 12:55 D-1,
+    # bids are submitted before 13:00, and accepted positions become mandatory.
+    # I use retrospective forecasts (imperfect, MAE ~18 EUR) — NOT actual prices.
+    forecast_path = data_dir / "dam_forecasts_2024_2026.csv"
+    if forecast_path.exists():
+        print("  Using EntsoE3 D-1 forecasts for DAM commitments...")
+        unified['dam_commitment'] = _generate_dam_commitments_from_forecasts(
+            unified, forecast_path
+        )
+    else:
+        print("  WARNING: EntsoE3 forecasts not found, using heuristic DAM commitments")
+        unified['dam_commitment'] = _generate_dam_commitments(unified)
 
     # Step 8: I add rolling statistics BEFORE synthesizing IntraDay
     # (IntraDay synthesis uses price_std_24h if available)
@@ -400,6 +409,120 @@ def _synthesize_balancing_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFram
     df.loc[mask, 'load_mw'] = 5000 + 2000 * np.sin(2 * np.pi * hours / 24) + np.random.normal(0, 200, n)
 
     return df
+
+
+def _generate_dam_commitments_from_forecasts(
+    df: pd.DataFrame,
+    forecast_path: Path
+) -> np.ndarray:
+    """
+    I generate DAM commitments using D-1 price forecasts from EntsoE3.
+
+    This is realistic because:
+    1. Forecasts have imperfect accuracy (MAE ~18 EUR/MWh) — not oracle
+    2. The operator bids based on forecasted prices, not actual prices
+    3. Commitments are sized based on forecasted price spreads within each day
+
+    Strategy: I charge during forecasted cheap hours and discharge during
+    forecasted expensive hours, with size proportional to the daily spread.
+    """
+    max_power_mw = 30.0
+    commitments = np.zeros(len(df))
+
+    # I load the D-1 forecasts
+    forecasts_df = pd.read_csv(forecast_path, index_col=0, parse_dates=True)
+    print(f"    Loaded {len(forecasts_df)} hourly forecasts")
+
+    # I match forecasts to training data timestamps
+    dates = df.index.normalize().unique()
+
+    n_active_days = 0
+    for date in dates:
+        day_mask = df.index.normalize() == date
+        day_idx = df.index[day_mask]
+        n_hours = len(day_idx)
+
+        if n_hours < 12:
+            continue
+
+        # I get forecasted prices for this day
+        day_forecasts = forecasts_df.loc[
+            forecasts_df.index.normalize() == date, 'forecast_price'
+        ]
+
+        if len(day_forecasts) < 12:
+            continue
+
+        # I align forecast hours with data hours
+        forecast_prices = np.full(n_hours, np.nan)
+        for i, ts in enumerate(day_idx):
+            if ts in day_forecasts.index:
+                forecast_prices[i] = day_forecasts.loc[ts]
+
+        # I skip days where forecasts are mostly missing
+        valid = ~np.isnan(forecast_prices)
+        if valid.sum() < 12:
+            continue
+
+        # I fill any missing hours with interpolation
+        forecast_prices = pd.Series(forecast_prices).interpolate().fillna(method='bfill').fillna(method='ffill').values
+
+        # I skip ~10% of days randomly (maintenance, operator caution)
+        if np.random.random() < 0.10:
+            continue
+
+        # I compute the daily forecasted price spread
+        daily_spread = np.max(forecast_prices) - np.min(forecast_prices)
+
+        # I skip days with very flat forecasted prices (spread < 15 EUR)
+        # — not worth the cycling cost
+        if daily_spread < 15.0:
+            continue
+
+        # I rank hours by forecasted price
+        price_rank = np.argsort(np.argsort(forecast_prices))
+
+        # I select charge hours (cheapest 4-5) and discharge hours (most expensive 4-5)
+        n_trade = min(5, n_hours // 4)
+        charge_threshold = n_trade
+        discharge_threshold = n_hours - n_trade
+
+        # I size commitments based on daily spread (higher spread → more aggressive)
+        # Spread 15-30 EUR: 40-60% of max power
+        # Spread 30-60 EUR: 60-80%
+        # Spread > 60 EUR: 80-100%
+        spread_factor = np.clip(daily_spread / 80.0, 0.4, 1.0)
+        base_power = max_power_mw * spread_factor
+
+        day_commitments = np.zeros(n_hours)
+
+        for i in range(n_hours):
+            if price_rank[i] < charge_threshold:
+                day_commitments[i] = -base_power * np.random.uniform(0.6, 1.0)
+            elif price_rank[i] >= discharge_threshold:
+                day_commitments[i] = base_power * np.random.uniform(0.6, 1.0)
+
+        # I ensure energy balance feasibility (charge ≥ discharge / efficiency)
+        total_charge = abs(day_commitments[day_commitments < 0].sum())
+        total_discharge = day_commitments[day_commitments > 0].sum()
+
+        if total_charge < total_discharge * 1.1:
+            scale = total_charge / (total_discharge * 1.1 + 1e-6)
+            day_commitments[day_commitments > 0] *= scale
+
+        commitments[day_mask] = day_commitments
+        n_active_days += 1
+
+    commitments = np.clip(commitments, -max_power_mw, max_power_mw)
+
+    n_active = np.sum(np.abs(commitments) > 0.1)
+    n_charge = np.sum(commitments < -0.1)
+    n_discharge = np.sum(commitments > 0.1)
+    print(f"    DAM commitments (forecast-based): {n_active} active hours "
+          f"({n_charge} charge, {n_discharge} discharge) across {n_active_days} days, "
+          f"{len(commitments) - n_active} idle")
+
+    return commitments
 
 
 def _generate_dam_commitments(df: pd.DataFrame) -> np.ndarray:
