@@ -3,23 +3,24 @@ Unified Multi-Market Battery Trading Environment
 
 I implement a single unified environment that handles ALL markets:
 - DAM (Day-Ahead Market) commitment tracking
-- IntraDay energy trading
+- IntraDay (XBID/HEnEx) energy trading — voluntary arbitrage
 - aFRR (automatic Frequency Restoration Reserve) capacity + energy
-- mFRR (manual Frequency Restoration Reserve) energy trading
+- mFRR (manual Frequency Restoration Reserve) energy trading — balancing market
 
 Key Design Decisions:
 1. Single model for all markets (learns market interactions)
-2. MultiDiscrete action space: [aFRR_commitment, aFRR_price_tier, energy_action]
-3. Hierarchical capacity cascading: DAM -> aFRR -> mFRR/IntraDay
+2. MultiDiscrete action space: [aFRR_commitment, aFRR_price_tier, intraday_action, mfrr_action]
+3. Hierarchical capacity cascading: DAM -> aFRR -> IntraDay -> mFRR
 4. aFRR activation simulation with MANDATORY response requirement
 5. HEnEx-compliant gate closure awareness
 
-Action Space: MultiDiscrete([5, 5, 21]) = 525 combinations
+Action Space: MultiDiscrete([5, 5, 11, 11]) = 3,025 combinations
 - [0] aFRR Commitment: 0%, 25%, 50%, 75%, 100% of remaining capacity
 - [1] aFRR Price Tier: 5 levels from aggressive to conservative bidding
-- [2] Energy Action: -30 to +30 MW (IntraDay/mFRR trading)
+- [2] IntraDay Action: 11 levels (-1.0 to +1.0) × remaining capacity after aFRR
+- [3] mFRR Action: 11 levels (-1.0 to +1.0) × remaining capacity after IntraDay
 
-Observation Space: 58 features (see _build_observation for details)
+Observation Space: 63 features (see _build_observation for details)
 """
 
 import gymnasium as gym
@@ -51,8 +52,11 @@ class BatteryEnvUnified(gym.Env):
     # Higher = more conservative (lower chance, more revenue if selected)
     AFRR_PRICE_TIERS = np.array([0.7, 0.85, 1.0, 1.15, 1.3])  # 5 tiers
 
-    # I define energy action levels
-    N_ENERGY_ACTIONS = 21  # -30 to +30 MW in 3 MW steps
+    # I define separate IntraDay and mFRR action levels (~6 MW granularity per level)
+    INTRADAY_LEVELS = np.linspace(-1.0, 1.0, 11)  # 11 levels
+    MFRR_LEVELS = np.linspace(-1.0, 1.0, 11)  # 11 levels
+    N_INTRADAY_ACTIONS = 11
+    N_MFRR_ACTIONS = 11
 
     def __init__(
         self,
@@ -137,9 +141,9 @@ class BatteryEnvUnified(gym.Env):
         # I initialize state
         self._reset_state()
 
-        print(f"Unified Multi-Market Environment Initialized")
+        print(f"Unified Multi-Market Environment Initialized (IntraDay/mFRR separated)")
         print(f"  Battery: {capacity_mwh} MWh, {max_power_mw} MW")
-        print(f"  Action Space: MultiDiscrete({list(self.action_space.nvec)})")
+        print(f"  Action Space: MultiDiscrete({list(self.action_space.nvec)}) = {np.prod(self.action_space.nvec)} combos")
         print(f"  Observation Space: {self.observation_space.shape[0]} features")
         print(f"  aFRR: selection={selection_probability:.0%}, activation={afrr_activation_rate:.0%}")
         print(f"  Data: {len(self.df)} hours ({len(self.df)/24:.0f} days)")
@@ -152,10 +156,12 @@ class BatteryEnvUnified(gym.Env):
         if not isinstance(df.index, pd.DatetimeIndex):
             # I parse the index, handling timezone info in the strings
             # Format: "2021-01-01 00:00:00+02:00"
-            df.index = pd.to_datetime(df.index, format='mixed', utc=True)
-            df.index = df.index.tz_convert('Europe/Athens')
-        elif df.index.tz is None:
-            df.index = df.index.tz_localize('Europe/Athens')
+            try:
+                df.index = pd.to_datetime(df.index, format='mixed', utc=True)
+                df.index = df.index.tz_convert('Europe/Athens')
+            except (ValueError, TypeError):
+                df.index = pd.to_datetime(df.index)
+        # I leave naive DatetimeIndex as-is — hour/dayofweek work without tz
 
         # I ensure required columns exist
         required = ['price', 'dam_commitment']
@@ -163,12 +169,17 @@ class BatteryEnvUnified(gym.Env):
             if col not in df.columns:
                 raise ValueError(f"Missing required column: {col}")
 
-        # I add aFRR/mFRR columns if missing (with defaults)
+        # I add aFRR/mFRR/IntraDay columns if missing (with safe constant defaults
+        # that do NOT depend on DAM price to avoid data leakage)
         defaults = {
             'afrr_up': 80.0,
             'afrr_down': 80.0,
             'afrr_cap_up_price': 20.0,
             'afrr_cap_down_price': 30.0,
+            'intraday_bid': 98.0,   # Fixed default, NOT derived from DAM
+            'intraday_ask': 102.0,  # Fixed default, NOT derived from DAM
+            'intraday_spread': 4.0,
+            'intraday_volume': 0.5,
             'mfrr_price_up': 120.0,
             'mfrr_price_down': 60.0,
             'mfrr_spread': 60.0,
@@ -176,7 +187,7 @@ class BatteryEnvUnified(gym.Env):
         }
         for col, default in defaults.items():
             if col not in df.columns:
-                df[col] = default
+                df[col] = default() if callable(default) else default
 
         # I add time features if missing
         if 'hour' not in df.columns:
@@ -185,7 +196,8 @@ class BatteryEnvUnified(gym.Env):
             df['day_of_week'] = df.index.dayofweek
 
         # I add lagged features (backward-looking only!)
-        lag_cols = ['price', 'afrr_up', 'afrr_down', 'mfrr_price_up', 'mfrr_price_down']
+        lag_cols = ['price', 'afrr_up', 'afrr_down', 'mfrr_price_up', 'mfrr_price_down',
+                    'intraday_bid', 'intraday_ask', 'intraday_spread', 'intraday_volume']
         for col in lag_cols:
             if col in df.columns and f'{col}_lag_1h' not in df.columns:
                 df[f'{col}_lag_1h'] = df[col].shift(1)
@@ -220,20 +232,18 @@ class BatteryEnvUnified(gym.Env):
 
     def _setup_spaces(self):
         """I define action and observation spaces."""
-        # Action space: MultiDiscrete([aFRR_commitment, aFRR_price_tier, energy_action])
+        # Action space: MultiDiscrete([aFRR_commitment, aFRR_price_tier, intraday_action, mfrr_action])
         self.action_space = spaces.MultiDiscrete([
             len(self.AFRR_LEVELS),      # 5 aFRR commitment levels
             len(self.AFRR_PRICE_TIERS), # 5 aFRR price tiers
-            self.N_ENERGY_ACTIONS       # 21 energy actions
+            self.N_INTRADAY_ACTIONS,    # 11 IntraDay actions
+            self.N_MFRR_ACTIONS         # 11 mFRR actions
         ])
 
-        # Energy action levels: -30 to +30 MW
-        self.energy_levels = np.linspace(-1.0, 1.0, self.N_ENERGY_ACTIONS)
-
-        # Observation space: 58 features
+        # Observation space: 63 features (was 58, +5 for separate IntraDay features)
         # See _build_observation for detailed breakdown
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(58,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(63,), dtype=np.float32
         )
 
     def _reset_state(self):
@@ -304,7 +314,7 @@ class BatteryEnvUnified(gym.Env):
         I return hierarchical action masks for the MultiDiscrete space.
 
         Returns a flattened mask for sb3_contrib.MaskablePPO compatibility.
-        Total length = 5 + 5 + 21 = 31
+        Total length = 5 + 5 + 11 + 11 = 32
         """
         row = self.df.iloc[self.current_step]
 
@@ -315,9 +325,10 @@ class BatteryEnvUnified(gym.Env):
         # I calculate remaining capacity after DAM
         remaining_capacity = self.max_power_mw - abs(dam_commitment)
 
-        # I calculate SoC-based limits
-        available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
-        available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
+        # I calculate SoC-based limits using DAM-aware reserves
+        dam_min_soc, dam_max_soc = self._calculate_dam_soc_reserve()
+        available_discharge_mwh = max(0.0, (self.soc - dam_min_soc) * self.capacity_mwh)
+        available_charge_mwh = max(0.0, (dam_max_soc - self.soc) * self.capacity_mwh)
 
         max_discharge_mw = min(
             remaining_capacity,
@@ -348,28 +359,36 @@ class BatteryEnvUnified(gym.Env):
         # I always allow all price tiers (no physical constraints)
         price_mask = np.ones(len(self.AFRR_PRICE_TIERS), dtype=bool)
 
-        # Mask 3: Energy actions (21 options)
+        # Mask 3: IntraDay actions (11 options)
         # I mask based on available power after aFRR reservation
-        # For safety, I assume worst case: full aFRR commitment might be activated
-        energy_mask = np.zeros(self.N_ENERGY_ACTIONS, dtype=bool)
-
-        for i, level in enumerate(self.energy_levels):
+        intraday_mask = np.zeros(self.N_INTRADAY_ACTIONS, dtype=bool)
+        for i, level in enumerate(self.INTRADAY_LEVELS):
             power_mw = level * remaining_capacity
-
-            if level >= 0:  # Discharge
-                # I check if we can discharge this much
+            if level >= 0:  # Discharge (sell)
                 if power_mw <= max_discharge_mw + 0.01:
-                    energy_mask[i] = True
-            else:  # Charge
-                # I check if we can charge this much
+                    intraday_mask[i] = True
+            else:  # Charge (buy)
                 if abs(power_mw) <= max_charge_mw + 0.01:
-                    energy_mask[i] = True
+                    intraday_mask[i] = True
+        # I always allow idle (center index = 5)
+        intraday_mask[self.N_INTRADAY_ACTIONS // 2] = True
 
-        # Always allow idle
-        energy_mask[self.N_ENERGY_ACTIONS // 2] = True
+        # Mask 4: mFRR actions (11 options)
+        # I apply independent mask (step() clips if combined > capacity)
+        mfrr_mask = np.zeros(self.N_MFRR_ACTIONS, dtype=bool)
+        for i, level in enumerate(self.MFRR_LEVELS):
+            power_mw = level * remaining_capacity
+            if level >= 0:  # Discharge (sell)
+                if power_mw <= max_discharge_mw + 0.01:
+                    mfrr_mask[i] = True
+            else:  # Charge (buy)
+                if abs(power_mw) <= max_charge_mw + 0.01:
+                    mfrr_mask[i] = True
+        # I always allow idle (center index = 5)
+        mfrr_mask[self.N_MFRR_ACTIONS // 2] = True
 
         # I concatenate masks for MultiDiscrete format
-        full_mask = np.concatenate([afrr_mask, price_mask, energy_mask])
+        full_mask = np.concatenate([afrr_mask, price_mask, intraday_mask, mfrr_mask])
 
         return full_mask
 
@@ -377,8 +396,13 @@ class BatteryEnvUnified(gym.Env):
         """I execute one step in the unified environment."""
         self._check_day_reset()
 
-        # I unpack the action
-        afrr_action, price_tier_action, energy_action = action[0], action[1], action[2]
+        # =====================================================================
+        # STAGE 1: UNPACK ACTION [afrr, price, intraday, mfrr]
+        # =====================================================================
+        afrr_action = action[0]
+        price_tier_action = action[1]
+        intraday_action = action[2]
+        mfrr_action = action[3]
 
         # I get current market data
         row = self.df.iloc[self.current_step]
@@ -389,7 +413,7 @@ class BatteryEnvUnified(gym.Env):
         remaining_capacity = self.max_power_mw - abs(dam_commitment)
 
         # =====================================================================
-        # 1. aFRR COMMITMENT
+        # STAGE 2: aFRR COMMITMENT & SELECTION
         # =====================================================================
         new_afrr_level = self.AFRR_LEVELS[afrr_action]
         self.afrr_commitment_level = afrr_action
@@ -397,7 +421,6 @@ class BatteryEnvUnified(gym.Env):
 
         # I determine if we're selected for aFRR
         price_tier = self.AFRR_PRICE_TIERS[price_tier_action]
-        # More aggressive bids (lower tier) have higher selection probability
         adjusted_selection_prob = self.selection_probability * (1.5 - price_tier * 0.5)
         adjusted_selection_prob = np.clip(adjusted_selection_prob, 0.1, 0.95)
 
@@ -406,9 +429,7 @@ class BatteryEnvUnified(gym.Env):
             np.random.random() < adjusted_selection_prob
         )
 
-        # =====================================================================
-        # 2. aFRR CAPACITY REVENUE
-        # =====================================================================
+        # aFRR capacity revenue
         afrr_capacity_revenue = 0.0
         if self.is_selected_for_afrr:
             cap_price = row.get('afrr_cap_up_price', 20.0) * price_tier
@@ -416,7 +437,7 @@ class BatteryEnvUnified(gym.Env):
             self.afrr_capacity_profit += afrr_capacity_revenue
 
         # =====================================================================
-        # 3. aFRR ACTIVATION CHECK
+        # STAGE 3: aFRR ACTIVATION CHECK
         # =====================================================================
         afrr_activated = False
         afrr_direction = None
@@ -427,14 +448,12 @@ class BatteryEnvUnified(gym.Env):
             afrr_activated, afrr_direction = self._check_afrr_activation(row)
 
         # =====================================================================
-        # 4. EXECUTE DAM COMMITMENT (MANDATORY - binding commitment)
+        # STAGE 4: EXECUTE DAM COMMITMENT (MANDATORY)
         # =====================================================================
-        # I MUST execute the DAM commitment first - this is a regulatory requirement
         actual_energy_mw = 0.0
         dam_executed_mw = 0.0
 
         if abs(dam_commitment) > 0.1:
-            # I calculate available energy for DAM execution
             available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
             available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
 
@@ -445,12 +464,10 @@ class BatteryEnvUnified(gym.Env):
                 )
                 dam_executed_mw = max_dam_discharge
 
-                # I execute the discharge
                 energy_mwh = dam_executed_mw * self.time_step_hours
                 soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
                 self.soc = max(self.min_soc, self.soc - soc_delta)
 
-                # I track cycling from DAM
                 cycle_fraction = energy_mwh / self.capacity_mwh
                 self.total_cycles += cycle_fraction
                 self.daily_cycles += cycle_fraction
@@ -460,14 +477,12 @@ class BatteryEnvUnified(gym.Env):
                     abs(dam_commitment),
                     available_charge_mwh / self.eff_sqrt / self.time_step_hours
                 )
-                dam_executed_mw = -max_dam_charge  # Negative for charging
+                dam_executed_mw = -max_dam_charge
 
-                # I execute the charge
                 energy_mwh = max_dam_charge * self.time_step_hours
                 soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
                 self.soc = min(self.max_soc, self.soc + soc_delta)
 
-                # I track cycling from DAM
                 cycle_fraction = energy_mwh / self.capacity_mwh
                 self.total_cycles += cycle_fraction
                 self.daily_cycles += cycle_fraction
@@ -476,12 +491,8 @@ class BatteryEnvUnified(gym.Env):
             self.dam_profit += dam_executed_mw * row.get('price', 100.0) * self.time_step_hours
 
         # =====================================================================
-        # 5. ENERGY ACTION (mFRR/IntraDay) - with REMAINING capacity after DAM
+        # STAGE 5: EXECUTE aFRR IF ACTIVATED (takes priority)
         # =====================================================================
-        energy_level = self.energy_levels[energy_action]
-        requested_power = energy_level * remaining_capacity
-
-        # I recalculate physical limits AFTER DAM execution
         available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
         available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
 
@@ -494,19 +505,12 @@ class BatteryEnvUnified(gym.Env):
             available_charge_mwh / self.eff_sqrt / self.time_step_hours
         )
 
-        # =====================================================================
-        # 6. EXECUTE aFRR IF ACTIVATED (takes priority over mFRR!)
-        # =====================================================================
-        mfrr_energy_mw = 0.0
-
         if afrr_activated:
             self.hours_since_afrr_activation = 0
 
             if afrr_direction == 'up':
-                # MUST discharge
                 afrr_energy_delivered = min(self.afrr_commitment_mw, max_discharge)
                 if afrr_energy_delivered > 0.1:
-                    # I execute the aFRR response
                     energy_mwh = afrr_energy_delivered * self.time_step_hours
                     soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
                     old_soc = self.soc
@@ -516,15 +520,13 @@ class BatteryEnvUnified(gym.Env):
                     afrr_price = row.get('afrr_up', 80.0)
                     afrr_energy_revenue = actual_energy * afrr_price
 
-                    # I track cycling
                     cycle_fraction = actual_energy / self.capacity_mwh
                     self.total_cycles += cycle_fraction
                     self.daily_cycles += cycle_fraction
 
-                    afrr_energy_delivered = actual_energy / self.time_step_hours  # Convert back to MW
+                    afrr_energy_delivered = actual_energy / self.time_step_hours
 
             else:  # 'down'
-                # MUST charge
                 afrr_energy_delivered = min(self.afrr_commitment_mw, max_charge)
                 if afrr_energy_delivered > 0.1:
                     energy_mwh = afrr_energy_delivered * self.time_step_hours
@@ -534,89 +536,150 @@ class BatteryEnvUnified(gym.Env):
                     actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
 
                     afrr_price = row.get('afrr_down', 80.0)
-                    afrr_energy_revenue = -actual_energy * afrr_price  # We pay for energy received
+                    afrr_energy_revenue = -actual_energy * afrr_price
 
                     cycle_fraction = actual_energy / self.capacity_mwh
                     self.total_cycles += cycle_fraction
                     self.daily_cycles += cycle_fraction
 
-                    afrr_energy_delivered = -actual_energy / self.time_step_hours  # Negative for charge
+                    afrr_energy_delivered = -actual_energy / self.time_step_hours
 
             self.afrr_energy_profit += afrr_energy_revenue
-            actual_energy_mw += afrr_energy_delivered  # ADD to DAM execution, not replace!
+            actual_energy_mw += afrr_energy_delivered
 
-            # I reduce available capacity for mFRR
             remaining_after_afrr = remaining_capacity - abs(afrr_energy_delivered)
         else:
             self.hours_since_afrr_activation += 1
             remaining_after_afrr = remaining_capacity
 
         # =====================================================================
-        # 7. EXECUTE mFRR/IntraDay TRADE (if capacity remains)
+        # STAGE 6: EXECUTE INTRADAY TRADE (voluntary arbitrage)
         # =====================================================================
-        if not afrr_activated and abs(requested_power) > 0.1:
-            # I recalculate limits (SoC may have changed from aFRR)
-            available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
-            available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
+        intraday_energy_mw = 0.0
+        intraday_revenue = 0.0
 
-            max_discharge = min(
-                remaining_after_afrr,
-                available_discharge_mwh * self.eff_sqrt / self.time_step_hours
-            )
-            max_charge = min(
-                remaining_after_afrr,
-                available_charge_mwh / self.eff_sqrt / self.time_step_hours
-            )
+        if not afrr_activated:
+            intraday_level = self.INTRADAY_LEVELS[intraday_action]
+            requested_intraday = intraday_level * remaining_after_afrr
 
-            # I clip to physical limits
-            if requested_power > 0:
-                actual_mfrr = min(requested_power, max_discharge)
-            else:
-                actual_mfrr = max(requested_power, -max_charge)
+            if abs(requested_intraday) > 0.1:
+                # I recalculate limits after previous stages
+                available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
+                available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
 
-            if abs(actual_mfrr) > 0.1:
-                if actual_mfrr > 0:  # Discharge
-                    energy_mwh = actual_mfrr * self.time_step_hours
-                    soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
-                    old_soc = self.soc
-                    self.soc = max(self.min_soc, self.soc - soc_delta)
-                    actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
+                max_discharge = min(
+                    remaining_after_afrr,
+                    available_discharge_mwh * self.eff_sqrt / self.time_step_hours
+                )
+                max_charge = min(
+                    remaining_after_afrr,
+                    available_charge_mwh / self.eff_sqrt / self.time_step_hours
+                )
 
-                    mfrr_price = row.get('mfrr_price_up', 120.0)
-                    mfrr_revenue = actual_energy * mfrr_price
+                if requested_intraday > 0:
+                    actual_intraday = min(requested_intraday, max_discharge)
+                else:
+                    actual_intraday = max(requested_intraday, -max_charge)
 
-                else:  # Charge
-                    energy_mwh = abs(actual_mfrr) * self.time_step_hours
-                    soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
-                    old_soc = self.soc
-                    self.soc = min(self.max_soc, self.soc + soc_delta)
-                    actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
+                if abs(actual_intraday) > 0.1:
+                    if actual_intraday > 0:  # Sell (discharge) at bid
+                        energy_mwh = actual_intraday * self.time_step_hours
+                        soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
+                        old_soc = self.soc
+                        self.soc = max(self.min_soc, self.soc - soc_delta)
+                        actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
 
-                    mfrr_price = row.get('mfrr_price_down', 60.0)
-                    mfrr_revenue = -actual_energy * mfrr_price
+                        id_price = row.get('intraday_bid', row.get('price', 100.0) - 2.0)
+                        intraday_revenue = actual_energy * id_price
 
-                # I track cycling
-                cycle_fraction = actual_energy / self.capacity_mwh
-                self.total_cycles += cycle_fraction
-                self.daily_cycles += cycle_fraction
+                    else:  # Buy (charge) at ask
+                        energy_mwh = abs(actual_intraday) * self.time_step_hours
+                        soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
+                        old_soc = self.soc
+                        self.soc = min(self.max_soc, self.soc + soc_delta)
+                        actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
 
-                mfrr_energy_mw = actual_mfrr
-                self.mfrr_profit += mfrr_revenue
-                actual_energy_mw += actual_mfrr
+                        id_price = row.get('intraday_ask', row.get('price', 100.0) + 2.0)
+                        intraday_revenue = -actual_energy * id_price
+
+                    cycle_fraction = actual_energy / self.capacity_mwh
+                    self.total_cycles += cycle_fraction
+                    self.daily_cycles += cycle_fraction
+
+                    intraday_energy_mw = actual_intraday
+                    self.intraday_profit += intraday_revenue
+                    actual_energy_mw += actual_intraday
+
+        # I calculate remaining after IntraDay for mFRR
+        remaining_after_intraday = remaining_after_afrr - abs(intraday_energy_mw)
 
         # =====================================================================
-        # 8. CALCULATE REWARD
+        # STAGE 7: EXECUTE mFRR TRADE (uses remaining after IntraDay)
         # =====================================================================
-        # I need to also account for DAM compliance
-        # If we have a DAM commitment, actual_energy_mw should include that
+        mfrr_energy_mw = 0.0
+        mfrr_revenue = 0.0
 
-        # I build market state for reward calculation
+        if not afrr_activated:
+            mfrr_level = self.MFRR_LEVELS[mfrr_action]
+            requested_mfrr = mfrr_level * remaining_after_intraday
+
+            if abs(requested_mfrr) > 0.1:
+                # I recalculate limits after IntraDay
+                available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
+                available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
+
+                max_discharge = min(
+                    remaining_after_intraday,
+                    available_discharge_mwh * self.eff_sqrt / self.time_step_hours
+                )
+                max_charge = min(
+                    remaining_after_intraday,
+                    available_charge_mwh / self.eff_sqrt / self.time_step_hours
+                )
+
+                if requested_mfrr > 0:
+                    actual_mfrr = min(requested_mfrr, max_discharge)
+                else:
+                    actual_mfrr = max(requested_mfrr, -max_charge)
+
+                if abs(actual_mfrr) > 0.1:
+                    if actual_mfrr > 0:  # Sell (discharge) at mfrr_up
+                        energy_mwh = actual_mfrr * self.time_step_hours
+                        soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
+                        old_soc = self.soc
+                        self.soc = max(self.min_soc, self.soc - soc_delta)
+                        actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
+
+                        mfrr_price = row.get('mfrr_price_up', 120.0)
+                        mfrr_revenue = actual_energy * mfrr_price
+
+                    else:  # Buy (charge) at mfrr_down
+                        energy_mwh = abs(actual_mfrr) * self.time_step_hours
+                        soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
+                        old_soc = self.soc
+                        self.soc = min(self.max_soc, self.soc + soc_delta)
+                        actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
+
+                        mfrr_price = row.get('mfrr_price_down', 60.0)
+                        mfrr_revenue = -actual_energy * mfrr_price
+
+                    cycle_fraction = actual_energy / self.capacity_mwh
+                    self.total_cycles += cycle_fraction
+                    self.daily_cycles += cycle_fraction
+
+                    mfrr_energy_mw = actual_mfrr
+                    self.mfrr_profit += mfrr_revenue
+                    actual_energy_mw += actual_mfrr
+
+        # =====================================================================
+        # STAGE 8: CALCULATE REWARD
+        # =====================================================================
         market_state = UnifiedMarketState(
             dam_price=row.get('price', 100.0),
             dam_commitment=dam_commitment,
-            intraday_bid=row.get('price', 100.0) - 2.0,  # Simple spread
-            intraday_ask=row.get('price', 100.0) + 2.0,
-            intraday_spread=4.0,
+            intraday_bid=row.get('intraday_bid', row.get('price', 100.0) - 2.0),
+            intraday_ask=row.get('intraday_ask', row.get('price', 100.0) + 2.0),
+            intraday_spread=row.get('intraday_spread', 4.0),
             afrr_cap_up_price=row.get('afrr_cap_up_price', 20.0),
             afrr_cap_down_price=row.get('afrr_cap_down_price', 30.0),
             afrr_energy_up_price=row.get('afrr_up', 80.0),
@@ -627,10 +690,7 @@ class BatteryEnvUnified(gym.Env):
             mfrr_price_down=row.get('mfrr_price_down', 60.0)
         )
 
-        # I calculate shortfall risk for proactive penalty
         shortfall_risk = self._calculate_shortfall_risk()
-
-        # I get price momentum (backward-looking)
         price_momentum = row.get('price_momentum', 0.0)
 
         reward_info = self.reward_calculator.calculate(
@@ -638,11 +698,12 @@ class BatteryEnvUnified(gym.Env):
             actual_energy_mw=actual_energy_mw,
             afrr_capacity_committed_mw=self.afrr_commitment_mw if self.is_selected_for_afrr else 0.0,
             afrr_energy_delivered_mw=afrr_energy_delivered,
+            intraday_energy_mw=intraday_energy_mw,
             mfrr_energy_mw=mfrr_energy_mw,
             current_soc=self.soc,
             capacity_mwh=self.capacity_mwh,
             time_step_hours=self.time_step_hours,
-            is_physical_violation=False,  # Action masking prevents violations
+            is_physical_violation=False,
             shortfall_risk=shortfall_risk,
             price_momentum=price_momentum,
             is_selected_for_afrr=self.is_selected_for_afrr
@@ -653,11 +714,10 @@ class BatteryEnvUnified(gym.Env):
         self.episode_profit += reward_info['components'].get('net_profit', 0)
 
         # =====================================================================
-        # 9. ADVANCE STEP
+        # STAGE 9: ADVANCE STEP
         # =====================================================================
         self.current_step += 1
 
-        # I check termination conditions
         terminated = self.current_step >= self.max_steps
         truncated = False
 
@@ -666,7 +726,6 @@ class BatteryEnvUnified(gym.Env):
             if steps_in_episode >= self.episode_length:
                 truncated = True
 
-        # I build observation and info
         obs = self._build_observation()
         info = self._get_info()
         info.update({
@@ -674,7 +733,11 @@ class BatteryEnvUnified(gym.Env):
             'afrr_direction': afrr_direction,
             'is_selected': self.is_selected_for_afrr,
             'actual_energy_mw': actual_energy_mw,
+            'intraday_energy_mw': intraday_energy_mw,
+            'intraday_profit': intraday_revenue,
+            'intraday_revenue': intraday_revenue,
             'mfrr_energy_mw': mfrr_energy_mw,
+            'mfrr_revenue': mfrr_revenue,
             **reward_info['components']
         })
 
@@ -717,40 +780,145 @@ class BatteryEnvUnified(gym.Env):
         return False, None
 
     def _calculate_shortfall_risk(self) -> float:
-        """I calculate the risk of not meeting future DAM commitments."""
-        # I look at upcoming DAM commitments
-        risk = 0.0
-        total_commitment = 0.0
+        """
+        I calculate the risk of not meeting future DAM commitments.
 
-        for i in range(1, min(12, self.max_steps - self.current_step)):
-            future_row = self.df.iloc[self.current_step + i]
-            dam = future_row.get('dam_commitment', 0.0)
-            if dam > 0:  # Sell commitment
-                total_commitment += dam
+        I check both sell-side (discharge) and buy-side (charge) risks over
+        a 4-hour lookahead window, consistent with the mask reserve horizon.
+        """
+        sell_risk = 0.0
+        buy_risk = 0.0
+        total_sell_commitment = 0.0
+        total_buy_commitment = 0.0
 
-        if total_commitment > 0:
-            # I check if we have enough energy
+        lookahead = min(4, self.max_steps - self.current_step)
+
+        for i in range(1, lookahead + 1):
+            future_idx = self.current_step + i
+            if future_idx >= len(self.df):
+                break
+            future_row = self.df.iloc[future_idx]
+            dam = np.clip(future_row.get('dam_commitment', 0.0),
+                          -self.max_power_mw, self.max_power_mw)
+            if dam > 0.1:
+                total_sell_commitment += dam
+            elif dam < -0.1:
+                total_buy_commitment += abs(dam)
+
+        # I assess sell-side risk (not enough energy to discharge)
+        if total_sell_commitment > 0:
             available_energy = (self.soc - self.min_soc) * self.capacity_mwh
-            needed_energy = total_commitment * self.time_step_hours / self.eff_sqrt
-
+            needed_energy = total_sell_commitment * self.time_step_hours / self.eff_sqrt
             if available_energy < needed_energy:
-                risk = (needed_energy - available_energy) / needed_energy
-                risk = np.clip(risk, 0, 1)
+                sell_risk = (needed_energy - available_energy) / needed_energy
+                sell_risk = np.clip(sell_risk, 0, 1)
 
-        return risk
+        # I assess buy-side risk (not enough headroom to charge)
+        if total_buy_commitment > 0:
+            available_headroom = (self.max_soc - self.soc) * self.capacity_mwh
+            needed_headroom = total_buy_commitment * self.time_step_hours * self.eff_sqrt
+            if available_headroom < needed_headroom:
+                buy_risk = (needed_headroom - available_headroom) / needed_headroom
+                buy_risk = np.clip(buy_risk, 0, 1)
+
+        return max(sell_risk, buy_risk)
+
+    def _calculate_dam_soc_reserve(self) -> Tuple[float, float]:
+        """
+        I calculate dynamic SoC reserves to guarantee future DAM commitment execution.
+
+        I look 4 hours ahead and compute:
+        - min_soc_reserve: raised above self.min_soc when future SELL commitments exist
+          (I must keep enough energy to discharge later)
+        - max_soc_reserve: lowered below self.max_soc when future BUY commitments exist
+          (I must keep enough headroom to charge later)
+
+        I also account for intermediate charge/discharge potential (50% discount)
+        so the reserve is not overly conservative when the agent has time to prepare.
+        """
+        min_soc_reserve = self.min_soc
+        max_soc_reserve = self.max_soc
+
+        lookahead = min(4, self.max_steps - self.current_step)
+        if lookahead <= 0:
+            return min_soc_reserve, max_soc_reserve
+
+        # I first scan to find the last sell/buy commitment positions
+        # so I only credit idle hours that occur BEFORE a commitment
+        commitments = []
+        for i in range(1, lookahead + 1):
+            future_idx = self.current_step + i
+            if future_idx >= len(self.df):
+                break
+            future_row = self.df.iloc[future_idx]
+            dam = np.clip(future_row.get('dam_commitment', 0.0),
+                          -self.max_power_mw, self.max_power_mw)
+            commitments.append((i, dam))
+
+        # I find last sell and last buy positions in the lookahead window
+        last_sell_pos = 0
+        last_buy_pos = 0
+        for pos, dam in commitments:
+            if dam > 0.1:
+                last_sell_pos = pos
+            elif dam < -0.1:
+                last_buy_pos = pos
+
+        # I accumulate energy needs and intermediate potential
+        sell_energy_needed = 0.0
+        buy_headroom_needed = 0.0
+        intermediate_charge_potential = 0.0
+        intermediate_discharge_potential = 0.0
+
+        for pos, dam in commitments:
+            if dam > 0.1:
+                # I have a future sell commitment — need energy to discharge
+                energy_needed = dam * self.time_step_hours / self.eff_sqrt
+                sell_energy_needed += energy_needed
+            elif dam < -0.1:
+                # I have a future buy commitment — need headroom to charge
+                energy_needed = abs(dam) * self.time_step_hours * self.eff_sqrt
+                buy_headroom_needed += energy_needed
+            else:
+                # I have an idle hour — I can only use it to prepare if it occurs
+                # BEFORE a future commitment (can't prepare after the fact)
+                potential = self.max_power_mw * self.time_step_hours * 0.5
+                if pos < last_sell_pos:
+                    intermediate_charge_potential += potential * self.eff_sqrt
+                if pos < last_buy_pos:
+                    intermediate_discharge_potential += potential / self.eff_sqrt
+
+        # I subtract intermediate potential from needs (agent can prepare)
+        net_sell_energy = max(0.0, sell_energy_needed - intermediate_charge_potential)
+        net_buy_headroom = max(0.0, buy_headroom_needed - intermediate_discharge_potential)
+
+        # I convert energy needs to SoC reserves
+        sell_soc_reserve = net_sell_energy / self.capacity_mwh
+        buy_soc_reserve = net_buy_headroom / self.capacity_mwh
+
+        min_soc_reserve = min(self.max_soc, self.min_soc + sell_soc_reserve)
+        max_soc_reserve = max(self.min_soc, self.max_soc - buy_soc_reserve)
+
+        # I ensure min <= max (edge case with very large commitments)
+        if min_soc_reserve > max_soc_reserve:
+            midpoint = (min_soc_reserve + max_soc_reserve) / 2.0
+            min_soc_reserve = midpoint
+            max_soc_reserve = midpoint
+
+        return min_soc_reserve, max_soc_reserve
 
     def _build_observation(self) -> np.ndarray:
         """
-        I build the 58-feature observation vector.
+        I build the 63-feature observation vector.
 
         Feature Groups:
         1. Battery State (3): soc, max_discharge, max_charge
-        2. Market Prices (6): dam, intraday, spread, mfrr_up, mfrr_down, mfrr_spread
+        2. Market Prices (11): dam, id_bid, id_ask, id_spread, id_volume, mfrr_up, mfrr_down, mfrr_spread, id_dam_spread, mfrr_dam_premium, mfrr_id_spread
         3. Time Encoding (4): hour_sin/cos, dow_sin/cos
         4. DAM Lookahead (13): current + 12h commitments
         5. Price Lookahead (12): 12h price forecasts
         6. aFRR State (8): cap_prices, activation, commitment, selection, signal, hours_since
-        7. Risk/Imbalance (4): net_imbalance, shortfall_risk, momentum, worthiness
+        7. Risk/Imbalance (4): dam_discharge_reserve, shortfall_risk, momentum, worthiness
         8. Gate Closure (4): dam_open, intraday_hours, afrr_hours, mfrr_open
         9. Timing Signals (4): price_vs_typical, is_peak, is_solar, hours_to_max
         """
@@ -780,27 +948,34 @@ class BatteryEnvUnified(gym.Env):
         features.append(max_charge / self.max_power_mw)
 
         # =====================================================================
-        # 2. MARKET PRICES (6 features)
+        # 2. MARKET PRICES (11 features — was 6)
         # =====================================================================
         dam_price = row.get('price', 100.0)
-        features.append(dam_price / 100.0)  # Normalized
+        features.append(dam_price / 100.0)  # [3] DAM price
 
-        # IntraDay (use lagged price to avoid leakage)
-        intraday_price = row.get('price_lag_1h', dam_price)
-        features.append(intraday_price / 100.0)
+        # IntraDay prices (lagged to avoid lookahead — NO fallback to current-step)
+        id_bid = row.get('intraday_bid_lag_1h', 0.0)
+        id_ask = row.get('intraday_ask_lag_1h', 0.0)
+        id_spread = row.get('intraday_spread_lag_1h', 0.0)
+        id_volume = row.get('intraday_volume_lag_1h', 0.5)
+        features.append(id_bid / 100.0)      # [4] IntraDay bid
+        features.append(id_ask / 100.0)      # [5] IntraDay ask
+        features.append(id_spread / 100.0)   # [6] IntraDay spread
+        features.append(id_volume)            # [7] IntraDay volume (already 0-1)
 
-        # Spread
-        spread = row.get('mfrr_spread', 60.0)
-        features.append(spread / 100.0)
-
-        # mFRR prices (lagged)
-        mfrr_up = row.get('mfrr_price_up_lag_1h', row.get('mfrr_price_up', 120.0))
-        mfrr_down = row.get('mfrr_price_down_lag_1h', row.get('mfrr_price_down', 60.0))
-        features.append(mfrr_up / 100.0)
-        features.append(mfrr_down / 100.0)
+        # mFRR prices (lagged — NO fallback to current-step)
+        mfrr_up = row.get('mfrr_price_up_lag_1h', 0.0)
+        mfrr_down = row.get('mfrr_price_down_lag_1h', 0.0)
+        features.append(mfrr_up / 100.0)     # [8] mFRR up
+        features.append(mfrr_down / 100.0)   # [9] mFRR down
 
         # mFRR spread
-        features.append((mfrr_up - mfrr_down) / 100.0)
+        features.append((mfrr_up - mfrr_down) / 100.0)  # [10] mFRR spread
+
+        # Cross-market signals (help agent pick the best market)
+        features.append((id_bid - dam_price) / 100.0)    # [11] IntraDay-DAM spread
+        features.append((mfrr_up - dam_price) / 100.0)   # [12] mFRR premium over DAM
+        features.append((mfrr_up - id_ask) / 100.0)      # [13] mFRR-IntraDay spread
 
         # =====================================================================
         # 3. TIME ENCODING (4 features)
@@ -895,8 +1070,10 @@ class BatteryEnvUnified(gym.Env):
         # =====================================================================
         # 7. RISK/IMBALANCE (4 features)
         # =====================================================================
-        # Net imbalance
-        features.append(np.clip(imbalance / 1000.0, -1, 1))
+        # DAM discharge reserve — how much SoC the mask is reserving for future sells
+        dam_min_soc, dam_max_soc = self._calculate_dam_soc_reserve()
+        dam_discharge_reserve = (dam_min_soc - self.min_soc) / (self.max_soc - self.min_soc)
+        features.append(np.clip(dam_discharge_reserve, 0, 1))
 
         # Shortfall risk
         shortfall_risk = self._calculate_shortfall_risk()
@@ -959,7 +1136,7 @@ class BatteryEnvUnified(gym.Env):
         # =====================================================================
         obs = np.array(features, dtype=np.float32)
 
-        assert len(obs) == 58, f"Expected 58 features, got {len(obs)}"
+        assert len(obs) == 63, f"Expected 63 features, got {len(obs)}"
 
         # I replace any NaN/Inf with 0
         obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -975,6 +1152,7 @@ class BatteryEnvUnified(gym.Env):
             'is_selected': self.is_selected_for_afrr,
             'total_profit': self.total_profit,
             'dam_profit': self.dam_profit,
+            'intraday_profit': self.intraday_profit,
             'afrr_capacity_profit': self.afrr_capacity_profit,
             'afrr_energy_profit': self.afrr_energy_profit,
             'mfrr_profit': self.mfrr_profit,
