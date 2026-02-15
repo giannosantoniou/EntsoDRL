@@ -6,8 +6,8 @@ This wraps the trained MaskablePPO model and provides the IDecisionStrategy
 interface for integration with the production system.
 
 Key Features:
-1. Handles MultiDiscrete action space [5, 5, 21]
-2. Applies action masking for capacity cascading
+1. Handles MultiDiscrete action space [5, 5, 11, 11]
+2. Applies action masking for capacity cascading: DAM -> aFRR -> IntraDay -> mFRR
 3. Provides unified action interpretation
 4. Supports VecNormalize for observation normalization
 """
@@ -29,19 +29,21 @@ class UnifiedStrategy(IDecisionStrategy):
     """
 
     # I define the action space structure
-    N_AFRR_LEVELS = 5      # 0%, 25%, 50%, 75%, 100%
-    N_PRICE_TIERS = 5      # Aggressive to conservative
-    N_ENERGY_ACTIONS = 21  # -30 to +30 MW
+    N_AFRR_LEVELS = 5       # 0%, 25%, 50%, 75%, 100%
+    N_PRICE_TIERS = 5       # Aggressive to conservative
+    N_INTRADAY_ACTIONS = 11  # -1.0 to +1.0 (IntraDay)
+    N_MFRR_ACTIONS = 11     # -1.0 to +1.0 (mFRR)
 
     # I define action interpretation
     AFRR_LEVELS = np.array([0.0, 0.25, 0.50, 0.75, 1.0])
     PRICE_TIERS = np.array([0.7, 0.85, 1.0, 1.15, 1.3])
-    ENERGY_LEVELS = np.linspace(-1.0, 1.0, N_ENERGY_ACTIONS)
+    INTRADAY_LEVELS = np.linspace(-1.0, 1.0, N_INTRADAY_ACTIONS)
+    MFRR_LEVELS = np.linspace(-1.0, 1.0, N_MFRR_ACTIONS)
 
     def __init__(
         self,
         max_power_mw: float = 30.0,
-        n_obs_features: int = 58
+        n_obs_features: int = 63
     ):
         self.model = None
         self.vec_normalize = None
@@ -87,11 +89,11 @@ class UnifiedStrategy(IDecisionStrategy):
         I predict the unified action given observation and mask.
 
         Args:
-            observation: 58-feature observation vector
-            action_mask: Flattened boolean mask (31 elements = 5 + 5 + 21)
+            observation: 63-feature observation vector
+            action_mask: Flattened boolean mask (32 elements = 5 + 5 + 11 + 11)
 
         Returns:
-            Action array [afrr_level, price_tier, energy_action]
+            Action array [afrr_level, price_tier, intraday_action, mfrr_action]
         """
         if self.model is None:
             raise RuntimeError("Model not loaded! Call load() first.")
@@ -104,15 +106,16 @@ class UnifiedStrategy(IDecisionStrategy):
         if self.vec_normalize is not None:
             observation = self.vec_normalize.normalize_obs(observation)
 
-        # I reshape action mask for MultiDiscrete format
-        # MaskablePPO expects mask as list of arrays for MultiDiscrete
-        afrr_mask = action_mask[:self.N_AFRR_LEVELS]
-        price_mask = action_mask[self.N_AFRR_LEVELS:self.N_AFRR_LEVELS + self.N_PRICE_TIERS]
-        energy_mask = action_mask[self.N_AFRR_LEVELS + self.N_PRICE_TIERS:]
+        # I parse the flattened mask into sub-masks
+        offset = 0
+        afrr_mask = action_mask[offset:offset + self.N_AFRR_LEVELS]; offset += self.N_AFRR_LEVELS
+        price_mask = action_mask[offset:offset + self.N_PRICE_TIERS]; offset += self.N_PRICE_TIERS
+        intraday_mask = action_mask[offset:offset + self.N_INTRADAY_ACTIONS]; offset += self.N_INTRADAY_ACTIONS
+        mfrr_mask = action_mask[offset:offset + self.N_MFRR_ACTIONS]
 
         # I stack masks for batch dimension
         action_masks = np.array([
-            np.concatenate([afrr_mask, price_mask, energy_mask])
+            np.concatenate([afrr_mask, price_mask, intraday_mask, mfrr_mask])
         ])
 
         # I predict with action masking
@@ -134,7 +137,7 @@ class UnifiedStrategy(IDecisionStrategy):
         I predict action and provide full interpretation.
 
         Args:
-            observation: 58-feature observation vector
+            observation: 63-feature observation vector
             action_mask: Flattened boolean mask
             remaining_capacity_mw: Capacity after DAM commitment
 
@@ -143,10 +146,11 @@ class UnifiedStrategy(IDecisionStrategy):
         """
         action = self.predict_action(observation, action_mask)
 
-        # I unpack the action
+        # I unpack the 4-part action
         afrr_action = int(action[0])
         price_action = int(action[1])
-        energy_action = int(action[2])
+        intraday_action = int(action[2])
+        mfrr_action = int(action[3])
 
         # I interpret the action
         afrr_level = self.AFRR_LEVELS[afrr_action]
@@ -154,21 +158,27 @@ class UnifiedStrategy(IDecisionStrategy):
 
         price_tier = self.PRICE_TIERS[price_action]
 
-        energy_level = self.ENERGY_LEVELS[energy_action]
-        energy_power_mw = energy_level * remaining_capacity_mw
+        intraday_level = self.INTRADAY_LEVELS[intraday_action]
+        intraday_power_mw = intraday_level * remaining_capacity_mw
+
+        mfrr_level = self.MFRR_LEVELS[mfrr_action]
+        mfrr_power_mw = mfrr_level * remaining_capacity_mw
 
         return {
             # Action indices
             'afrr_action': afrr_action,
             'price_action': price_action,
-            'energy_action': energy_action,
+            'intraday_action': intraday_action,
+            'mfrr_action': mfrr_action,
 
             # Physical values
             'afrr_level': afrr_level,
             'afrr_commitment_mw': afrr_commitment_mw,
             'price_tier': price_tier,
-            'energy_level': energy_level,
-            'energy_power_mw': energy_power_mw,
+            'intraday_level': intraday_level,
+            'intraday_power_mw': intraday_power_mw,
+            'mfrr_level': mfrr_level,
+            'mfrr_power_mw': mfrr_power_mw,
             'remaining_capacity_mw': remaining_capacity_mw
         }
 
@@ -178,17 +188,20 @@ class UnifiedRuleBasedStrategy(IDecisionStrategy):
     Rule-based fallback strategy for unified multi-market trading.
 
     I provide a deterministic strategy that can be used when the AI model
-    is not available or during safety mode.
+    is not available or during safety mode. IntraDay is used for arbitrage
+    (buy solar/sell peak), mFRR for spread capture.
     """
 
     # I use the same action structure as UnifiedStrategy
     N_AFRR_LEVELS = 5
     N_PRICE_TIERS = 5
-    N_ENERGY_ACTIONS = 21
+    N_INTRADAY_ACTIONS = 11
+    N_MFRR_ACTIONS = 11
 
     AFRR_LEVELS = np.array([0.0, 0.25, 0.50, 0.75, 1.0])
     PRICE_TIERS = np.array([0.7, 0.85, 1.0, 1.15, 1.3])
-    ENERGY_LEVELS = np.linspace(-1.0, 1.0, N_ENERGY_ACTIONS)
+    INTRADAY_LEVELS = np.linspace(-1.0, 1.0, N_INTRADAY_ACTIONS)
+    MFRR_LEVELS = np.linspace(-1.0, 1.0, N_MFRR_ACTIONS)
 
     def __init__(
         self,
@@ -219,25 +232,29 @@ class UnifiedRuleBasedStrategy(IDecisionStrategy):
         """
         I decide based on rules extracted from observation features.
 
-        Observation structure (key features):
+        Observation structure (key features for 63-feature obs):
         [0] soc
         [3] dam_price / 100
-        [10-12] time encoding
-        [26] afrr_cap_price
-        [34] is_peak
-        [35] is_solar
+        [4] intraday_bid / 100
+        [5] intraday_ask / 100
+        [14-17] time encoding (sin/cos)
+        [43] afrr_cap_price
+        [60] is_peak
+        [61] is_solar
         """
         if observation.ndim > 1:
             observation = observation[0]
 
-        # I extract key features
+        # I extract key features (63-feature observation layout)
         soc = observation[0]
         dam_price = observation[3] * 100  # Denormalize
-        hour_sin = observation[10]
-        hour_cos = observation[11]
-        afrr_cap_price_norm = observation[26] if len(observation) > 26 else 0.5
-        is_peak = observation[34] if len(observation) > 34 else 0.0
-        is_solar = observation[35] if len(observation) > 35 else 0.0
+        id_bid = observation[4] * 100 if len(observation) > 4 else dam_price - 2
+        id_ask = observation[5] * 100 if len(observation) > 5 else dam_price + 2
+        hour_sin = observation[14] if len(observation) > 14 else 0.0
+        hour_cos = observation[15] if len(observation) > 15 else 1.0
+        afrr_cap_price_norm = observation[43] if len(observation) > 43 else 0.5
+        is_peak = observation[60] if len(observation) > 60 else 0.0
+        is_solar = observation[61] if len(observation) > 61 else 0.0
 
         # I decode hour
         import math
@@ -248,7 +265,6 @@ class UnifiedRuleBasedStrategy(IDecisionStrategy):
         hour = int(round(hour)) % 24
 
         # I decide aFRR commitment level
-        # High commitment when capacity prices are high
         if afrr_cap_price_norm > 0.7:
             afrr_action = 4  # 100% commitment
         elif afrr_cap_price_norm > 0.5:
@@ -257,62 +273,89 @@ class UnifiedRuleBasedStrategy(IDecisionStrategy):
             afrr_action = 1  # 25% commitment
 
         # I decide price tier
-        # More aggressive during peak hours (higher selection chance)
         if is_peak > 0.5:
             price_action = 1  # Aggressive
         else:
             price_action = 2  # Neutral
 
-        # I decide energy action
-        # Similar to AggressiveHybridStrategy but for unified format
-        if is_peak > 0.5 or dam_price > self.high_price_threshold:
-            # Peak or high price: discharge
-            if soc > 0.4:
-                energy_action = 18  # ~80% discharge
-            else:
-                energy_action = 14  # ~40% discharge
-        elif is_solar > 0.5 or dam_price < self.low_price_threshold:
-            # Solar hours or low price: charge
+        # I decide IntraDay action — buy during solar, sell during peak
+        id_idle = self.N_INTRADAY_ACTIONS // 2  # 5
+        if is_solar > 0.5 and dam_price < self.low_price_threshold:
+            # Solar hours + low price: buy on IntraDay
             if soc < 0.6:
-                energy_action = 2  # ~80% charge
+                id_action = 1  # ~80% charge
             else:
-                energy_action = 6  # ~40% charge
+                id_action = 3  # ~40% charge
+        elif is_peak > 0.5 or dam_price > self.high_price_threshold:
+            # Peak or high price: sell on IntraDay
+            if soc > 0.4:
+                id_action = 9  # ~80% discharge
+            else:
+                id_action = 7  # ~40% discharge
         else:
-            # Off-peak: idle or minimal trading
-            energy_action = 10  # Idle
+            id_action = id_idle  # Idle
 
-        # I apply action mask
-        afrr_mask = action_mask[:self.N_AFRR_LEVELS]
-        price_mask = action_mask[self.N_AFRR_LEVELS:self.N_AFRR_LEVELS + self.N_PRICE_TIERS]
-        energy_mask = action_mask[self.N_AFRR_LEVELS + self.N_PRICE_TIERS:]
+        # I decide mFRR action — constrained by TSO direction signal
+        # observation[58] encodes mFRR direction: +1 (UP/discharge), -1 (DOWN/charge), 0 (closed)
+        mfrr_idle = self.N_MFRR_ACTIONS // 2  # 5
+        mfrr_direction = observation[58] if len(observation) > 58 else 0.0
+        mfrr_up = observation[8] * 100 if len(observation) > 8 else 120.0
+        mfrr_down = observation[9] * 100 if len(observation) > 9 else 60.0
 
-        # I find valid actions
+        if mfrr_direction > 0.5 and soc > 0.3:
+            # UP available (deficit) — I can discharge/sell
+            if mfrr_up > dam_price * 1.2:
+                mfrr_action = 8  # Moderate discharge
+            else:
+                mfrr_action = mfrr_idle
+        elif mfrr_direction < -0.5 and soc < 0.7:
+            # DOWN available (surplus) — I can charge/buy (usually loss, be cautious)
+            if mfrr_down < dam_price * 0.5:
+                mfrr_action = 2  # Moderate charge at very low price
+            else:
+                mfrr_action = mfrr_idle  # Not worth it
+        else:
+            mfrr_action = mfrr_idle  # Closed or uncertain
+
+        # I apply action masks
+        offset = 0
+        afrr_mask = action_mask[offset:offset + self.N_AFRR_LEVELS]; offset += self.N_AFRR_LEVELS
+        price_mask = action_mask[offset:offset + self.N_PRICE_TIERS]; offset += self.N_PRICE_TIERS
+        id_mask = action_mask[offset:offset + self.N_INTRADAY_ACTIONS]; offset += self.N_INTRADAY_ACTIONS
+        mfrr_mask = action_mask[offset:offset + self.N_MFRR_ACTIONS]
+
+        # I find valid actions (fallback to valid mid-point)
         if not afrr_mask[afrr_action]:
-            valid_afrr = np.where(afrr_mask)[0]
-            afrr_action = int(valid_afrr[len(valid_afrr) // 2]) if len(valid_afrr) > 0 else 0
+            valid = np.where(afrr_mask)[0]
+            afrr_action = int(valid[len(valid) // 2]) if len(valid) > 0 else 0
 
         if not price_mask[price_action]:
-            valid_price = np.where(price_mask)[0]
-            price_action = int(valid_price[len(valid_price) // 2]) if len(valid_price) > 0 else 2
+            valid = np.where(price_mask)[0]
+            price_action = int(valid[len(valid) // 2]) if len(valid) > 0 else 2
 
-        if not energy_mask[energy_action]:
-            valid_energy = np.where(energy_mask)[0]
-            energy_action = int(valid_energy[len(valid_energy) // 2]) if len(valid_energy) > 0 else 10
+        if not id_mask[id_action]:
+            valid = np.where(id_mask)[0]
+            id_action = int(valid[len(valid) // 2]) if len(valid) > 0 else id_idle
 
-        return np.array([afrr_action, price_action, energy_action])
+        if not mfrr_mask[mfrr_action]:
+            valid = np.where(mfrr_mask)[0]
+            mfrr_action = int(valid[len(valid) // 2]) if len(valid) > 0 else mfrr_idle
+
+        return np.array([afrr_action, price_action, id_action, mfrr_action])
 
 
 class UnifiedConservativeStrategy(IDecisionStrategy):
     """
     Conservative fallback strategy that minimizes risk.
 
-    I commit minimal aFRR capacity and stay mostly idle for energy trading.
+    I commit minimal aFRR capacity and stay idle for both IntraDay and mFRR.
     This is useful during system issues or when the market is uncertain.
     """
 
     N_AFRR_LEVELS = 5
     N_PRICE_TIERS = 5
-    N_ENERGY_ACTIONS = 21
+    N_INTRADAY_ACTIONS = 11
+    N_MFRR_ACTIONS = 11
 
     def __init__(self):
         self._name = "UnifiedConservative"
@@ -329,11 +372,13 @@ class UnifiedConservativeStrategy(IDecisionStrategy):
         observation: np.ndarray,
         action_mask: np.ndarray
     ) -> np.ndarray:
-        """I return minimal action: low aFRR commitment, neutral price, idle."""
+        """I return minimal action: [0 aFRR, neutral price, idle IntraDay, idle mFRR]."""
         # I parse masks
-        afrr_mask = action_mask[:self.N_AFRR_LEVELS]
-        price_mask = action_mask[self.N_PRICE_TIERS:self.N_AFRR_LEVELS + self.N_PRICE_TIERS]
-        energy_mask = action_mask[self.N_AFRR_LEVELS + self.N_PRICE_TIERS:]
+        offset = 0
+        afrr_mask = action_mask[offset:offset + self.N_AFRR_LEVELS]; offset += self.N_AFRR_LEVELS
+        price_mask = action_mask[offset:offset + self.N_PRICE_TIERS]; offset += self.N_PRICE_TIERS
+        id_mask = action_mask[offset:offset + self.N_INTRADAY_ACTIONS]; offset += self.N_INTRADAY_ACTIONS
+        mfrr_mask = action_mask[offset:offset + self.N_MFRR_ACTIONS]
 
         # I prefer lowest valid aFRR commitment
         afrr_action = 0 if afrr_mask[0] else int(np.where(afrr_mask)[0][0])
@@ -341,11 +386,15 @@ class UnifiedConservativeStrategy(IDecisionStrategy):
         # I prefer neutral price tier
         price_action = 2 if price_mask[2] else int(np.where(price_mask)[0][len(np.where(price_mask)[0]) // 2])
 
-        # I prefer idle
-        idle_action = self.N_ENERGY_ACTIONS // 2
-        energy_action = idle_action if energy_mask[idle_action] else int(np.where(energy_mask)[0][len(np.where(energy_mask)[0]) // 2])
+        # I prefer idle for IntraDay (center = 5)
+        id_idle = self.N_INTRADAY_ACTIONS // 2
+        id_action = id_idle if id_mask[id_idle] else int(np.where(id_mask)[0][len(np.where(id_mask)[0]) // 2])
 
-        return np.array([afrr_action, price_action, energy_action])
+        # I prefer idle for mFRR (center = 5)
+        mfrr_idle = self.N_MFRR_ACTIONS // 2
+        mfrr_action = mfrr_idle if mfrr_mask[mfrr_idle] else int(np.where(mfrr_mask)[0][len(np.where(mfrr_mask)[0]) // 2])
+
+        return np.array([afrr_action, price_action, id_action, mfrr_action])
 
 
 def create_unified_strategy(
@@ -369,7 +418,7 @@ def create_unified_strategy(
     if strategy_type in ("AI", "UNIFIED", "UNIFIED_AI"):
         strategy = UnifiedStrategy(
             max_power_mw=kwargs.get('max_power_mw', 30.0),
-            n_obs_features=kwargs.get('n_obs_features', 58)
+            n_obs_features=kwargs.get('n_obs_features', 63)
         )
         strategy.load(model_path)
         return strategy

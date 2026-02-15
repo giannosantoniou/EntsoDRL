@@ -78,6 +78,9 @@ class BatteryEnvUnified(gym.Env):
         peak_activation_boost: float = 1.3,  # Higher activation during peak hours
         high_imbalance_boost: float = 1.5,  # Higher activation during system stress
 
+        # mFRR direction constraint
+        mfrr_imbalance_threshold: float = 30.0,  # MW minimum |imbalance| for mFRR
+
         # Cycling limits
         max_daily_cycles: float = 2.0,
         degradation_cost: float = 15.0,
@@ -110,6 +113,9 @@ class BatteryEnvUnified(gym.Env):
         self.afrr_activation_rate = afrr_activation_rate
         self.peak_activation_boost = peak_activation_boost
         self.high_imbalance_boost = high_imbalance_boost
+
+        # mFRR direction constraint
+        self.mfrr_imbalance_threshold = mfrr_imbalance_threshold
 
         # Cycling
         self.max_daily_cycles = max_daily_cycles
@@ -146,6 +152,7 @@ class BatteryEnvUnified(gym.Env):
         print(f"  Action Space: MultiDiscrete({list(self.action_space.nvec)}) = {np.prod(self.action_space.nvec)} combos")
         print(f"  Observation Space: {self.observation_space.shape[0]} features")
         print(f"  aFRR: selection={selection_probability:.0%}, activation={afrr_activation_rate:.0%}")
+        print(f"  mFRR: imbalance_threshold={mfrr_imbalance_threshold:.0f} MW (direction-constrained)")
         print(f"  Data: {len(self.df)} hours ({len(self.df)/24:.0f} days)")
 
     def _prepare_data(self):
@@ -373,19 +380,32 @@ class BatteryEnvUnified(gym.Env):
         # I always allow idle (center index = 5)
         intraday_mask[self.N_INTRADAY_ACTIONS // 2] = True
 
-        # Mask 4: mFRR actions (11 options)
-        # I apply independent mask (step() clips if combined > capacity)
+        # Mask 4: mFRR actions (11 options) — constrained by system imbalance direction
+        # I only allow mFRR in the direction the TSO needs based on net_imbalance_mw:
+        #   Deficit (imbalance < -threshold): only discharge (UP regulation)
+        #   Surplus (imbalance > +threshold): only charge (DOWN regulation)
+        #   Balanced (|imbalance| <= threshold): mFRR closed (idle only)
         mfrr_mask = np.zeros(self.N_MFRR_ACTIONS, dtype=bool)
-        for i, level in enumerate(self.MFRR_LEVELS):
-            power_mw = level * remaining_capacity
-            if level >= 0:  # Discharge (sell)
-                if power_mw <= max_discharge_mw + 0.01:
-                    mfrr_mask[i] = True
-            else:  # Charge (buy)
-                if abs(power_mw) <= max_charge_mw + 0.01:
-                    mfrr_mask[i] = True
-        # I always allow idle (center index = 5)
-        mfrr_mask[self.N_MFRR_ACTIONS // 2] = True
+        imbalance = row.get('net_imbalance_mw', 0.0)
+        mfrr_up_price = row.get('mfrr_price_up', 0.0)
+        mfrr_down_price = row.get('mfrr_price_down', 0.0)
+
+        if imbalance < -self.mfrr_imbalance_threshold and mfrr_up_price > 1.0:
+            # Deficit → only discharge (sell/UP) levels
+            for i, level in enumerate(self.MFRR_LEVELS):
+                if level > 0:
+                    power_mw = level * remaining_capacity
+                    if power_mw <= max_discharge_mw + 0.01:
+                        mfrr_mask[i] = True
+        elif imbalance > self.mfrr_imbalance_threshold and mfrr_down_price > 1.0:
+            # Surplus → only charge (buy/DOWN) levels
+            for i, level in enumerate(self.MFRR_LEVELS):
+                if level < 0:
+                    power_mw = abs(level) * remaining_capacity
+                    if power_mw <= max_charge_mw + 0.01:
+                        mfrr_mask[i] = True
+        # else: balanced → mFRR closed (idle only)
+        mfrr_mask[self.N_MFRR_ACTIONS // 2] = True  # I always allow idle
 
         # I concatenate masks for MultiDiscrete format
         full_mask = np.concatenate([afrr_mask, price_mask, intraday_mask, mfrr_mask])
@@ -622,6 +642,15 @@ class BatteryEnvUnified(gym.Env):
         if not afrr_activated:
             mfrr_level = self.MFRR_LEVELS[mfrr_action]
             requested_mfrr = mfrr_level * remaining_after_intraday
+
+            # I enforce mFRR direction constraint (defense-in-depth for stale masks)
+            imbalance = row.get('net_imbalance_mw', 0.0)
+            if abs(imbalance) <= self.mfrr_imbalance_threshold:
+                requested_mfrr = 0.0  # Balanced → mFRR closed
+            elif imbalance < -self.mfrr_imbalance_threshold and requested_mfrr < 0:
+                requested_mfrr = 0.0  # Can't charge during deficit
+            elif imbalance > self.mfrr_imbalance_threshold and requested_mfrr > 0:
+                requested_mfrr = 0.0  # Can't discharge during surplus
 
             if abs(requested_mfrr) > 0.1:
                 # I recalculate limits after IntraDay
@@ -919,7 +948,7 @@ class BatteryEnvUnified(gym.Env):
         5. Price Lookahead (12): 12h price forecasts
         6. aFRR State (8): cap_prices, activation, commitment, selection, signal, hours_since
         7. Risk/Imbalance (4): dam_discharge_reserve, shortfall_risk, momentum, worthiness
-        8. Gate Closure (4): dam_open, intraday_hours, afrr_hours, mfrr_open
+        8. Gate Closure (4): dam_open, intraday_hours, afrr_hours, mfrr_direction
         9. Timing Signals (4): price_vs_typical, is_peak, is_solar, hours_to_max
         """
         row = self.df.iloc[self.current_step]
@@ -1103,9 +1132,17 @@ class BatteryEnvUnified(gym.Env):
         afrr_hours_remaining = max(0, 23.75 - hour) / 24.0
         features.append(afrr_hours_remaining)
 
-        # mFRR gate open
-        mfrr_gate_open = 1.0 if hour < 23 else 0.0
-        features.append(mfrr_gate_open)
+        # mFRR direction signal (replaces useless gate_open that was always 1.0)
+        # I encode TSO direction based on system imbalance:
+        #  +1.0 = UP available (deficit), -1.0 = DOWN available (surplus), 0.0 = closed
+        imbalance = row.get('net_imbalance_mw', 0.0)
+        if imbalance < -self.mfrr_imbalance_threshold:
+            mfrr_direction = 1.0   # UP available (discharge/sell)
+        elif imbalance > self.mfrr_imbalance_threshold:
+            mfrr_direction = -1.0  # DOWN available (charge/buy)
+        else:
+            mfrr_direction = 0.0   # Closed
+        features.append(mfrr_direction)
 
         # =====================================================================
         # 9. TIMING SIGNALS (4 features)

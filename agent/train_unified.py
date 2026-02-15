@@ -3,14 +3,14 @@ Training Script for Unified Multi-Market Battery Trading Model
 
 I train a single MaskablePPO model that handles ALL markets:
 - DAM commitment execution
-- IntraDay energy trading
+- IntraDay energy trading (separate from mFRR)
 - aFRR capacity commitment and activation
-- mFRR energy trading
+- mFRR energy trading (separate from IntraDay)
 
 Key Features:
-1. MultiDiscrete action space [5, 5, 21]
-2. Hierarchical action masking
-3. 58-feature observation space
+1. MultiDiscrete action space [5, 5, 11, 11]
+2. Hierarchical action masking with capacity cascading: DAM -> aFRR -> IntraDay -> mFRR
+3. 63-feature observation space
 4. VecNormalize for observation normalization
 5. Curriculum learning for degradation cost
 """
@@ -87,6 +87,7 @@ class TensorboardLoggingCallback(BaseCallback):
 
         # I track per-market profits
         self.dam_profits = []
+        self.intraday_profits = []
         self.afrr_capacity_profits = []
         self.afrr_energy_profits = []
         self.mfrr_profits = []
@@ -100,6 +101,10 @@ class TensorboardLoggingCallback(BaseCallback):
         self.step_afrr_bids = 0
         self.step_afrr_selections = 0
         self.step_afrr_activations = 0
+        self.step_intraday_trades = 0
+        self.step_mfrr_trades = 0
+        self.step_mfrr_sells = 0
+        self.step_mfrr_buys = 0
         self.step_count = 0
 
     def _on_step(self) -> bool:
@@ -107,13 +112,22 @@ class TensorboardLoggingCallback(BaseCallback):
         for info in self.locals.get('infos', []):
             self.step_count += 1
 
-            # I track step-level aFRR participation
+            # I track step-level participation
             if info.get('afrr_commitment', 0) > 0.1:
                 self.step_afrr_bids += 1
             if info.get('is_selected', False):
                 self.step_afrr_selections += 1
             if info.get('afrr_activated', False):
                 self.step_afrr_activations += 1
+            if abs(info.get('intraday_energy_mw', 0)) > 0.1:
+                self.step_intraday_trades += 1
+            mfrr_mw = info.get('mfrr_energy_mw', 0)
+            if abs(mfrr_mw) > 0.1:
+                self.step_mfrr_trades += 1
+                if mfrr_mw > 0:
+                    self.step_mfrr_sells += 1
+                else:
+                    self.step_mfrr_buys += 1
 
             # I check for episode end (when total_profit is reported)
             if 'total_profit' in info:
@@ -124,6 +138,8 @@ class TensorboardLoggingCallback(BaseCallback):
             # I track per-market profits
             if 'dam_profit' in info:
                 self.dam_profits.append(info['dam_profit'])
+            if 'intraday_profit' in info:
+                self.intraday_profits.append(info['intraday_profit'])
             if 'afrr_capacity_profit' in info:
                 self.afrr_capacity_profits.append(info['afrr_capacity_profit'])
             if 'afrr_energy_profit' in info:
@@ -144,6 +160,8 @@ class TensorboardLoggingCallback(BaseCallback):
             # I log per-market profits
             if len(self.dam_profits) > 0:
                 self.logger.record('markets/dam_profit', np.mean(self.dam_profits[-100:]))
+            if len(self.intraday_profits) > 0:
+                self.logger.record('markets/intraday_profit', np.mean(self.intraday_profits[-100:]))
             if len(self.afrr_capacity_profits) > 0:
                 self.logger.record('markets/afrr_capacity_profit', np.mean(self.afrr_capacity_profits[-100:]))
             if len(self.afrr_energy_profits) > 0:
@@ -156,6 +174,10 @@ class TensorboardLoggingCallback(BaseCallback):
                 self.logger.record('participation/afrr_bid_rate', self.step_afrr_bids / self.step_count)
                 self.logger.record('participation/afrr_selection_rate', self.step_afrr_selections / self.step_count)
                 self.logger.record('participation/afrr_activation_rate', self.step_afrr_activations / self.step_count)
+                self.logger.record('participation/intraday_trade_rate', self.step_intraday_trades / self.step_count)
+                self.logger.record('participation/mfrr_trade_rate', self.step_mfrr_trades / self.step_count)
+                self.logger.record('participation/mfrr_sell_rate', self.step_mfrr_sells / self.step_count)
+                self.logger.record('participation/mfrr_buy_rate', self.step_mfrr_buys / self.step_count)
 
                 # I calculate conditional rates
                 if self.step_afrr_bids > 0:
@@ -169,6 +191,10 @@ class TensorboardLoggingCallback(BaseCallback):
             self.step_afrr_bids = 0
             self.step_afrr_selections = 0
             self.step_afrr_activations = 0
+            self.step_intraday_trades = 0
+            self.step_mfrr_trades = 0
+            self.step_mfrr_sells = 0
+            self.step_mfrr_buys = 0
             self.step_count = 0
 
         return True
@@ -316,9 +342,16 @@ def train_unified_model(
     if not Path(data_path).exists():
         data_path = project_root / data_path
 
-    # I load data once to share across environments
+    # I load data once and split temporally to avoid data leakage
     df = pd.read_csv(data_path, index_col=0, parse_dates=True)
-    print(f"Loaded training data: {len(df)} rows")
+    print(f"Loaded full dataset: {len(df)} rows")
+
+    # I perform temporal train/test split (80/20 by date)
+    split_idx = int(len(df) * 0.80)
+    df_train = df.iloc[:split_idx].copy()
+    df_eval = df.iloc[split_idx:].copy()
+    print(f"Temporal split: train={len(df_train)} rows ({df_train.index[0]} to {df_train.index[-1]})")
+    print(f"                eval ={len(df_eval)} rows ({df_eval.index[0]} to {df_eval.index[-1]})")
 
     # I create multiple parallel training environments for speedup
     print(f"\nCreating {n_envs} parallel training environments...")
@@ -327,7 +360,7 @@ def train_unified_model(
         """I create a training environment with unique random seed."""
         def _init():
             env = BatteryEnvUnified(
-                df=df,
+                df=df_train,
                 episode_length=168,  # 1 week episodes
                 random_start=True
             )
@@ -348,12 +381,12 @@ def train_unified_model(
         clip_reward=10.0
     )
 
-    # I create evaluation environment (single env is fine for eval)
-    print("Creating evaluation environment...")
+    # I create evaluation environment on SEPARATE held-out data
+    print("Creating evaluation environment (held-out data)...")
 
     def make_eval_env():
         return BatteryEnvUnified(
-            df=df,
+            df=df_eval,
             episode_length=336,  # 2 weeks for eval
             random_start=True
         )
@@ -401,10 +434,31 @@ def train_unified_model(
 
     # I create or load the model
     if resume_from:
-        # I resume training from a saved checkpoint
+        # I resume training from a saved checkpoint with fallback search
         resume_path = Path(resume_from)
-        model_file = resume_path / "final_model.zip" if resume_path.is_dir() else resume_path
-        vec_file = resume_path.parent / "vec_normalize_unified.pkl" if not resume_path.is_dir() else resume_path / "vec_normalize_unified.pkl"
+        if resume_path.is_dir():
+            # I search for the best available model file in priority order
+            candidates = [
+                resume_path / "final_model.zip",
+                resume_path / "best" / "best_model.zip",
+            ]
+            # I also check for checkpoints (latest first)
+            cp_dir = resume_path / "checkpoints"
+            if cp_dir.exists():
+                checkpoints = sorted(cp_dir.glob("*.zip"), reverse=True)
+                candidates.extend(checkpoints)
+
+            model_file = None
+            for c in candidates:
+                if c.exists():
+                    model_file = c
+                    break
+            if model_file is None:
+                raise FileNotFoundError(f"No model found in {resume_path}")
+            vec_file = resume_path / "vec_normalize_unified.pkl"
+        else:
+            model_file = resume_path
+            vec_file = resume_path.parent / "vec_normalize_unified.pkl"
 
         print(f"\nResuming training from: {model_file}")
         model = MaskablePPO.load(

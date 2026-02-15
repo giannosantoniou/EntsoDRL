@@ -2,11 +2,13 @@
 Unit Tests for Unified Multi-Market Battery Environment
 
 I test the key functionality of the unified environment:
-1. Action space structure (MultiDiscrete [5, 5, 21])
-2. Observation space (58 features)
-3. Action masking (capacity cascading)
+1. Action space structure (MultiDiscrete [5, 5, 11, 11])
+2. Observation space (63 features)
+3. Action masking (capacity cascading: DAM -> aFRR -> IntraDay -> mFRR)
 4. aFRR activation simulation
 5. Reward calculation
+6. Separate IntraDay/mFRR capacity cascading
+7. Separate IntraDay/mFRR revenue tracking
 """
 
 import pytest
@@ -56,6 +58,10 @@ def sample_data():
         'afrr_down': prices * 0.9,
         'afrr_cap_up_price': 15 + 10 * np.random.random(n_hours),
         'afrr_cap_down_price': 25 + 15 * np.random.random(n_hours),
+        'intraday_bid': prices - 2.0 + np.random.normal(0, 1, n_hours),
+        'intraday_ask': prices + 2.0 + np.random.normal(0, 1, n_hours),
+        'intraday_spread': 3.0 + np.random.uniform(0, 4, n_hours),
+        'intraday_volume': np.random.uniform(0.3, 0.9, n_hours),
         'mfrr_price_up': prices * 1.3,
         'mfrr_price_down': prices * 0.7,
         'mfrr_spread': prices * 0.6,
@@ -88,8 +94,8 @@ class TestActionSpace:
     """I test the action space structure."""
 
     def test_action_space_shape(self, unified_env):
-        """I verify the action space is MultiDiscrete([5, 5, 21])."""
-        assert unified_env.action_space.nvec.tolist() == [5, 5, 21]
+        """I verify the action space is MultiDiscrete([5, 5, 11, 11])."""
+        assert unified_env.action_space.nvec.tolist() == [5, 5, 11, 11]
 
     def test_afrr_levels(self, unified_env):
         """I verify aFRR commitment levels."""
@@ -101,35 +107,43 @@ class TestActionSpace:
         expected = np.array([0.7, 0.85, 1.0, 1.15, 1.3])
         np.testing.assert_array_equal(unified_env.AFRR_PRICE_TIERS, expected)
 
-    def test_energy_levels(self, unified_env):
-        """I verify energy action levels span -1 to +1."""
-        levels = unified_env.energy_levels
-        assert len(levels) == 21
-        assert levels[0] == -1.0
-        assert levels[10] == 0.0
-        assert levels[20] == 1.0
+    def test_intraday_levels(self, unified_env):
+        """I verify IntraDay action levels span -1 to +1 with 11 levels."""
+        levels = unified_env.INTRADAY_LEVELS
+        assert len(levels) == 11
+        assert levels[0] == pytest.approx(-1.0)
+        assert levels[5] == pytest.approx(0.0)
+        assert levels[10] == pytest.approx(1.0)
+
+    def test_mfrr_levels(self, unified_env):
+        """I verify mFRR action levels span -1 to +1 with 11 levels."""
+        levels = unified_env.MFRR_LEVELS
+        assert len(levels) == 11
+        assert levels[0] == pytest.approx(-1.0)
+        assert levels[5] == pytest.approx(0.0)
+        assert levels[10] == pytest.approx(1.0)
 
 
 class TestObservationSpace:
     """I test the observation space structure."""
 
     def test_observation_shape(self, unified_env):
-        """I verify the observation space is 58 features."""
-        assert unified_env.observation_space.shape == (58,)
+        """I verify the observation space is 63 features."""
+        assert unified_env.observation_space.shape == (63,)
 
     def test_observation_reset(self, unified_env):
         """I verify observation is correctly shaped after reset."""
         obs, info = unified_env.reset(seed=42)
-        assert obs.shape == (58,)
+        assert obs.shape == (63,)
         assert not np.any(np.isnan(obs))
         assert not np.any(np.isinf(obs))
 
     def test_observation_step(self, unified_env):
         """I verify observation is correctly shaped after step."""
         unified_env.reset(seed=42)
-        action = np.array([0, 2, 10])  # No aFRR, neutral price, idle
+        action = np.array([0, 2, 5, 5])  # No aFRR, neutral price, idle ID, idle mFRR
         obs, reward, done, truncated, info = unified_env.step(action)
-        assert obs.shape == (58,)
+        assert obs.shape == (63,)
         assert isinstance(reward, (int, float))
 
 
@@ -137,20 +151,23 @@ class TestActionMasking:
     """I test hierarchical action masking."""
 
     def test_mask_shape(self, unified_env):
-        """I verify the action mask is correctly shaped."""
+        """I verify the action mask is correctly shaped (32 = 5+5+11+11)."""
         unified_env.reset(seed=42)
         mask = unified_env.action_masks()
-        assert len(mask) == 5 + 5 + 21  # 31 total
+        assert len(mask) == 5 + 5 + 11 + 11  # 32 total
 
     def test_idle_always_valid(self, unified_env):
-        """I verify idle action (10) is always valid."""
+        """I verify idle actions are always valid for both IntraDay and mFRR."""
         unified_env.reset(seed=42)
         mask = unified_env.action_masks()
 
-        # Energy mask starts at index 10 (5 + 5)
-        energy_mask = mask[10:]
-        idle_idx = 10  # Middle of 21
-        assert energy_mask[idle_idx] == True
+        # IntraDay idle: index 5 in the IntraDay section (offset 10)
+        intraday_mask = mask[10:21]
+        assert intraday_mask[5] == True
+
+        # mFRR idle: index 5 in the mFRR section (offset 21)
+        mfrr_mask = mask[21:32]
+        assert mfrr_mask[5] == True
 
     def test_zero_afrr_always_valid(self, unified_env):
         """I verify zero aFRR commitment is always valid."""
@@ -160,25 +177,19 @@ class TestActionMasking:
 
     def test_capacity_cascading(self, unified_env, sample_data):
         """I verify capacity cascading respects DAM commitment."""
-        # I find a step with DAM commitment
         dam_steps = sample_data[sample_data['dam_commitment'].abs() > 5].index
 
         if len(dam_steps) > 0:
-            # I reset and step to a DAM commitment hour
             unified_env.reset(seed=42)
-
-            # I manually set state
             unified_env.soc = 0.5  # Middle SoC for flexibility
 
             mask = unified_env.action_masks()
 
-            # With DAM commitment, remaining capacity is reduced
-            # So some high-power actions should be masked
-            energy_mask = mask[10:]
-
-            # Not all discharge actions should be valid (capacity limited)
-            # But some should be (within remaining capacity)
-            assert np.any(energy_mask)
+            # I check that some actions are masked but not all
+            intraday_mask = mask[10:21]
+            mfrr_mask = mask[21:32]
+            assert np.any(intraday_mask)
+            assert np.any(mfrr_mask)
 
     def test_soc_limits_masking(self, unified_env):
         """I verify SoC limits affect action masking."""
@@ -187,13 +198,22 @@ class TestActionMasking:
         # I set SoC near minimum
         unified_env.soc = 0.08  # Near min_soc (0.05)
 
-        mask = unified_env.action_masks()
-        energy_mask = mask[10:]
+        # I set imbalance to deficit so mFRR UP (discharge) is allowed by direction
+        # This isolates the SoC constraint from the direction constraint
+        step = unified_env.current_step
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = -200.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_price_up')] = 500.0
 
-        # High discharge should be masked (not enough energy)
-        # But charge should be valid
-        assert energy_mask[0] == True or energy_mask[1] == True  # Charge
-        assert energy_mask[20] == False  # Max discharge should be masked
+        mask = unified_env.action_masks()
+        intraday_mask = mask[10:21]
+        mfrr_mask = mask[21:32]
+
+        # Max discharge (index 10) should be masked in both markets due to low SoC
+        assert intraday_mask[10] == False  # Max IntraDay discharge
+        assert mfrr_mask[10] == False  # Max mFRR discharge
+
+        # Charge should be valid
+        assert intraday_mask[0] == True or intraday_mask[1] == True
 
 
 class TestAFRRSimulation:
@@ -205,7 +225,7 @@ class TestAFRRSimulation:
 
         activations = 0
         for _ in range(100):
-            action = np.array([4, 2, 10])  # Max aFRR, neutral price, idle
+            action = np.array([4, 2, 5, 5])  # Max aFRR, neutral price, idle ID, idle mFRR
             obs, reward, done, truncated, info = unified_env.step(action)
 
             if info.get('afrr_activated', False):
@@ -222,7 +242,7 @@ class TestAFRRSimulation:
         unified_env.reset(seed=42)
 
         for _ in range(200):
-            action = np.array([4, 2, 10])  # Max aFRR commitment
+            action = np.array([4, 2, 5, 5])  # Max aFRR commitment
             obs, reward, done, truncated, info = unified_env.step(action)
 
             if info.get('afrr_activated', False):
@@ -255,7 +275,7 @@ class TestRewardCalculation:
         unified_env.reset(seed=42)
 
         for _ in range(50):
-            action = np.array([4, 2, 10])  # Max aFRR, neutral, idle
+            action = np.array([4, 2, 5, 5])  # Max aFRR, neutral, idle, idle
             obs, reward, done, truncated, info = unified_env.step(action)
 
             if info.get('is_selected', False):
@@ -270,10 +290,9 @@ class TestRewardCalculation:
         """I verify DAM violations incur penalty."""
         unified_env.reset(seed=42)
 
-        # I find a step with large sell commitment
         for _ in range(100):
             # I try to not meet the commitment by charging instead
-            action = np.array([0, 2, 0])  # No aFRR, max charge
+            action = np.array([0, 2, 0, 0])  # No aFRR, max charge ID, max charge mFRR
             obs, reward, done, truncated, info = unified_env.step(action)
 
             dam_shortfall = info.get('dam_shortfall_mw', 0)
@@ -297,7 +316,7 @@ class TestEpisodeFlow:
         max_steps = 1000
 
         while steps < max_steps:
-            action = np.array([0, 2, 10])  # Idle
+            action = np.array([0, 2, 5, 5])  # Idle
             obs, reward, done, truncated, info = unified_env.step(action)
             steps += 1
 
@@ -321,16 +340,19 @@ class TestEpisodeFlow:
                 unified_env.reset(seed=42)
 
     def test_info_contains_profits(self, unified_env):
-        """I verify info contains profit tracking."""
+        """I verify info contains profit tracking including IntraDay."""
         unified_env.reset(seed=42)
 
-        action = np.array([2, 2, 15])  # 50% aFRR, neutral, slight discharge
+        action = np.array([2, 2, 8, 5])  # 50% aFRR, neutral, moderate ID discharge, idle mFRR
         obs, reward, done, truncated, info = unified_env.step(action)
 
         # I check required info keys
         assert 'soc' in info
         assert 'afrr_commitment' in info
         assert 'total_profit' in info
+        assert 'intraday_profit' in info
+        assert 'intraday_energy_mw' in info
+        assert 'mfrr_energy_mw' in info
 
 
 class TestUnifiedRewardCalculator:
@@ -341,7 +363,7 @@ class TestUnifiedRewardCalculator:
         from gym_envs.unified_reward_calculator import UnifiedRewardCalculator, UnifiedMarketState
 
     def test_reward_components(self):
-        """I verify reward has expected components."""
+        """I verify reward has expected components including intraday_revenue."""
         from gym_envs.unified_reward_calculator import UnifiedRewardCalculator, UnifiedMarketState
 
         calculator = UnifiedRewardCalculator()
@@ -367,6 +389,7 @@ class TestUnifiedRewardCalculator:
             actual_energy_mw=10.0,
             afrr_capacity_committed_mw=5.0,
             afrr_energy_delivered_mw=0.0,
+            intraday_energy_mw=5.0,
             mfrr_energy_mw=0.0,
             current_soc=0.5,
             capacity_mwh=146.0,
@@ -376,8 +399,371 @@ class TestUnifiedRewardCalculator:
 
         assert 'reward' in result
         assert 'components' in result
+        assert 'intraday_revenue' in result['components']
         assert isinstance(result['reward'], (int, float))
         assert np.isfinite(result['reward'])
+
+    def test_intraday_revenue_sell(self):
+        """I verify IntraDay sell revenue uses bid price."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator, UnifiedMarketState
+
+        calculator = UnifiedRewardCalculator()
+        market = UnifiedMarketState(
+            dam_price=100.0, dam_commitment=0.0,
+            intraday_bid=98.0, intraday_ask=102.0, intraday_spread=4.0,
+            afrr_cap_up_price=20.0, afrr_cap_down_price=30.0,
+            afrr_energy_up_price=80.0, afrr_energy_down_price=80.0,
+            afrr_activated=False, afrr_activation_direction=None,
+            mfrr_price_up=120.0, mfrr_price_down=60.0
+        )
+
+        result = calculator.calculate(
+            market=market, actual_energy_mw=10.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            intraday_energy_mw=10.0, mfrr_energy_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0
+        )
+
+        # Sell 10 MW at bid=98 -> 980 EUR
+        assert result['components']['intraday_revenue'] == pytest.approx(980.0, abs=1.0)
+
+    def test_intraday_revenue_buy(self):
+        """I verify IntraDay buy cost uses ask price."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator, UnifiedMarketState
+
+        calculator = UnifiedRewardCalculator()
+        market = UnifiedMarketState(
+            dam_price=100.0, dam_commitment=0.0,
+            intraday_bid=98.0, intraday_ask=102.0, intraday_spread=4.0,
+            afrr_cap_up_price=20.0, afrr_cap_down_price=30.0,
+            afrr_energy_up_price=80.0, afrr_energy_down_price=80.0,
+            afrr_activated=False, afrr_activation_direction=None,
+            mfrr_price_up=120.0, mfrr_price_down=60.0
+        )
+
+        result = calculator.calculate(
+            market=market, actual_energy_mw=-10.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            intraday_energy_mw=-10.0, mfrr_energy_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0
+        )
+
+        # Buy 10 MW at ask=102 -> -1020 EUR (cost)
+        assert result['components']['intraday_revenue'] == pytest.approx(-1020.0, abs=1.0)
+
+
+class TestDAMSoCReservation:
+    """I test the SoC-aware action masking that prevents DAM violations."""
+
+    def test_dam_soc_reserve_no_commitment(self, unified_env):
+        """I verify that without DAM commitments, reserves stay at defaults."""
+        unified_env.reset(seed=42)
+
+        # I set all future DAM commitments to 0
+        step = unified_env.current_step
+        for i in range(1, 5):
+            if step + i < len(unified_env.df):
+                unified_env.df.iloc[step + i, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        min_soc, max_soc = unified_env._calculate_dam_soc_reserve()
+        assert min_soc == pytest.approx(unified_env.min_soc, abs=1e-6)
+        assert max_soc == pytest.approx(unified_env.max_soc, abs=1e-6)
+
+    def test_dam_soc_reserve_sell_commitment(self, unified_env):
+        """I verify that a sell commitment raises the minimum SoC reserve."""
+        unified_env.reset(seed=42)
+
+        step = unified_env.current_step
+        # I clear all future commitments first
+        for i in range(1, 5):
+            if step + i < len(unified_env.df):
+                unified_env.df.iloc[step + i, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        # I set a 30 MW sell commitment at H+1
+        if step + 1 < len(unified_env.df):
+            unified_env.df.iloc[step + 1, unified_env.df.columns.get_loc('dam_commitment')] = 30.0
+
+        min_soc, max_soc = unified_env._calculate_dam_soc_reserve()
+
+        # min_soc should be higher than default
+        assert min_soc > unified_env.min_soc + 0.01
+        # max_soc should stay at default
+        assert max_soc == pytest.approx(unified_env.max_soc, abs=1e-6)
+
+        expected_min_soc = unified_env.min_soc + (30.0 / unified_env.eff_sqrt) / unified_env.capacity_mwh
+        assert min_soc == pytest.approx(expected_min_soc, abs=0.01)
+
+    def test_dam_mask_prevents_over_discharge(self, unified_env):
+        """I verify the mask blocks discharge when SoC is near the DAM reserve."""
+        unified_env.reset(seed=42)
+
+        step = unified_env.current_step
+        for i in range(1, 5):
+            if step + i < len(unified_env.df):
+                unified_env.df.iloc[step + i, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+        if step + 1 < len(unified_env.df):
+            unified_env.df.iloc[step + 1, unified_env.df.columns.get_loc('dam_commitment')] = 30.0
+
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        min_soc_reserve, _ = unified_env._calculate_dam_soc_reserve()
+        unified_env.soc = min_soc_reserve + 0.01
+
+        mask = unified_env.action_masks()
+        intraday_mask = mask[10:21]  # IntraDay section
+        mfrr_mask = mask[21:32]  # mFRR section
+
+        # Max discharge should be blocked in both markets
+        assert intraday_mask[10] == False, "Max IntraDay discharge should be masked near DAM reserve"
+        assert mfrr_mask[10] == False, "Max mFRR discharge should be masked near DAM reserve"
+        # Idle should always be allowed
+        assert intraday_mask[5] == True, "IntraDay idle should always be allowed"
+        assert mfrr_mask[5] == True, "mFRR idle should always be allowed"
+        # Charge should be allowed
+        assert intraday_mask[0] == True, "Max IntraDay charge should be allowed"
+
+    def test_dam_mask_buy_commitment(self, unified_env):
+        """I verify the mask blocks excessive charge when a buy commitment is ahead."""
+        unified_env.reset(seed=42)
+
+        step = unified_env.current_step
+        for i in range(1, 5):
+            if step + i < len(unified_env.df):
+                unified_env.df.iloc[step + i, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+        if step + 1 < len(unified_env.df):
+            unified_env.df.iloc[step + 1, unified_env.df.columns.get_loc('dam_commitment')] = -30.0
+
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        _, max_soc_reserve = unified_env._calculate_dam_soc_reserve()
+        unified_env.soc = max_soc_reserve - 0.01
+
+        mask = unified_env.action_masks()
+        intraday_mask = mask[10:21]
+        mfrr_mask = mask[21:32]
+
+        # Max charge should be blocked
+        assert intraday_mask[0] == False, "Max IntraDay charge should be masked near buy-reserve ceiling"
+        assert mfrr_mask[0] == False, "Max mFRR charge should be masked near buy-reserve ceiling"
+        # Idle should always be allowed
+        assert intraday_mask[5] == True
+        assert mfrr_mask[5] == True
+        # Discharge should be allowed
+        assert intraday_mask[10] == True, "IntraDay discharge should be allowed with high SoC"
+
+
+class TestCapacityCascading:
+    """I test that IntraDay and mFRR properly cascade capacity."""
+
+    def test_intraday_reduces_mfrr_capacity(self, unified_env):
+        """I verify that IntraDay trading reduces available mFRR capacity."""
+        unified_env.reset(seed=42)
+        unified_env.soc = 0.5
+        # I clear DAM commitment for this step
+        step = unified_env.current_step
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        # I request full IntraDay discharge + full mFRR discharge
+        # [0 aFRR, neutral price, max ID discharge (10), max mFRR discharge (10)]
+        action = np.array([0, 2, 10, 10])
+        obs, reward, done, truncated, info = unified_env.step(action)
+
+        id_mw = abs(info.get('intraday_energy_mw', 0))
+        mfrr_mw = abs(info.get('mfrr_energy_mw', 0))
+        total_mw = id_mw + mfrr_mw
+
+        # I verify combined power does not exceed max_power_mw
+        assert total_mw <= unified_env.max_power_mw + 0.1, \
+            f"|IntraDay| + |mFRR| = {total_mw:.1f} exceeds max_power {unified_env.max_power_mw}"
+
+    def test_cross_direction_trades(self, unified_env):
+        """I verify buy ID + sell mFRR = valid (cross-direction)."""
+        unified_env.reset(seed=42)
+        unified_env.soc = 0.5
+        step = unified_env.current_step
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        # I buy on IntraDay (action 0 = max charge), sell on mFRR (action 10 = max discharge)
+        action = np.array([0, 2, 0, 10])
+        obs, reward, done, truncated, info = unified_env.step(action)
+
+        id_mw = info.get('intraday_energy_mw', 0)
+        mfrr_mw = info.get('mfrr_energy_mw', 0)
+
+        # I verify both trades happened (they have opposite signs)
+        # IntraDay charge is negative, mFRR discharge is positive
+        if abs(id_mw) > 0.1 and abs(mfrr_mw) > 0.1:
+            assert id_mw < 0, "IntraDay should be charging (negative)"
+            assert mfrr_mw > 0, "mFRR should be discharging (positive)"
+
+
+class TestSeparateRevenue:
+    """I test that IntraDay and mFRR track revenue separately."""
+
+    def test_separate_profit_tracking(self, unified_env):
+        """I verify IntraDay and mFRR have separate profit counters."""
+        unified_env.reset(seed=42)
+        step = unified_env.current_step
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        # I discharge on IntraDay only (mFRR idle)
+        action = np.array([0, 2, 9, 5])  # ~80% ID discharge, mFRR idle
+        obs, reward, done, truncated, info = unified_env.step(action)
+
+        id_profit = info.get('intraday_profit', 0)
+        mfrr_rev = info.get('mfrr_revenue', 0)
+
+        if abs(info.get('intraday_energy_mw', 0)) > 0.1:
+            assert abs(id_profit) > 0, "IntraDay profit should be non-zero when trading"
+        assert mfrr_rev == pytest.approx(0.0, abs=0.01), "mFRR revenue should be zero when idle"
+
+    def test_intraday_uses_bid_ask(self, unified_env):
+        """I verify IntraDay sells at bid and buys at ask."""
+        unified_env.reset(seed=42)
+        unified_env.soc = 0.5
+        step = unified_env.current_step
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        # I sell on IntraDay
+        action = np.array([0, 2, 9, 5])  # ~80% ID discharge, mFRR idle
+        obs, reward, done, truncated, info = unified_env.step(action)
+
+        id_revenue = info.get('intraday_revenue', 0)
+        id_mw = info.get('intraday_energy_mw', 0)
+
+        if id_mw > 0.1:
+            # Selling should generate positive revenue
+            assert id_revenue > 0, "IntraDay sell should generate positive revenue"
+
+    def test_mfrr_uses_up_down(self, unified_env):
+        """I verify mFRR sells at mfrr_up and buys at mfrr_down."""
+        unified_env.reset(seed=42)
+        unified_env.soc = 0.5
+        step = unified_env.current_step
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        # I sell on mFRR (IntraDay idle)
+        action = np.array([0, 2, 5, 9])  # ID idle, ~80% mFRR discharge
+        obs, reward, done, truncated, info = unified_env.step(action)
+
+        mfrr_rev = info.get('mfrr_revenue', 0)
+        mfrr_mw = info.get('mfrr_energy_mw', 0)
+
+        if mfrr_mw > 0.1:
+            assert mfrr_rev > 0, "mFRR sell should generate positive revenue"
+
+
+class TestMFRRDirectionConstraint:
+    """I test that mFRR actions are constrained by system imbalance direction."""
+
+    def test_mfrr_idle_only_when_balanced(self, unified_env):
+        """I verify all non-idle mFRR actions are masked when |imbalance| < threshold."""
+        unified_env.reset(seed=42)
+        step = unified_env.current_step
+
+        # I set balanced imbalance (within threshold)
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = 10.0
+
+        mask = unified_env.action_masks()
+        mfrr_mask = mask[21:32]  # mFRR section
+
+        # Only idle (index 5) should be allowed
+        for i in range(11):
+            if i == 5:
+                assert mfrr_mask[i] == True, "mFRR idle must always be allowed"
+            else:
+                assert mfrr_mask[i] == False, \
+                    f"mFRR action {i} should be masked when balanced (imb=10 MW)"
+
+    def test_mfrr_discharge_only_during_deficit(self, unified_env):
+        """I verify only discharge (level > 0) actions allowed during deficit."""
+        unified_env.reset(seed=42)
+        unified_env.soc = 0.5  # Enough SoC for discharge
+        step = unified_env.current_step
+
+        # I set deficit imbalance and valid price
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = -200.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_price_up')] = 500.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        mask = unified_env.action_masks()
+        mfrr_mask = mask[21:32]
+
+        # Idle (5) must be allowed
+        assert mfrr_mask[5] == True
+
+        # Discharge levels (6-10, level > 0) should be allowed (SoC permitting)
+        has_discharge = any(mfrr_mask[6:11])
+        assert has_discharge, "At least one discharge action should be allowed during deficit"
+
+        # Charge levels (0-4, level < 0) must be masked
+        for i in range(5):
+            assert mfrr_mask[i] == False, \
+                f"mFRR charge action {i} should be masked during deficit"
+
+    def test_mfrr_charge_only_during_surplus(self, unified_env):
+        """I verify only charge (level < 0) actions allowed during surplus."""
+        unified_env.reset(seed=42)
+        unified_env.soc = 0.5  # Enough headroom for charge
+        step = unified_env.current_step
+
+        # I set surplus imbalance and valid price
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = 200.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_price_down')] = 300.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        mask = unified_env.action_masks()
+        mfrr_mask = mask[21:32]
+
+        # Idle (5) must be allowed
+        assert mfrr_mask[5] == True
+
+        # Charge levels (0-4, level < 0) should be allowed (SoC permitting)
+        has_charge = any(mfrr_mask[0:5])
+        assert has_charge, "At least one charge action should be allowed during surplus"
+
+        # Discharge levels (6-10, level > 0) must be masked
+        for i in range(6, 11):
+            assert mfrr_mask[i] == False, \
+                f"mFRR discharge action {i} should be masked during surplus"
+
+    def test_mfrr_direction_feature_in_observation(self, unified_env):
+        """I verify obs[58] encodes mFRR direction: +1 (UP), -1 (DOWN), 0 (closed)."""
+        unified_env.reset(seed=42)
+        step = unified_env.current_step
+
+        # I test deficit → +1.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = -200.0
+        obs = unified_env._build_observation()
+        assert obs[58] == 1.0, f"Expected mfrr_direction=+1.0 for deficit, got {obs[58]}"
+
+        # I test surplus → -1.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = 200.0
+        obs = unified_env._build_observation()
+        assert obs[58] == -1.0, f"Expected mfrr_direction=-1.0 for surplus, got {obs[58]}"
+
+        # I test balanced → 0.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = 10.0
+        obs = unified_env._build_observation()
+        assert obs[58] == 0.0, f"Expected mfrr_direction=0.0 for balanced, got {obs[58]}"
+
+    def test_step_enforces_direction_constraint(self, unified_env):
+        """I verify step() blocks wrong-direction mFRR trades (defense-in-depth)."""
+        unified_env.reset(seed=42)
+        unified_env.soc = 0.5
+        step = unified_env.current_step
+
+        # I set balanced imbalance — mFRR should be blocked entirely
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = 5.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        # I force a max discharge mFRR action (action 10) despite balanced conditions
+        action = np.array([0, 2, 5, 10])  # No aFRR, idle ID, max mFRR discharge
+        obs, reward, done, truncated, info = unified_env.step(action)
+
+        # mFRR should be zero because of direction enforcement
+        assert abs(info.get('mfrr_energy_mw', 0)) < 0.01, \
+            f"mFRR should be blocked during balanced conditions, got {info.get('mfrr_energy_mw', 0)}"
 
 
 class TestUnifiedStrategy:
@@ -388,7 +774,7 @@ class TestUnifiedStrategy:
         from agent.unified_strategy import UnifiedStrategy, UnifiedRuleBasedStrategy
 
     def test_rule_based_action(self, unified_env):
-        """I verify rule-based strategy produces valid actions."""
+        """I verify rule-based strategy produces valid 4-element actions."""
         from agent.unified_strategy import UnifiedRuleBasedStrategy
 
         strategy = UnifiedRuleBasedStrategy()
@@ -400,13 +786,14 @@ class TestUnifiedStrategy:
 
         action = strategy.predict_action(obs, mask)
 
-        assert len(action) == 3
-        assert 0 <= action[0] < 5
-        assert 0 <= action[1] < 5
-        assert 0 <= action[2] < 21
+        assert len(action) == 4
+        assert 0 <= action[0] < 5   # aFRR
+        assert 0 <= action[1] < 5   # Price tier
+        assert 0 <= action[2] < 11  # IntraDay
+        assert 0 <= action[3] < 11  # mFRR
 
     def test_conservative_action(self, unified_env):
-        """I verify conservative strategy produces minimal actions."""
+        """I verify conservative strategy produces minimal 4-element actions."""
         from agent.unified_strategy import UnifiedConservativeStrategy
 
         strategy = UnifiedConservativeStrategy()
@@ -418,9 +805,11 @@ class TestUnifiedStrategy:
 
         action = strategy.predict_action(obs, mask)
 
-        # Conservative should prefer low aFRR and idle energy
+        assert len(action) == 4
+        # Conservative should prefer zero aFRR and idle energy
         assert action[0] == 0  # Zero aFRR commitment
-        assert action[2] == 10  # Idle energy action
+        assert action[2] == 5  # Idle IntraDay action
+        assert action[3] == 5  # Idle mFRR action
 
 
 if __name__ == "__main__":
