@@ -73,7 +73,7 @@ def upsample_hourly_to_15min(
     expected_len = (original_len - 1) * 4 + 1  # Ffill doesn't extend beyond last hour
     actual_len = len(df_15min)
     
-    print(f"Upsampling complete: {original_len} hours → {actual_len} 15-min slots")
+    print(f"Upsampling complete: {original_len} hours -> {actual_len} 15-min slots")
     print(f"  Method: {method}")
     print(f"  Energy columns ({'divided by 4' if divide_energy_by_4 else 'repeated'}): {energy_columns}")
     print(f"  Power columns (forward-filled as-is): {power_columns}")
