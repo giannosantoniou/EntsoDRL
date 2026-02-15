@@ -228,6 +228,239 @@ def create_unified_dataset_from_admie(
     return unified
 
 
+def create_unified_dataset_from_admie_15min(
+    dam_path: str = 'dam_prices_2021_2026.csv',
+    admie_path: str = 'admie_market_data_combined_15min.csv',
+    forecast_path_name: str = 'dam_forecasts_2024_2026.csv',
+    output_path: str = 'unified_multimarket_training_15min.csv'
+) -> pd.DataFrame:
+    """
+    I create a native 15-min unified training dataset from real ADMIE data.
+
+    Unlike the Phase 1 approach (forward-fill from hourly), this uses native
+    15-min resolution data from ADMIE for mFRR, aFRR, imbalance, and system
+    deviation. Only DAM prices and load/RES (which are truly hourly) get
+    forward-filled to 15-min.
+
+    This means the agent sees real intra-hour price variation in balancing
+    markets, enabling it to learn 15-min trading strategies.
+    """
+    data_dir = Path(__file__).parent
+    steps_per_hour = 4  # 15-min resolution
+
+    print("=" * 60)
+    print("CREATING NATIVE 15-MIN UNIFIED DATASET FROM ADMIE DATA")
+    print("=" * 60)
+
+    # Step 1: I load DAM prices (hourly by market design) and upsample to 15-min
+    dam_filepath = data_dir / dam_path
+    print(f"\nLoading DAM prices from {dam_filepath}...")
+    dam_df = pd.read_csv(dam_filepath, index_col=0)
+
+    # I parse timestamps as UTC, convert to Athens local, strip timezone
+    dam_df.index = pd.to_datetime(dam_df.index, utc=True)
+    dam_df.index = dam_df.index.tz_convert('Europe/Athens')
+    dam_df.index = dam_df.index.tz_localize(None)
+
+    dam_df = dam_df.resample('h').mean().dropna()
+    dam_df.columns = ['price']
+
+    # I upsample DAM prices to 15-min via forward-fill (DAM is hourly by design)
+    dam_df = dam_df.resample('15min').ffill()
+    print(f"  DAM: {len(dam_df)} rows at 15-min (forward-filled from hourly)")
+    print(f"  DAM price: mean={dam_df['price'].mean():.2f}, std={dam_df['price'].std():.2f}")
+
+    # Step 2: I load native 15-min ADMIE balancing data
+    admie_filepath = data_dir / admie_path
+    if not admie_filepath.exists():
+        # I fall back to the hourly file if 15-min doesn't exist yet
+        admie_filepath_fallback = data_dir / 'admie_market_data_combined.csv'
+        if admie_filepath_fallback.exists():
+            print(f"\n  WARNING: {admie_path} not found, falling back to hourly ADMIE data")
+            print("  Run: python data/admie_data_fetcher.py --start 2024-01-01 --end 2026-01-31 --resolution 15min")
+            admie_filepath = admie_filepath_fallback
+        else:
+            raise FileNotFoundError(
+                f"Neither {admie_path} nor admie_market_data_combined.csv found in {data_dir}. "
+                "Run the ADMIE fetcher first."
+            )
+
+    print(f"\nLoading ADMIE data from {admie_filepath}...")
+    admie_df = pd.read_csv(admie_filepath, parse_dates=['timestamp'])
+    admie_df = admie_df.set_index('timestamp')
+
+    if admie_df.index.tz is not None:
+        admie_df.index = admie_df.index.tz_localize(None)
+
+    # I check if this is truly 15-min data by examining the index frequency
+    if len(admie_df) > 2:
+        median_diff = admie_df.index.to_series().diff().median()
+        is_native_15min = median_diff <= pd.Timedelta(minutes=20)
+        print(f"  ADMIE: {len(admie_df)} rows, median step={median_diff}")
+        if is_native_15min:
+            print("  -> Native 15-min resolution confirmed")
+        else:
+            print("  -> WARNING: Data appears hourly, will forward-fill to 15-min")
+            admie_df = admie_df.resample('15min').ffill()
+            print(f"  -> After ffill: {len(admie_df)} rows")
+
+    print(f"  Date range: {admie_df.index.min()} to {admie_df.index.max()}")
+
+    # Step 3: I inner join on timestamp
+    print("\nJoining DAM (15-min ffill) + ADMIE (native 15-min)...")
+    unified = dam_df.join(admie_df, how='inner')
+    print(f"  Overlap: {len(unified)} rows, {unified.index.min()} to {unified.index.max()}")
+
+    if len(unified) == 0:
+        raise ValueError("No overlapping timestamps between DAM and ADMIE data!")
+
+    # Step 4: I map ADMIE columns -> environment column names
+    # I rename mFRR energy activation prices (the high-value spreads the agent trades)
+    column_mapping = {
+        'mfrr_energy_price_up': 'mfrr_price_up',
+        'mfrr_energy_price_down': 'mfrr_price_down',
+        'afrr_price_up': 'afrr_cap_up_price',
+        'afrr_price_down': 'afrr_cap_down_price',
+        'afrr_requirements_up': 'afrr_cap_up_qty',
+        'afrr_requirements_down': 'afrr_cap_down_qty',
+        'system_load_mw': 'load_mw',
+        'res_production_mw': 'res_total_mw',
+        'system_deviation_mwh': 'net_imbalance_mw',
+    }
+
+    # I drop ADMIE's mfrr_price_up/down (capacity) before renaming to avoid collision
+    admie_cap_cols = ['mfrr_price_up', 'mfrr_price_down']
+    for col in admie_cap_cols:
+        if col in unified.columns:
+            unified = unified.rename(columns={col: f'mfrr_cap_{col.split("_", 1)[1]}'})
+
+    unified = unified.rename(columns=column_mapping)
+
+    # Step 5: I derive aFRR energy prices from imbalance_price
+    if 'imbalance_price' in unified.columns:
+        unified['afrr_up'] = unified['imbalance_price']
+        unified['afrr_down'] = unified['imbalance_price'] * 0.3
+        unified['afrr_down'] = unified['afrr_down'].clip(lower=0)
+    else:
+        unified['afrr_up'] = 80.0
+        unified['afrr_down'] = 24.0
+
+    # I compute mFRR spread from real energy prices
+    unified['mfrr_spread'] = unified['mfrr_price_up'] - unified['mfrr_price_down']
+
+    # Step 6: I estimate solar/wind split from total RES + time-of-day
+    if 'res_total_mw' in unified.columns:
+        hours = unified.index.hour.values
+        solar_fraction = np.maximum(0, np.sin(np.pi * (hours - 5) / 13))
+        solar_fraction = solar_fraction * 0.6
+        solar_fraction[hours < 6] = 0.0
+        solar_fraction[hours > 19] = 0.0
+        unified['solar'] = unified['res_total_mw'] * solar_fraction
+        unified['wind_onshore'] = unified['res_total_mw'] * (1 - solar_fraction)
+    else:
+        unified['solar'] = 0.0
+        unified['wind_onshore'] = 0.0
+
+    # Step 7: I generate DAM commitments from forecasts, then forward-fill to 15-min
+    # DAM commitments are per-hour (same MW value for all 4 quarter-hours)
+    forecast_path = data_dir / forecast_path_name
+    if forecast_path.exists():
+        print("  Using EntsoE3 D-1 forecasts for DAM commitments...")
+        # I need hourly index for the commitment generator, then ffill to 15-min
+        hourly_index = unified.index[unified.index.minute == 0]
+        hourly_proxy = unified.loc[hourly_index].copy()
+        commitments_hourly = _generate_dam_commitments_from_forecasts(
+            hourly_proxy, forecast_path
+        )
+        # I create an hourly series and reindex to 15-min with ffill
+        commit_series = pd.Series(
+            commitments_hourly, index=hourly_index, name='dam_commitment'
+        )
+        unified['dam_commitment'] = commit_series.reindex(unified.index).ffill().bfill()
+    else:
+        print("  WARNING: EntsoE3 forecasts not found, using heuristic DAM commitments")
+        hourly_index = unified.index[unified.index.minute == 0]
+        hourly_proxy = unified.loc[hourly_index].copy()
+        commitments_hourly = _generate_dam_commitments(hourly_proxy)
+        commit_series = pd.Series(
+            commitments_hourly, index=hourly_index, name='dam_commitment'
+        )
+        unified['dam_commitment'] = commit_series.reindex(unified.index).ffill().bfill()
+
+    # Step 8: I add rolling statistics BEFORE synthesizing IntraDay
+    window_24h = 24 * steps_per_hour  # 96 steps at 15-min
+    unified['price_mean_24h'] = unified['price'].rolling(window_24h, min_periods=1).mean()
+    unified['price_std_24h'] = unified['price'].rolling(window_24h, min_periods=1).std().fillna(10)
+    unified['price_min_24h'] = unified['price'].rolling(window_24h, min_periods=1).min()
+    unified['price_max_24h'] = unified['price'].rolling(window_24h, min_periods=1).max()
+
+    # Step 9: I synthesize IntraDay data at 15-min resolution
+    # OU processes use sqrt(0.25) scaling -> finer intra-hour variation
+    all_mask = pd.Series(True, index=unified.index)
+    unified = _synthesize_intraday_data(unified, all_mask, time_step_hours=0.25)
+
+    # Step 10: I add all derived features with 15-min-aware window sizes
+    unified = _add_derived_features(unified, steps_per_hour=steps_per_hour)
+
+    # Step 11: I validate the final dataset
+    _validate_dataset(unified)
+    _print_admie_vs_synthetic_stats(unified)
+
+    # I verify native 15-min variability
+    _verify_15min_variability(unified)
+
+    # I save the output
+    output_filepath = data_dir / output_path
+    unified.to_csv(output_filepath)
+    print(f"\nSaved native 15-min unified dataset to {output_filepath}")
+    print(f"Dataset shape: {unified.shape}")
+
+    sample_path = data_dir / "unified_multimarket_sample.csv"
+    unified.head(100).to_csv(sample_path)
+    print(f"Saved sample (100 rows) to {sample_path}")
+
+    return unified
+
+
+def _verify_15min_variability(df: pd.DataFrame) -> None:
+    """
+    I verify that native 15-min columns actually vary within hours,
+    as opposed to being flat (forward-filled from hourly).
+    """
+    print("\n" + "=" * 60)
+    print("15-MIN VARIABILITY CHECK")
+    print("=" * 60)
+
+    # I check columns that should have native 15-min variation
+    native_15min_cols = ['mfrr_price_up', 'mfrr_price_down', 'imbalance_price',
+                         'net_imbalance_mw', 'afrr_cap_up_price', 'afrr_cap_down_price']
+    # I check columns that should be flat within hour (forward-filled)
+    hourly_cols = ['price']
+
+    # I compute within-hour standard deviation
+    df_check = df.copy()
+    df_check['hour_group'] = df_check.index.floor('h')
+
+    for col in native_15min_cols:
+        if col not in df_check.columns:
+            continue
+        within_hour_std = df_check.groupby('hour_group')[col].std().mean()
+        overall_std = df_check[col].std()
+        ratio = within_hour_std / overall_std if overall_std > 0 else 0
+        is_native = within_hour_std > 0.001
+        status = "NATIVE 15-min" if is_native else "FLAT (hourly ffill)"
+        print(f"  {col:30s}: within-hour std={within_hour_std:8.3f}, "
+              f"overall std={overall_std:8.2f}, ratio={ratio:.3f} -> {status}")
+
+    for col in hourly_cols:
+        if col not in df_check.columns:
+            continue
+        within_hour_std = df_check.groupby('hour_group')[col].std().mean()
+        is_flat = within_hour_std < 0.001
+        status = "FLAT (correct)" if is_flat else "UNEXPECTED variation"
+        print(f"  {col:30s}: within-hour std={within_hour_std:8.3f} -> {status}")
+
+
 def _print_admie_vs_synthetic_stats(df: pd.DataFrame) -> None:
     """I print key statistics to verify real data quality vs old synthetic levels."""
     print("\n" + "=" * 60)
@@ -607,7 +840,11 @@ def _generate_dam_commitments(df: pd.DataFrame) -> np.ndarray:
     return commitments
 
 
-def _synthesize_intraday_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
+def _synthesize_intraday_data(
+    df: pd.DataFrame,
+    mask: pd.Series,
+    time_step_hours: float = 1.0
+) -> pd.DataFrame:
     """
     I synthesize realistic IntraDay (XBID/HEnEx) market data with independent dynamics.
 
@@ -617,7 +854,13 @@ def _synthesize_intraday_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame
     - RES forecast updates between DAM and IntraDay gate
     - Liquidity-driven spread dynamics
     - Regime shifts (e.g., unexpected weather changes)
+
+    Args:
+        time_step_hours: Time step in hours (1.0 for hourly, 0.25 for 15-min).
+            OU processes scale with sqrt(dt) for per-step noise, producing
+            finer-grained variation at 15-min while preserving hourly statistics.
     """
+    dt = time_step_hours
     dam_prices = df.loc[mask, 'price'].values
     hours = df.loc[mask].index.hour.values if hasattr(df.index, 'hour') else np.zeros(mask.sum())
     n = len(dam_prices)
@@ -626,21 +869,30 @@ def _synthesize_intraday_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame
     # This represents market information arriving AFTER DAM clearing
     # (RES forecast updates, cross-border flow changes, outages)
     # I scale sigma proportionally to DAM price level for realistic deviation
-    ou_theta = 0.05  # Slow mean reversion — deviations persist for many hours
+    ou_theta = 0.05  # Slow mean reversion - deviations persist for many hours
     ou_sigma_base = 8.0  # Base EUR volatility per sqrt(hour)
     deviation = np.zeros(n)
     deviation[0] = np.random.normal(0, ou_sigma_base)
 
     for i in range(1, n):
-        # I scale volatility by price level — higher prices have larger deviations
+        # I scale volatility by price level - higher prices have larger deviations
         price_scale = max(dam_prices[i] / 100.0, 0.3)
         sigma_i = ou_sigma_base * price_scale
-        deviation[i] = deviation[i-1] + ou_theta * (0 - deviation[i-1]) + sigma_i * np.random.normal()
+        # I use sqrt(dt) scaling so the OU process produces smaller per-step
+        # jumps at 15-min but 4x more steps per hour -> same hourly variance
+        deviation[i] = (
+            deviation[i-1]
+            + ou_theta * dt * (0 - deviation[i-1])
+            + sigma_i * np.random.normal() * np.sqrt(dt)
+        )
 
-    # I add regime shifts — sudden forecast changes (~5% of hours)
-    forecast_shocks = np.random.random(n) < 0.05
-    shock_scale = np.abs(dam_prices[forecast_shocks]) * 0.15  # 15% of DAM price
-    deviation[forecast_shocks] += np.random.normal(0, 1.0, forecast_shocks.sum()) * shock_scale
+    # I add regime shifts - sudden forecast changes (~5% of hours, scaled by dt)
+    # At 15-min, each step has 1.25% shock probability -> ~5% per hour
+    shock_prob = 0.05 * dt
+    forecast_shocks = np.random.random(n) < shock_prob
+    if forecast_shocks.sum() > 0:
+        shock_scale = np.abs(dam_prices[forecast_shocks]) * 0.15
+        deviation[forecast_shocks] += np.random.normal(0, 1.0, forecast_shocks.sum()) * shock_scale
 
     # I add time-of-day effects (smaller than before)
     peak_premium = np.where((hours >= 17) & (hours <= 21), 2.0, 0.0)
@@ -654,7 +906,11 @@ def _synthesize_intraday_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame
     spread_mu = 3.0  # Mean spread
     spread_ou[0] = spread_mu
     for i in range(1, n):
-        spread_ou[i] = spread_ou[i-1] + 0.12 * (spread_mu - spread_ou[i-1]) + 1.0 * abs(np.random.normal())
+        spread_ou[i] = (
+            spread_ou[i-1]
+            + 0.12 * dt * (spread_mu - spread_ou[i-1])
+            + 1.0 * abs(np.random.normal()) * np.sqrt(dt)
+        )
 
     # I modulate spread by liquidity hours
     is_liquid = ((hours >= 8) & (hours <= 20)).astype(float)
@@ -677,7 +933,11 @@ def _synthesize_intraday_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame
     vol_mu = 0.55
     vol_ou[0] = vol_mu
     for i in range(1, n):
-        vol_ou[i] = vol_ou[i-1] + 0.1 * (vol_mu - vol_ou[i-1]) + 0.08 * np.random.normal()
+        vol_ou[i] = (
+            vol_ou[i-1]
+            + 0.1 * dt * (vol_mu - vol_ou[i-1])
+            + 0.08 * np.random.normal() * np.sqrt(dt)
+        )
 
     peak_boost = np.where((hours >= 17) & (hours <= 21), 0.15, 0.0)
     liquid_boost = np.where(is_liquid, 0.1, -0.1)
@@ -687,8 +947,16 @@ def _synthesize_intraday_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame
     return df
 
 
-def _add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
-    """I add derived features useful for training."""
+def _add_derived_features(df: pd.DataFrame, steps_per_hour: int = 1) -> pd.DataFrame:
+    """
+    I add derived features useful for training.
+
+    Args:
+        steps_per_hour: Number of time steps per hour (1 for hourly, 4 for 15-min).
+            All lag and rolling window sizes are scaled accordingly so that
+            e.g. "1h lag" = shift(4) at 15-min resolution.
+    """
+    sph = steps_per_hour
 
     # I extract hour and day of week if not present
     df['hour'] = df.index.hour
@@ -698,32 +966,38 @@ def _add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     df['is_solar_hour'] = ((df['hour'] >= 9) & (df['hour'] <= 15)).astype(int)
 
     # I add lagged features for backward-looking observations
+    # At 15-min: shift(4)=1h lag, shift(16)=4h lag
     for col in ['price', 'afrr_up', 'afrr_down', 'mfrr_price_up', 'mfrr_price_down']:
         if col in df.columns:
-            df[f'{col}_lag_1h'] = df[col].shift(1)
-            df[f'{col}_lag_4h'] = df[col].shift(4)
+            df[f'{col}_lag_1h'] = df[col].shift(1 * sph)
+            df[f'{col}_lag_4h'] = df[col].shift(4 * sph)
 
     # I add IntraDay lagged features (avoid lookahead)
     for col in ['intraday_bid', 'intraday_ask', 'intraday_spread', 'intraday_volume']:
         if col in df.columns:
-            df[f'{col}_lag_1h'] = df[col].shift(1)
+            df[f'{col}_lag_1h'] = df[col].shift(1 * sph)
 
     # I add rolling statistics (backward-looking only!)
-    df['price_mean_24h'] = df['price'].rolling(24, min_periods=1).mean()
-    df['price_std_24h'] = df['price'].rolling(24, min_periods=1).std().fillna(10)
-    df['price_min_24h'] = df['price'].rolling(24, min_periods=1).min()
-    df['price_max_24h'] = df['price'].rolling(24, min_periods=1).max()
+    # At 15-min: 24h window = 96 steps, at hourly: 24 steps
+    window_24h = 24 * sph
+    df['price_mean_24h'] = df['price'].rolling(window_24h, min_periods=1).mean()
+    df['price_std_24h'] = df['price'].rolling(window_24h, min_periods=1).std().fillna(10)
+    df['price_min_24h'] = df['price'].rolling(window_24h, min_periods=1).min()
+    df['price_max_24h'] = df['price'].rolling(window_24h, min_periods=1).max()
 
     # mFRR spread statistics
     if 'mfrr_spread' in df.columns:
-        df['mfrr_spread_mean_24h'] = df['mfrr_spread'].rolling(24, min_periods=1).mean()
+        df['mfrr_spread_mean_24h'] = df['mfrr_spread'].rolling(window_24h, min_periods=1).mean()
 
     # aFRR capacity price percentile (for bid optimization)
+    # Weekly window = 168h, minimum = 24h
     if 'afrr_cap_up_price' in df.columns:
-        df['afrr_cap_percentile'] = df['afrr_cap_up_price'].rolling(168, min_periods=24).rank(pct=True)  # Weekly window
+        df['afrr_cap_percentile'] = df['afrr_cap_up_price'].rolling(
+            168 * sph, min_periods=24 * sph
+        ).rank(pct=True)
 
     # I forward-fill then back-fill any remaining NaN values
-    df = df.fillna(method='ffill').fillna(method='bfill')
+    df = df.ffill().bfill()
 
     return df
 
@@ -785,37 +1059,52 @@ def main():
 
     I default to ADMIE-based creation (real market data) when the ADMIE CSV
     exists, falling back to synthetic generation otherwise.
+
+    Supports --resolution 1h (default) or 15min for native 15-min pipeline.
     """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='Create unified multi-market training dataset'
+    )
+    parser.add_argument(
+        '--resolution', type=str, default='1h',
+        choices=['1h', '15min'],
+        help='Time resolution: 1h (default) or 15min (native ADMIE)'
+    )
+    args = parser.parse_args()
+
     data_dir = Path(__file__).parent
-    admie_path = data_dir / "admie_market_data_combined.csv"
     dam_path = data_dir / "dam_prices_2021_2026.csv"
 
-    if admie_path.exists() and dam_path.exists():
-        print("ADMIE data found — using real market data")
-        unified_df = create_unified_dataset_from_admie()
+    if args.resolution == '15min':
+        # I use the native 15-min pipeline
+        print("Resolution: 15-min (native ADMIE)")
+        unified_df = create_unified_dataset_from_admie_15min()
     else:
-        print("ADMIE data not found — falling back to synthetic generation")
-        print("=" * 60)
-        print("CREATING UNIFIED MULTI-MARKET TRAINING DATASET (SYNTHETIC)")
-        print("=" * 60)
+        # I use the standard hourly pipeline
+        admie_path = data_dir / "admie_market_data_combined.csv"
+        if admie_path.exists() and dam_path.exists():
+            print("ADMIE data found - using real market data")
+            unified_df = create_unified_dataset_from_admie()
+        else:
+            print("ADMIE data not found - falling back to synthetic generation")
+            print("=" * 60)
+            print("CREATING UNIFIED MULTI-MARKET TRAINING DATASET (SYNTHETIC)")
+            print("=" * 60)
 
-        # I load both datasets
-        dam_df = load_dam_data()
-        afrr_df = load_afrr_mfrr_data()
+            dam_df = load_dam_data()
+            afrr_df = load_afrr_mfrr_data()
+            unified_df = create_unified_dataset(dam_df, afrr_df)
 
-        # I create the unified dataset
-        unified_df = create_unified_dataset(dam_df, afrr_df)
+            output_path = data_dir / "unified_multimarket_training.csv"
+            unified_df.to_csv(output_path)
+            print(f"\nSaved unified dataset to {output_path}")
+            print(f"Dataset shape: {unified_df.shape}")
 
-        # I save the unified dataset
-        output_path = data_dir / "unified_multimarket_training.csv"
-        unified_df.to_csv(output_path)
-        print(f"\nSaved unified dataset to {output_path}")
-        print(f"Dataset shape: {unified_df.shape}")
-
-        # I also save a sample for inspection
-        sample_path = data_dir / "unified_multimarket_sample.csv"
-        unified_df.head(100).to_csv(sample_path)
-        print(f"Saved sample (100 rows) to {sample_path}")
+            sample_path = data_dir / "unified_multimarket_sample.csv"
+            unified_df.head(100).to_csv(sample_path)
+            print(f"Saved sample (100 rows) to {sample_path}")
 
     return unified_df
 
