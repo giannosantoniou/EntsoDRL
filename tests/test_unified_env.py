@@ -67,7 +67,9 @@ def sample_data():
         'mfrr_spread': prices * 0.6,
         'net_imbalance_mw': np.random.normal(0, 300, n_hours),
         'solar': np.maximum(0, 500 * np.sin(2 * np.pi * (hours - 6) / 12)),
-        'wind_onshore': np.random.uniform(100, 500, n_hours)
+        'wind_onshore': np.random.uniform(100, 500, n_hours),
+        'res_total_mw': np.maximum(0, 500 * np.sin(2 * np.pi * (hours - 6) / 12)) + np.random.uniform(100, 500, n_hours),
+        'load_mw': np.random.uniform(3000, 6000, n_hours)
     }
 
     df = pd.DataFrame(data, index=dates)
@@ -810,6 +812,324 @@ class TestUnifiedStrategy:
         assert action[0] == 0  # Zero aFRR commitment
         assert action[2] == 5  # Idle IntraDay action
         assert action[3] == 5  # Idle mFRR action
+
+
+class TestMarketPhaseFeatures:
+    """I test the new market phase features that replaced gate closure."""
+
+    def test_ida3_correction_before_noon(self, unified_env):
+        """I verify obs[55] = 0.0 when hour < 12 (IDA3 not yet applicable)."""
+        unified_env.reset(seed=42)
+        step = unified_env.current_step
+
+        # I find a step with hour < 12
+        for i in range(step, min(step + 24, len(unified_env.df))):
+            ts = unified_env.df.index[i]
+            if ts.hour < 12:
+                unified_env.current_step = i
+                obs = unified_env._build_observation()
+                assert obs[55] == 0.0, \
+                    f"Expected ida3_applies=0.0 for hour {ts.hour}, got {obs[55]}"
+                return
+
+        pytest.skip("No hour < 12 found in test window")
+
+    def test_ida3_correction_after_noon(self, unified_env):
+        """I verify obs[55] = 1.0 when hour >= 12 (IDA3 prices available)."""
+        unified_env.reset(seed=42)
+        step = unified_env.current_step
+
+        # I find a step with hour >= 12
+        for i in range(step, min(step + 24, len(unified_env.df))):
+            ts = unified_env.df.index[i]
+            if ts.hour >= 12:
+                unified_env.current_step = i
+                obs = unified_env._build_observation()
+                assert obs[55] == 1.0, \
+                    f"Expected ida3_applies=1.0 for hour {ts.hour}, got {obs[55]}"
+                return
+
+        pytest.skip("No hour >= 12 found in test window")
+
+    def test_system_stress_feature(self, unified_env):
+        """I verify obs[56] scales with |imbalance| magnitude."""
+        unified_env.reset(seed=42)
+        step = unified_env.current_step
+
+        # I test zero imbalance → stress = 0.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = 0.0
+        obs = unified_env._build_observation()
+        assert obs[56] == pytest.approx(0.0, abs=0.01), \
+            f"Expected system_stress=0.0 for zero imbalance, got {obs[56]}"
+
+        # I test 150 MW imbalance → stress = 0.5
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = 150.0
+        obs = unified_env._build_observation()
+        assert obs[56] == pytest.approx(0.5, abs=0.01), \
+            f"Expected system_stress=0.5 for 150 MW, got {obs[56]}"
+
+        # I test 600 MW imbalance → stress = 1.0 (capped)
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = 600.0
+        obs = unified_env._build_observation()
+        assert obs[56] == pytest.approx(1.0, abs=0.01), \
+            f"Expected system_stress=1.0 for 600 MW, got {obs[56]}"
+
+        # I test negative imbalance → stress uses abs()
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = -300.0
+        obs = unified_env._build_observation()
+        assert obs[56] == pytest.approx(1.0, abs=0.01), \
+            f"Expected system_stress=1.0 for -300 MW, got {obs[56]}"
+
+    def test_res_penetration_feature(self, unified_env):
+        """I verify obs[57] reflects res_total/load ratio."""
+        unified_env.reset(seed=42)
+        step = unified_env.current_step
+
+        # I set known RES and load values
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('res_total_mw')] = 3000.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('load_mw')] = 6000.0
+        obs = unified_env._build_observation()
+        # res_penetration = clip(3000/6000, 0, 1.5) / 1.5 = 0.5 / 1.5 = 0.333
+        expected = (3000.0 / 6000.0) / 1.5
+        assert obs[57] == pytest.approx(expected, abs=0.01), \
+            f"Expected res_penetration={expected:.3f}, got {obs[57]}"
+
+        # I test high RES (above 100% of load) → capped at 1.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('res_total_mw')] = 10000.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('load_mw')] = 5000.0
+        obs = unified_env._build_observation()
+        # res_penetration = clip(10000/5000, 0, 1.5) / 1.5 = 1.5 / 1.5 = 1.0
+        assert obs[57] == pytest.approx(1.0, abs=0.01), \
+            f"Expected res_penetration=1.0 for high RES, got {obs[57]}"
+
+
+class TestAFRRMarginalPricing:
+    """I test that aFRR capacity profit uses marginal pricing."""
+
+    def test_capacity_profit_independent_of_price_tier(self, unified_env):
+        """I verify that per-selection aFRR capacity revenue does NOT vary with price_tier."""
+        # I collect per-step revenue when selected for two different price tiers.
+        # With marginal pricing, the revenue per MW should be identical
+        # regardless of the bid tier — only selection probability differs.
+        revenues_by_tier = {}
+
+        for price_tier_action in [0, 4]:  # Most aggressive vs most conservative
+            unified_env.reset(seed=42)
+            step = unified_env.current_step
+            row = unified_env.df.iloc[step]
+
+            # I clear DAM to get full capacity
+            unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+            # I directly test the revenue formula by forcing selection
+            unified_env.afrr_capacity_profit = 0.0
+            unified_env.is_selected_for_afrr = False
+
+            # I set a known aFRR capacity price
+            unified_env.df.iloc[step, unified_env.df.columns.get_loc('afrr_cap_up_price')] = 25.0
+
+            # I force selection by temporarily making selection probability 1.0
+            old_prob = unified_env.selection_probability
+            unified_env.selection_probability = 1.0
+
+            action = np.array([4, price_tier_action, 5, 5])  # Max aFRR, vary tier, idle
+            obs, reward, done, truncated, info = unified_env.step(action)
+
+            unified_env.selection_probability = old_prob
+
+            if info.get('is_selected', False):
+                revenues_by_tier[price_tier_action] = unified_env.afrr_capacity_profit
+
+        # I verify both tiers were selected and got identical revenue
+        assert len(revenues_by_tier) == 2, \
+            f"Expected both tiers to be selected, got {list(revenues_by_tier.keys())}"
+
+        assert revenues_by_tier[0] == pytest.approx(revenues_by_tier[4], abs=0.01), \
+            f"Capacity revenue should be identical with marginal pricing: " \
+            f"tier 0={revenues_by_tier[0]:.2f}, tier 4={revenues_by_tier[4]:.2f}"
+
+
+class Test15MinResolution:
+    """I test the 15-minute ISP resolution support."""
+
+    @pytest.fixture
+    def sample_data_15min(self):
+        """I create 15-min sample data (1 week = 672 slots)."""
+        n_slots = 672  # 7 days × 96 slots/day
+        dates = pd.date_range(
+            start='2024-01-01',
+            periods=n_slots,
+            freq='15T',
+            tz='Europe/Athens'
+        )
+
+        np.random.seed(42)
+
+        hours = np.array([d.hour for d in dates])
+        base_price = 80 + 40 * np.sin(2 * np.pi * hours / 24)
+        noise = np.random.normal(0, 10, n_slots)
+        prices = base_price + noise
+
+        # I create DAM commitments (same value for all 4 quarter-hours within an hour)
+        dam_commitments = np.zeros(n_slots)
+        for i in range(n_slots):
+            if hours[i] in [18, 19, 20]:
+                dam_commitments[i] = np.random.uniform(10, 25)
+            elif hours[i] in [10, 11, 12]:
+                dam_commitments[i] = np.random.uniform(-20, -5)
+
+        data = {
+            'price': prices,
+            'dam_commitment': dam_commitments,
+            'afrr_up': prices * 1.1,
+            'afrr_down': prices * 0.9,
+            'afrr_cap_up_price': 15 + 10 * np.random.random(n_slots),
+            'afrr_cap_down_price': 25 + 15 * np.random.random(n_slots),
+            'intraday_bid': prices - 2.0 + np.random.normal(0, 1, n_slots),
+            'intraday_ask': prices + 2.0 + np.random.normal(0, 1, n_slots),
+            'intraday_spread': 3.0 + np.random.uniform(0, 4, n_slots),
+            'intraday_volume': np.random.uniform(0.3, 0.9, n_slots),
+            'mfrr_price_up': prices * 1.3,
+            'mfrr_price_down': prices * 0.7,
+            'mfrr_spread': prices * 0.6,
+            'net_imbalance_mw': np.random.normal(0, 300, n_slots),
+            'solar': np.maximum(0, 500 * np.sin(2 * np.pi * (hours - 6) / 12)),
+            'wind_onshore': np.random.uniform(100, 500, n_slots),
+            'res_total_mw': np.maximum(0, 500 * np.sin(2 * np.pi * (hours - 6) / 12)) + np.random.uniform(100, 500, n_slots),
+            'load_mw': np.random.uniform(3000, 6000, n_slots)
+        }
+
+        df = pd.DataFrame(data, index=dates)
+        return df
+
+    @pytest.fixture
+    def env_15min(self, sample_data_15min):
+        """I create a 15-min resolution environment for testing."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+        env = BatteryEnvUnified(
+            df=sample_data_15min,
+            capacity_mwh=146.0,
+            max_power_mw=30.0,
+            efficiency=0.94,
+            time_step_hours=0.25,
+            episode_length=288,  # 3 days × 96 slots/day
+            random_start=False
+        )
+        return env
+
+    def test_obs_shape_15min(self, env_15min):
+        """I verify observation space is still 63 features at 15-min resolution."""
+        assert env_15min.observation_space.shape == (63,)
+        obs, info = env_15min.reset(seed=42)
+        assert obs.shape == (63,)
+        assert not np.any(np.isnan(obs))
+
+    def test_sph_value(self, env_15min):
+        """I verify _sph is 4 for 15-min resolution."""
+        assert env_15min._sph == 4
+
+    def test_dam_lookahead_hourly_sampling(self, env_15min):
+        """I verify DAM lookahead obs[19] matches price 1 HOUR ahead (not 15 min)."""
+        env_15min.reset(seed=42)
+        step = env_15min.current_step
+
+        obs = env_15min._build_observation()
+
+        # obs[19] is the first DAM lookahead (index 18 = current DAM, 19 = +1h)
+        # I verify it samples from step + 1*_sph (= step + 4), not step + 1
+        target_step = min(step + 4, len(env_15min.df) - 1)
+        target_ts = env_15min.df.index[target_step]
+        current_ts = env_15min.df.index[step]
+
+        if target_ts.date() == current_ts.date():
+            expected_dam = np.clip(
+                env_15min.df.iloc[target_step].get('dam_commitment', 0.0),
+                -env_15min.max_power_mw, env_15min.max_power_mw
+            )
+            assert obs[19] == pytest.approx(expected_dam / env_15min.max_power_mw, abs=0.001)
+
+    def test_time_encoding_discriminates_quarters(self, env_15min):
+        """I verify obs[14] differs between HH:00, HH:15, HH:30, HH:45."""
+        env_15min.reset(seed=42)
+        step = env_15min.current_step
+
+        # I find 4 consecutive steps within the same hour
+        ts = env_15min.df.index[step]
+        # I find a step at HH:00
+        while ts.minute != 0 and step < len(env_15min.df) - 5:
+            step += 1
+            ts = env_15min.df.index[step]
+
+        if ts.minute != 0:
+            pytest.skip("Could not find HH:00 step in range")
+
+        sin_values = []
+        for offset in range(4):
+            env_15min.current_step = step + offset
+            obs = env_15min._build_observation()
+            sin_values.append(obs[14])  # hour_sin
+
+        # I verify all 4 quarter-hour sin values are distinct
+        for i in range(len(sin_values)):
+            for j in range(i + 1, len(sin_values)):
+                assert sin_values[i] != pytest.approx(sin_values[j], abs=1e-4), \
+                    f"Time encoding must discriminate quarters: {sin_values}"
+
+    def test_4x_more_steps_per_day(self, env_15min):
+        """I verify 96 steps completes exactly 1 day at 15-min resolution."""
+        env_15min.reset(seed=42)
+        start_step = env_15min.current_step
+        start_ts = env_15min.df.index[start_step]
+
+        # I advance 96 steps (= 24 hours at 15-min)
+        target_step = start_step + 96
+        if target_step < len(env_15min.df):
+            target_ts = env_15min.df.index[target_step]
+            hours_elapsed = (target_ts - start_ts).total_seconds() / 3600
+            assert hours_elapsed == pytest.approx(24.0, abs=0.1), \
+                f"96 steps should be 24h, got {hours_elapsed:.1f}h"
+
+    def test_backward_compat_hourly(self, sample_data):
+        """I verify env with time_step_hours=1.0 still works identically."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        env_1h = BatteryEnvUnified(
+            df=sample_data,
+            capacity_mwh=146.0,
+            max_power_mw=30.0,
+            efficiency=0.94,
+            time_step_hours=1.0,
+            episode_length=72,
+            random_start=False
+        )
+
+        assert env_1h._sph == 1
+        assert env_1h.observation_space.shape == (63,)
+
+        obs, info = env_1h.reset(seed=42)
+        assert obs.shape == (63,)
+
+        # I verify a full episode runs without errors
+        for _ in range(50):
+            action = np.array([0, 2, 5, 5])
+            obs, reward, done, truncated, info = env_1h.step(action)
+            assert np.isfinite(reward)
+            if done or truncated:
+                break
+
+    def test_episode_runs_full(self, env_15min):
+        """I verify a full 15-min episode runs without errors."""
+        obs, info = env_15min.reset(seed=42)
+        steps = 0
+        for _ in range(300):
+            action = np.array([0, 2, 5, 5])  # Idle
+            obs, reward, done, truncated, info = env_15min.step(action)
+            steps += 1
+            assert np.isfinite(reward)
+            assert 0.05 <= info['soc'] <= 0.95
+            if done or truncated:
+                break
+        assert steps > 0
 
 
 if __name__ == "__main__":

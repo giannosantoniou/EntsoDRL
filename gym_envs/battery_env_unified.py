@@ -48,8 +48,10 @@ class BatteryEnvUnified(gym.Env):
     AFRR_LEVELS = np.array([0.0, 0.25, 0.50, 0.75, 1.0])  # 5 levels
 
     # I define aFRR price tier multipliers (bid aggressiveness)
-    # Lower = more aggressive (higher chance of selection, less revenue)
-    # Higher = more conservative (lower chance, more revenue if selected)
+    # Lower = more aggressive bid (higher chance of selection)
+    # Higher = more conservative bid (lower chance of selection)
+    # NOTE: Payment is MARGINAL (market clearing price), NOT bid price.
+    # Price tier only affects selection probability, not revenue per MW.
     AFRR_PRICE_TIERS = np.array([0.7, 0.85, 1.0, 1.15, 1.3])  # 5 tiers
 
     # I define separate IntraDay and mFRR action levels (~6 MW granularity per level)
@@ -106,6 +108,8 @@ class BatteryEnvUnified(gym.Env):
         self.min_soc = min_soc
         self.max_soc = max_soc
         self.time_step_hours = time_step_hours
+        # I compute steps-per-hour once at init for parameterized time resolution
+        self._sph = int(round(1.0 / self.time_step_hours))  # 4 for 15-min, 1 for 1-hour
         self.warmup_steps = warmup_steps
 
         # aFRR parameters
@@ -153,7 +157,8 @@ class BatteryEnvUnified(gym.Env):
         print(f"  Observation Space: {self.observation_space.shape[0]} features")
         print(f"  aFRR: selection={selection_probability:.0%}, activation={afrr_activation_rate:.0%}")
         print(f"  mFRR: imbalance_threshold={mfrr_imbalance_threshold:.0f} MW (direction-constrained)")
-        print(f"  Data: {len(self.df)} hours ({len(self.df)/24:.0f} days)")
+        days = len(self.df) * self.time_step_hours / 24
+        print(f"  Data: {len(self.df)} steps ({days:.0f} days, {self.time_step_hours*60:.0f}-min resolution)")
 
     def _prepare_data(self):
         """I prepare and validate the training data."""
@@ -209,25 +214,30 @@ class BatteryEnvUnified(gym.Env):
             if col in df.columns and f'{col}_lag_1h' not in df.columns:
                 df[f'{col}_lag_1h'] = df[col].shift(1)
 
+        # I scale rolling windows by steps-per-hour for resolution independence
+        w24 = 24 * self._sph      # 96 steps for 24h at 15-min, 24 at 1h
+        w168 = 168 * self._sph    # 672 steps for 1 week at 15-min, 168 at 1h
+        lag6 = 6 * self._sph      # 24 steps for 6h momentum at 15-min, 6 at 1h
+
         # I add rolling statistics (backward-looking only!)
         if 'price_mean_24h' not in df.columns:
-            df['price_mean_24h'] = df['price'].rolling(24, min_periods=1).mean()
+            df['price_mean_24h'] = df['price'].rolling(w24, min_periods=1).mean()
         if 'price_std_24h' not in df.columns:
-            df['price_std_24h'] = df['price'].rolling(24, min_periods=1).std().fillna(10)
+            df['price_std_24h'] = df['price'].rolling(w24, min_periods=1).std().fillna(10)
         if 'price_min_24h' not in df.columns:
-            df['price_min_24h'] = df['price'].rolling(24, min_periods=1).min()
+            df['price_min_24h'] = df['price'].rolling(w24, min_periods=1).min()
         if 'price_max_24h' not in df.columns:
-            df['price_max_24h'] = df['price'].rolling(24, min_periods=1).max()
+            df['price_max_24h'] = df['price'].rolling(w24, min_periods=1).max()
 
         # I compute price momentum (backward-looking)
         if 'price_momentum' not in df.columns:
-            price_6h_ago = df['price'].shift(6)
+            price_6h_ago = df['price'].shift(lag6)
             df['price_momentum'] = (df['price'] - price_6h_ago) / (price_6h_ago + 1)
             df['price_momentum'] = df['price_momentum'].fillna(0).clip(-1, 1)
 
         # I compute aFRR capacity price percentile
         if 'afrr_cap_percentile' not in df.columns:
-            df['afrr_cap_percentile'] = df['afrr_cap_up_price'].rolling(168, min_periods=24).rank(pct=True).fillna(0.5)
+            df['afrr_cap_percentile'] = df['afrr_cap_up_price'].rolling(w168, min_periods=w24).rank(pct=True).fillna(0.5)
 
         # I fill NaN values
         df = df.fillna(method='ffill').fillna(method='bfill')
@@ -260,7 +270,7 @@ class BatteryEnvUnified(gym.Env):
         self.afrr_commitment_mw = 0.0
         self.afrr_commitment_level = 0  # Index into AFRR_LEVELS
         self.is_selected_for_afrr = False
-        self.hours_since_afrr_activation = 24  # Start with no recent activation
+        self.steps_since_afrr_activation = 24 * self._sph  # Start with no recent activation
 
         # I track profits by market
         self.total_profit = 0.0
@@ -285,7 +295,7 @@ class BatteryEnvUnified(gym.Env):
 
         # I determine starting position
         if self.random_start:
-            max_start = self.max_steps - (self.episode_length or 168)  # Default 1 week
+            max_start = self.max_steps - (self.episode_length or 168 * self._sph)  # Default 1 week
             max_start = max(self.start_step + 1, max_start)
             self.current_step = self.np_random.integers(self.start_step, max_start)
         else:
@@ -452,7 +462,10 @@ class BatteryEnvUnified(gym.Env):
         # aFRR capacity revenue
         afrr_capacity_revenue = 0.0
         if self.is_selected_for_afrr:
-            cap_price = row.get('afrr_cap_up_price', 20.0) * price_tier
+            # I use marginal pricing: ALL selected providers receive the market
+            # clearing price, regardless of their individual bid. The price_tier
+            # only affects selection probability (line 444), NOT the payment.
+            cap_price = row.get('afrr_cap_up_price', 20.0)
             afrr_capacity_revenue = self.afrr_commitment_mw * cap_price * self.time_step_hours
             self.afrr_capacity_profit += afrr_capacity_revenue
 
@@ -526,7 +539,7 @@ class BatteryEnvUnified(gym.Env):
         )
 
         if afrr_activated:
-            self.hours_since_afrr_activation = 0
+            self.steps_since_afrr_activation = 0
 
             if afrr_direction == 'up':
                 afrr_energy_delivered = min(self.afrr_commitment_mw, max_discharge)
@@ -569,7 +582,7 @@ class BatteryEnvUnified(gym.Env):
 
             remaining_after_afrr = remaining_capacity - abs(afrr_energy_delivered)
         else:
-            self.hours_since_afrr_activation += 1
+            self.steps_since_afrr_activation += 1
             remaining_after_afrr = remaining_capacity
 
         # =====================================================================
@@ -820,7 +833,7 @@ class BatteryEnvUnified(gym.Env):
         total_sell_commitment = 0.0
         total_buy_commitment = 0.0
 
-        lookahead = min(4, self.max_steps - self.current_step)
+        lookahead = min(4 * self._sph, self.max_steps - self.current_step)
 
         for i in range(1, lookahead + 1):
             future_idx = self.current_step + i
@@ -868,7 +881,7 @@ class BatteryEnvUnified(gym.Env):
         min_soc_reserve = self.min_soc
         max_soc_reserve = self.max_soc
 
-        lookahead = min(4, self.max_steps - self.current_step)
+        lookahead = min(4 * self._sph, self.max_steps - self.current_step)
         if lookahead <= 0:
             return min_soc_reserve, max_soc_reserve
 
@@ -948,7 +961,7 @@ class BatteryEnvUnified(gym.Env):
         5. Price Lookahead (12): 12h price forecasts
         6. aFRR State (8): cap_prices, activation, commitment, selection, signal, hours_since
         7. Risk/Imbalance (4): dam_discharge_reserve, shortfall_risk, momentum, worthiness
-        8. Gate Closure (4): dam_open, intraday_hours, afrr_hours, mfrr_direction
+        8. Market Phase (4): ida3_correction, system_stress, res_penetration, mfrr_direction
         9. Timing Signals (4): price_vs_typical, is_peak, is_solar, hours_to_max
         """
         row = self.df.iloc[self.current_step]
@@ -1010,10 +1023,13 @@ class BatteryEnvUnified(gym.Env):
         # 3. TIME ENCODING (4 features)
         # =====================================================================
         hour = ts.hour
+        minute = ts.minute
+        # I use fractional hour for sub-hourly discrimination (14.0, 14.25, 14.5, 14.75)
+        fractional_hour = hour + minute / 60.0
         dow = ts.dayofweek
 
-        features.append(np.sin(2 * np.pi * hour / 24))
-        features.append(np.cos(2 * np.pi * hour / 24))
+        features.append(np.sin(2 * np.pi * fractional_hour / 24))
+        features.append(np.cos(2 * np.pi * fractional_hour / 24))
         features.append(np.sin(2 * np.pi * dow / 7))
         features.append(np.cos(2 * np.pi * dow / 7))
 
@@ -1023,9 +1039,10 @@ class BatteryEnvUnified(gym.Env):
         features.append(dam_commitment / self.max_power_mw)  # Current
 
         # I only show same-day commitments (HEnEx compliant)
+        # I sample every _sph steps so that 12 values cover 12 hours (DAM products are hourly)
         current_day = ts.date()
         for i in range(1, 13):
-            target = min(self.current_step + i, len(self.df) - 1)
+            target = min(self.current_step + i * self._sph, len(self.df) - 1)
             target_ts = self.df.index[target]
             if target_ts.date() == current_day:
                 future_dam = self.df.iloc[target].get('dam_commitment', 0.0)
@@ -1052,8 +1069,9 @@ class BatteryEnvUnified(gym.Env):
             # Before 14:00: only today's prices known
             last_known_day = current_day
 
+        # I sample every _sph steps so that 12 values cover 12 hours (DAM prices are hourly)
         for i in range(1, 13):
-            target = min(self.current_step + i, len(self.df) - 1)
+            target = min(self.current_step + i * self._sph, len(self.df) - 1)
             target_ts = self.df.index[target]
             target_day = target_ts.date()
 
@@ -1088,10 +1106,10 @@ class BatteryEnvUnified(gym.Env):
         features.append(cap_percentile)
 
         # Activation signal (binary indicator based on recent activations)
-        features.append(1.0 if self.hours_since_afrr_activation < 4 else 0.0)
+        features.append(1.0 if self.steps_since_afrr_activation < 4 * self._sph else 0.0)
 
-        # Hours since last activation (normalized)
-        features.append(min(self.hours_since_afrr_activation, 24) / 24.0)
+        # Steps since last activation (normalized to 24h equivalent)
+        features.append(min(self.steps_since_afrr_activation, 24 * self._sph) / (24 * self._sph))
 
         # Is currently selected
         features.append(1.0 if self.is_selected_for_afrr else 0.0)
@@ -1118,19 +1136,25 @@ class BatteryEnvUnified(gym.Env):
         features.append(worthiness)
 
         # =====================================================================
-        # 8. GATE CLOSURE (4 features)
+        # 8. MARKET PHASE & SYSTEM STATE (4 features)
         # =====================================================================
-        # DAM gate (always closed for current day, open for D+1 until 14:00)
-        dam_gate_open = 1.0 if hour < 14 else 0.0
-        features.append(dam_gate_open)
+        # [55] IDA3 correction signal — hours 12+ have fresher IntraDay prices
+        # (IDA3 auction at 10:00 covers hours 12-24; before that only IDA1+IDA2)
+        ida3_applies = 1.0 if hour >= 12 else 0.0
+        features.append(ida3_applies)
 
-        # IntraDay gate hours remaining (H-1 before delivery)
-        intraday_hours_remaining = max(0, 24 - hour) / 24.0
-        features.append(intraday_hours_remaining)
+        # [56] System stress magnitude — |imbalance| normalized (0=balanced, 1=severe)
+        # I use this to help predict aFRR activation and mFRR availability
+        imbalance_mag = row.get('net_imbalance_mw', 0.0)
+        system_stress = min(abs(imbalance_mag) / 300.0, 1.0)
+        features.append(system_stress)
 
-        # aFRR gate hours (H-0.25 before delivery)
-        afrr_hours_remaining = max(0, 23.75 - hour) / 24.0
-        features.append(afrr_hours_remaining)
+        # [57] RES penetration — renewable share of load
+        # High RES → more price volatility, more downward balancing likely
+        res_total = row.get('res_total_mw', 0.0)
+        load_total = row.get('load_mw', 1.0)
+        res_penetration = np.clip(res_total / max(load_total, 1.0), 0.0, 1.5) / 1.5
+        features.append(res_penetration)
 
         # mFRR direction signal (replaces useless gate_open that was always 1.0)
         # I encode TSO direction based on system imbalance:

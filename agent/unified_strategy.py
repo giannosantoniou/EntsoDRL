@@ -10,6 +10,9 @@ Key Features:
 2. Applies action masking for capacity cascading: DAM -> aFRR -> IntraDay -> mFRR
 3. Provides unified action interpretation
 4. Supports VecNormalize for observation normalization
+5. Resolution-independent: works with both 15-min and 1-hour timesteps.
+   Observation indices (63 features) stay the same regardless of resolution —
+   DAM/price lookahead samples at hourly intervals via _sph parameter.
 """
 
 import numpy as np
@@ -239,6 +242,10 @@ class UnifiedRuleBasedStrategy(IDecisionStrategy):
         [5] intraday_ask / 100
         [14-17] time encoding (sin/cos)
         [43] afrr_cap_price
+        [55] ida3_correction (1.0 if hour >= 12, IDA3 prices available)
+        [56] system_stress (|imbalance|/300, capped at 1.0)
+        [57] res_penetration (res_total/load, normalized 0-1)
+        [58] mfrr_direction (+1 UP, -1 DOWN, 0 closed)
         [60] is_peak
         [61] is_solar
         """

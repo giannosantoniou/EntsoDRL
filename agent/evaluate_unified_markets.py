@@ -68,7 +68,7 @@ def find_latest_model():
     return None, None
 
 
-def evaluate_market_participation(model_path: Path, vec_norm_path: Path = None, n_episodes: int = 20):
+def evaluate_market_participation(model_path: Path, vec_norm_path: Path = None, n_episodes: int = 20, time_step_hours: float = 0.25):
     """I evaluate market participation across all markets."""
 
     # I load the data
@@ -76,10 +76,14 @@ def evaluate_market_participation(model_path: Path, vec_norm_path: Path = None, 
     df = pd.read_csv(data_path, index_col=0, parse_dates=True)
     print(f"Loaded data: {len(df)} rows")
 
+    # I convert 2-week evaluation from hours to steps
+    episode_length_steps = int(336 / time_step_hours)
+
     # I create the environment
     env = BatteryEnvUnified(
         df=df,
-        episode_length=336,  # 2 weeks
+        time_step_hours=time_step_hours,
+        episode_length=episode_length_steps,
         random_start=True
     )
 
@@ -107,6 +111,7 @@ def evaluate_market_participation(model_path: Path, vec_norm_path: Path = None, 
     stats = {
         'total_profit': [],
         'dam_profit': [],
+        'intraday_profit': [],
         'afrr_capacity_profit': [],
         'afrr_energy_profit': [],
         'mfrr_profit': [],
@@ -116,13 +121,15 @@ def evaluate_market_participation(model_path: Path, vec_norm_path: Path = None, 
         'afrr_bids': [],  # Number of steps with aFRR > 0
         'afrr_selections': [],  # Number of times selected for aFRR
         'afrr_activations': [],  # Number of times aFRR activated
+        'intraday_trades': [],  # Number of IntraDay trades
         'mfrr_trades': [],  # Number of mFRR trades
         'energy_actions': [],  # Non-zero energy actions
 
         # I track action distribution
         'afrr_level_counts': [0, 0, 0, 0, 0],  # 5 levels
         'price_tier_counts': [0, 0, 0, 0, 0],  # 5 tiers
-        'energy_action_hist': np.zeros(21),  # 21 energy actions
+        'intraday_action_hist': np.zeros(11),  # 11 IntraDay actions
+        'mfrr_action_hist': np.zeros(11),  # 11 mFRR actions
     }
 
     for ep in range(n_episodes):
@@ -132,6 +139,7 @@ def evaluate_market_participation(model_path: Path, vec_norm_path: Path = None, 
         ep_afrr_bids = 0
         ep_afrr_selections = 0
         ep_afrr_activations = 0
+        ep_intraday_trades = 0
         ep_mfrr_trades = 0
         ep_energy_actions = 0
 
@@ -142,11 +150,12 @@ def evaluate_market_participation(model_path: Path, vec_norm_path: Path = None, 
             # I get action from model
             action, _ = model.predict(obs, deterministic=False, action_masks=action_masks)
 
-            # I track action distribution
-            afrr_level, price_tier, energy_action = action[0]
+            # I track action distribution (4-part action)
+            afrr_level, price_tier, intraday_action, mfrr_action = action[0]
             stats['afrr_level_counts'][afrr_level] += 1
             stats['price_tier_counts'][price_tier] += 1
-            stats['energy_action_hist'][energy_action] += 1
+            stats['intraday_action_hist'][intraday_action] += 1
+            stats['mfrr_action_hist'][mfrr_action] += 1
 
             # I step the environment
             obs, reward, done, info = vec_env.step(action)
@@ -159,6 +168,8 @@ def evaluate_market_participation(model_path: Path, vec_norm_path: Path = None, 
                 ep_afrr_selections += 1
             if info.get('afrr_activated', False):
                 ep_afrr_activations += 1
+            if abs(info.get('intraday_energy_mw', 0)) > 0.1:
+                ep_intraday_trades += 1
             if abs(info.get('mfrr_energy_mw', 0)) > 0.1:
                 ep_mfrr_trades += 1
             if abs(info.get('actual_energy_mw', 0)) > 0.1:
@@ -168,6 +179,7 @@ def evaluate_market_participation(model_path: Path, vec_norm_path: Path = None, 
         final_info = info
         stats['total_profit'].append(final_info.get('total_profit', 0))
         stats['dam_profit'].append(final_info.get('dam_profit', 0))
+        stats['intraday_profit'].append(final_info.get('intraday_profit', 0))
         stats['afrr_capacity_profit'].append(final_info.get('afrr_capacity_profit', 0))
         stats['afrr_energy_profit'].append(final_info.get('afrr_energy_profit', 0))
         stats['mfrr_profit'].append(final_info.get('mfrr_profit', 0))
@@ -176,6 +188,7 @@ def evaluate_market_participation(model_path: Path, vec_norm_path: Path = None, 
         stats['afrr_bids'].append(ep_afrr_bids)
         stats['afrr_selections'].append(ep_afrr_selections)
         stats['afrr_activations'].append(ep_afrr_activations)
+        stats['intraday_trades'].append(ep_intraday_trades)
         stats['mfrr_trades'].append(ep_mfrr_trades)
         stats['energy_actions'].append(ep_energy_actions)
 
@@ -184,6 +197,7 @@ def evaluate_market_participation(model_path: Path, vec_norm_path: Path = None, 
 
     vec_env.close()
 
+    stats['episode_length_steps'] = episode_length_steps
     return stats
 
 
@@ -195,13 +209,14 @@ def print_statistics(stats: dict):
     print("=" * 70)
 
     n_eps = len(stats['total_profit'])
-    ep_length = 336  # Approximate
+    ep_length = stats.get('episode_length_steps', 336)  # Steps per episode
 
     # I calculate averages
     print("\n[PROFIT] REVENUE BY MARKET (per episode)")
     print("-" * 50)
     print(f"  Total Profit:        {np.mean(stats['total_profit']):>12,.0f} EUR")
     print(f"  DAM Profit:          {np.mean(stats['dam_profit']):>12,.0f} EUR")
+    print(f"  IntraDay Profit:     {np.mean(stats['intraday_profit']):>12,.0f} EUR")
     print(f"  aFRR Capacity:       {np.mean(stats['afrr_capacity_profit']):>12,.0f} EUR")
     print(f"  aFRR Energy:         {np.mean(stats['afrr_energy_profit']):>12,.0f} EUR")
     print(f"  mFRR Trading:        {np.mean(stats['mfrr_profit']):>12,.0f} EUR")
@@ -213,12 +228,14 @@ def print_statistics(stats: dict):
     avg_afrr_bids = np.mean(stats['afrr_bids'])
     avg_afrr_selections = np.mean(stats['afrr_selections'])
     avg_afrr_activations = np.mean(stats['afrr_activations'])
+    avg_intraday_trades = np.mean(stats['intraday_trades'])
     avg_mfrr_trades = np.mean(stats['mfrr_trades'])
     avg_energy_actions = np.mean(stats['energy_actions'])
 
     print(f"  aFRR Bids:           {avg_afrr_bids:>8.1f} / {ep_length} steps ({100*avg_afrr_bids/ep_length:.1f}%)")
     print(f"  aFRR Selections:     {avg_afrr_selections:>8.1f} / {ep_length} steps ({100*avg_afrr_selections/ep_length:.1f}%)")
     print(f"  aFRR Activations:    {avg_afrr_activations:>8.1f} / {ep_length} steps ({100*avg_afrr_activations/ep_length:.1f}%)")
+    print(f"  IntraDay Trades:     {avg_intraday_trades:>8.1f} / {ep_length} steps ({100*avg_intraday_trades/ep_length:.1f}%)")
     print(f"  mFRR Trades:         {avg_mfrr_trades:>8.1f} / {ep_length} steps ({100*avg_mfrr_trades/ep_length:.1f}%)")
     print(f"  Energy Actions:      {avg_energy_actions:>8.1f} / {ep_length} steps ({100*avg_energy_actions/ep_length:.1f}%)")
 
@@ -251,16 +268,25 @@ def print_statistics(stats: dict):
         bar = '#' * int(pct / 2)
         print(f"    {name:>18}: {count:>6} ({pct:>5.1f}%) {bar}")
 
-    # I show energy action distribution summary
-    energy_hist = stats['energy_action_hist']
-    print("\n  Energy Actions (-30 to +30 MW):")
-    charge_actions = sum(energy_hist[:10])  # -30 to -3 MW (charging)
-    idle_action = energy_hist[10]  # 0 MW
-    discharge_actions = sum(energy_hist[11:])  # +3 to +30 MW (discharging)
+    # I show IntraDay action distribution summary
+    id_hist = stats['intraday_action_hist']
+    print("\n  IntraDay Actions (11 levels, -1.0 to +1.0):")
+    id_charge = sum(id_hist[:5])
+    id_idle = id_hist[5]
+    id_discharge = sum(id_hist[6:])
+    print(f"    Charging (buy):    {id_charge:>6} ({100*id_charge/total_actions:.1f}%)")
+    print(f"    Idle:              {id_idle:>6} ({100*id_idle/total_actions:.1f}%)")
+    print(f"    Discharging (sell):{id_discharge:>6} ({100*id_discharge/total_actions:.1f}%)")
 
-    print(f"    Charging (-30 to -3 MW):   {charge_actions:>6} ({100*charge_actions/total_actions:.1f}%)")
-    print(f"    Idle (0 MW):               {idle_action:>6} ({100*idle_action/total_actions:.1f}%)")
-    print(f"    Discharging (+3 to +30 MW):{discharge_actions:>6} ({100*discharge_actions/total_actions:.1f}%)")
+    # I show mFRR action distribution summary
+    mfrr_hist = stats['mfrr_action_hist']
+    print("\n  mFRR Actions (11 levels, -1.0 to +1.0):")
+    mfrr_charge = sum(mfrr_hist[:5])
+    mfrr_idle = mfrr_hist[5]
+    mfrr_discharge = sum(mfrr_hist[6:])
+    print(f"    Charging (buy):    {mfrr_charge:>6} ({100*mfrr_charge/total_actions:.1f}%)")
+    print(f"    Idle:              {mfrr_idle:>6} ({100*mfrr_idle/total_actions:.1f}%)")
+    print(f"    Discharging (sell):{mfrr_discharge:>6} ({100*mfrr_discharge/total_actions:.1f}%)")
 
     # I calculate revenue breakdown
     print("\n[REVENUE] REVENUE BREAKDOWN (% of total)")
@@ -268,11 +294,13 @@ def print_statistics(stats: dict):
     total_rev = np.mean(stats['total_profit'])
     if total_rev != 0:
         dam_pct = 100 * np.mean(stats['dam_profit']) / abs(total_rev)
+        intraday_pct = 100 * np.mean(stats['intraday_profit']) / abs(total_rev)
         afrr_cap_pct = 100 * np.mean(stats['afrr_capacity_profit']) / abs(total_rev)
         afrr_energy_pct = 100 * np.mean(stats['afrr_energy_profit']) / abs(total_rev)
         mfrr_pct = 100 * np.mean(stats['mfrr_profit']) / abs(total_rev)
 
         print(f"  DAM:           {dam_pct:>8.1f}%")
+        print(f"  IntraDay:      {intraday_pct:>8.1f}%")
         print(f"  aFRR Capacity: {afrr_cap_pct:>8.1f}%")
         print(f"  aFRR Energy:   {afrr_energy_pct:>8.1f}%")
         print(f"  mFRR:          {mfrr_pct:>8.1f}%")
@@ -283,14 +311,16 @@ def print_statistics(stats: dict):
     print("=" * 70)
 
     markets_used = []
+    if np.mean(stats['dam_profit']) != 0:
+        markets_used.append("DAM")
+    if np.mean(stats['intraday_profit']) != 0:
+        markets_used.append("IntraDay")
     if np.mean(stats['afrr_capacity_profit']) != 0:
         markets_used.append("aFRR Capacity")
     if np.mean(stats['afrr_energy_profit']) != 0:
         markets_used.append("aFRR Energy")
     if np.mean(stats['mfrr_profit']) != 0:
         markets_used.append("mFRR")
-    if np.mean(stats['dam_profit']) != 0:
-        markets_used.append("DAM")
 
     if markets_used:
         print(f"[OK] Model participates in: {', '.join(markets_used)}")

@@ -14,23 +14,29 @@ def upsample_hourly_to_15min(
     df: pd.DataFrame,
     method: Literal['step', 'linear'] = 'step',
     energy_columns: list = None,
+    power_columns: list = None,
     divide_energy_by_4: bool = True
 ) -> pd.DataFrame:
     """
     Convert hourly DataFrame to 15-minute resolution.
-    
+
     Args:
         df: Input DataFrame with DatetimeIndex at hourly frequency
         method: 'step' for forward fill (DAM prices), 'linear' for interpolation
-        energy_columns: Columns representing energy (e.g., 'dam_commitment') 
-                       that should be divided by 4 (or repeated as-is)
+        energy_columns: Columns in MWh to divide by 4 when divide_energy_by_4=True.
+                       Default: [] (empty — most columns are prices or MW, not MWh)
+        power_columns: Columns in MW to forward-fill as-is (NOT divided).
+                      Default: ['dam_commitment'] — dam_commitment is power (MW),
+                      the battery must deliver 30 MW in EACH quarter-hour.
         divide_energy_by_4: If True, divide energy columns by 4; if False, repeat
-    
+
     Returns:
         DataFrame with 15-minute resolution (4× more rows)
     """
     if energy_columns is None:
-        energy_columns = ['dam_commitment']
+        energy_columns = []
+    if power_columns is None:
+        power_columns = ['dam_commitment']
     
     # Validate input
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -70,6 +76,7 @@ def upsample_hourly_to_15min(
     print(f"Upsampling complete: {original_len} hours → {actual_len} 15-min slots")
     print(f"  Method: {method}")
     print(f"  Energy columns ({'divided by 4' if divide_energy_by_4 else 'repeated'}): {energy_columns}")
+    print(f"  Power columns (forward-filled as-is): {power_columns}")
     
     return df_15min
 

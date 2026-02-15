@@ -217,7 +217,8 @@ def create_training_env(
     data_path: str,
     battery_params: Optional[Dict] = None,
     reward_config: Optional[Dict] = None,
-    episode_length: int = 168  # 1 week
+    episode_length_hours: int = 168,  # 1 week in hours
+    time_step_hours: float = 0.25    # 15-min default
 ) -> gym.Env:
     """I create and wrap the training environment."""
     # I load data
@@ -241,13 +242,17 @@ def create_training_env(
             'reward_scale': 0.001
         }
 
+    # I convert episode length from hours to steps
+    episode_length_steps = int(episode_length_hours / time_step_hours)
+
     # I create environment (it already implements action_masks())
     env = BatteryEnvUnified(
         df=df,
         capacity_mwh=battery_params['capacity_mwh'],
         max_power_mw=battery_params['max_power_mw'],
         efficiency=battery_params['efficiency'],
-        episode_length=episode_length,
+        time_step_hours=time_step_hours,
+        episode_length=episode_length_steps,
         random_start=True,
         reward_config=reward_config
     )
@@ -260,7 +265,8 @@ def create_training_env(
 
 def create_eval_env(
     data_path: str,
-    battery_params: Optional[Dict] = None
+    battery_params: Optional[Dict] = None,
+    time_step_hours: float = 0.25
 ) -> gym.Env:
     """I create the evaluation environment (deterministic)."""
     df = pd.read_csv(data_path, index_col=0, parse_dates=True)
@@ -272,12 +278,16 @@ def create_eval_env(
             'efficiency': 0.94
         }
 
+    # I convert 2-week evaluation from hours to steps
+    episode_length_steps = int(336 / time_step_hours)
+
     env = BatteryEnvUnified(
         df=df,
         capacity_mwh=battery_params['capacity_mwh'],
         max_power_mw=battery_params['max_power_mw'],
         efficiency=battery_params['efficiency'],
-        episode_length=336,  # 2 weeks for evaluation
+        time_step_hours=time_step_hours,
+        episode_length=episode_length_steps,
         random_start=False
     )
 
@@ -301,7 +311,8 @@ def train_unified_model(
     ent_coef: float = 0.03,
     seed: int = 42,
     device: str = "auto",
-    resume_from: str = None
+    resume_from: str = None,
+    time_step_hours: float = 0.25  # 15-min resolution default
 ) -> str:
     """
     I train the unified multi-market model.
@@ -337,6 +348,7 @@ def train_unified_model(
     print(f"Output directory: {model_dir}")
     print(f"Training timesteps: {total_timesteps:,}")
     print(f"Parallel environments: {n_envs}")
+    print(f"Time step: {time_step_hours*60:.0f}-min resolution ({1/time_step_hours:.0f} steps/hour)")
 
     # I resolve data path
     if not Path(data_path).exists():
@@ -356,12 +368,17 @@ def train_unified_model(
     # I create multiple parallel training environments for speedup
     print(f"\nCreating {n_envs} parallel training environments...")
 
+    # I convert episode lengths from hours to steps
+    train_episode_steps = int(168 / time_step_hours)  # 1 week
+    eval_episode_steps = int(336 / time_step_hours)   # 2 weeks
+
     def make_train_env(env_id: int):
         """I create a training environment with unique random seed."""
         def _init():
             env = BatteryEnvUnified(
                 df=df_train,
-                episode_length=168,  # 1 week episodes
+                time_step_hours=time_step_hours,
+                episode_length=train_episode_steps,
                 random_start=True
             )
             # I set unique seed for each environment
@@ -387,7 +404,8 @@ def train_unified_model(
     def make_eval_env():
         return BatteryEnvUnified(
             df=df_eval,
-            episode_length=336,  # 2 weeks for eval
+            time_step_hours=time_step_hours,
+            episode_length=eval_episode_steps,
             random_start=True
         )
 
@@ -547,6 +565,7 @@ def train_unified_model(
         'ent_coef': ent_coef,
         'seed': seed,
         'data_path': str(data_path),
+        'time_step_hours': time_step_hours,
         'timestamp': timestamp
     }
 
@@ -680,6 +699,8 @@ if __name__ == "__main__":
                         help="Training device (auto/cpu/cuda)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to model directory to resume training from")
+    parser.add_argument("--time_step", type=float, default=0.25,
+                        help="Time step in hours (0.25 = 15-min, 1.0 = hourly)")
     parser.add_argument("--eval", type=str, default=None,
                         help="Path to model for evaluation (skip training)")
 
@@ -699,7 +720,8 @@ if __name__ == "__main__":
             ent_coef=args.ent_coef,
             seed=args.seed,
             device=args.device,
-            resume_from=args.resume
+            resume_from=args.resume,
+            time_step_hours=args.time_step
         )
 
         # I run evaluation on trained model
