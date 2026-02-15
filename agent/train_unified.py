@@ -169,6 +169,18 @@ class TensorboardLoggingCallback(BaseCallback):
             if len(self.mfrr_profits) > 0:
                 self.logger.record('markets/mfrr_profit', np.mean(self.mfrr_profits[-100:]))
 
+            # I log full market mode metrics if available
+            infos = self.locals.get('infos', [])
+            if len(infos) > 0 and 'ida_profit' in infos[0]:
+                self.logger.record('markets/ida_profit',
+                                   np.mean([i.get('ida_profit', 0) for i in infos]))
+                self.logger.record('markets/xbid_profit',
+                                   np.mean([i.get('xbid_profit', 0) for i in infos]))
+                self.logger.record('markets/free_bid_profit',
+                                   np.mean([i.get('free_bid_profit', 0) for i in infos]))
+                self.logger.record('markets/free_bid_activation_rate',
+                                   np.mean([i.get('free_bid_activation_rate', 0) for i in infos]))
+
             # I log participation rates
             if self.step_count > 0:
                 self.logger.record('participation/afrr_bid_rate', self.step_afrr_bids / self.step_count)
@@ -312,7 +324,8 @@ def train_unified_model(
     seed: int = 42,
     device: str = "auto",
     resume_from: str = None,
-    time_step_hours: float = 0.25  # 15-min resolution default
+    time_step_hours: float = 0.25,  # 15-min resolution default
+    enable_full_market: bool = False
 ) -> str:
     """
     I train the unified multi-market model.
@@ -349,6 +362,8 @@ def train_unified_model(
     print(f"Training timesteps: {total_timesteps:,}")
     print(f"Parallel environments: {n_envs}")
     print(f"Time step: {time_step_hours*60:.0f}-min resolution ({1/time_step_hours:.0f} steps/hour)")
+    if enable_full_market:
+        print(f"Full Market Mode: IDA1/2/3/XBID + Free Bids (75 obs, 5 action dims)")
 
     # I resolve data path
     if not Path(data_path).exists():
@@ -379,7 +394,8 @@ def train_unified_model(
                 df=df_train,
                 time_step_hours=time_step_hours,
                 episode_length=train_episode_steps,
-                random_start=True
+                random_start=True,
+                enable_full_market=enable_full_market
             )
             # I set unique seed for each environment
             env.reset(seed=seed + env_id if seed else env_id)
@@ -406,7 +422,8 @@ def train_unified_model(
             df=df_eval,
             time_step_hours=time_step_hours,
             episode_length=eval_episode_steps,
-            random_start=True
+            random_start=True,
+            enable_full_market=enable_full_market
         )
 
     eval_env = MaskableVecEnv([make_eval_env])
@@ -566,6 +583,7 @@ def train_unified_model(
         'seed': seed,
         'data_path': str(data_path),
         'time_step_hours': time_step_hours,
+        'enable_full_market': enable_full_market,
         'timestamp': timestamp
     }
 
@@ -703,6 +721,8 @@ if __name__ == "__main__":
                         help="Time step in hours (0.25 = 15-min, 1.0 = hourly)")
     parser.add_argument("--eval", type=str, default=None,
                         help="Path to model for evaluation (skip training)")
+    parser.add_argument("--full-market", action='store_true',
+                        help="Enable IDA1/2/3/XBID + Free Bids (75 obs, 5 action dims)")
 
     args = parser.parse_args()
 
@@ -721,7 +741,8 @@ if __name__ == "__main__":
             seed=args.seed,
             device=args.device,
             resume_from=args.resume,
-            time_step_hours=args.time_step
+            time_step_hours=args.time_step,
+            enable_full_market=args.full_market
         )
 
         # I run evaluation on trained model

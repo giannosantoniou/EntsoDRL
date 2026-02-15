@@ -43,6 +43,20 @@ class UnifiedMarketState:
     mfrr_price_up: float  # EUR/MWh for upward energy
     mfrr_price_down: float  # EUR/MWh for downward energy
 
+    # IDA sub-market prices (full market mode)
+    ida1_clearing_price: float = 0.0
+    ida2_clearing_price: float = 0.0
+    ida3_clearing_price: float = 0.0
+    net_ida_position: float = 0.0      # MW locked position
+
+    # XBID prices (replaces intraday for full market mode)
+    xbid_bid: float = 0.0
+    xbid_ask: float = 0.0
+
+    # Free Bid (agent-set price, pay-as-bid)
+    free_bid_activated: bool = False
+    free_bid_agent_price: float = 0.0  # The price the AGENT set
+
 
 class UnifiedRewardCalculator:
     """
@@ -72,7 +86,7 @@ class UnifiedRewardCalculator:
         optimal_timing_bonus: float = 2.0,  # EUR/MWh for good trade timing
 
         # Risk penalties
-        shortfall_risk_penalty: float = 50.0,  # Proactive penalty for risky SoC
+        shortfall_risk_penalty: float = 200.0,  # Proactive penalty for risky SoC (raised from 50)
         soc_buffer_bonus: float = 2.0,  # Bonus for maintaining healthy SoC
 
         # Scaling
@@ -96,18 +110,26 @@ class UnifiedRewardCalculator:
         actual_energy_mw: float,  # Actual energy traded (positive = discharge)
         afrr_capacity_committed_mw: float,  # aFRR capacity commitment
         afrr_energy_delivered_mw: float,  # aFRR energy when activated
-        mfrr_energy_mw: float,  # mFRR energy traded
 
         # Battery state
         current_soc: float,
         capacity_mwh: float,
+
+        # Optional actions (default 0 for backward compatibility)
+        intraday_energy_mw: float = 0.0,  # IntraDay energy traded (positive = sell)
+        mfrr_energy_mw: float = 0.0,  # mFRR energy traded
         time_step_hours: float = 1.0,
 
         # Context
         is_physical_violation: bool = False,
         shortfall_risk: float = 0.0,
         price_momentum: float = 0.0,  # Backward-looking price trend
-        is_selected_for_afrr: bool = True
+        is_selected_for_afrr: bool = True,
+
+        # Full market mode (IDA/XBID/FreeBid)
+        ida_energy_mw: float = 0.0,
+        xbid_energy_mw: float = 0.0,
+        free_bid_energy_mw: float = 0.0,
     ) -> Dict:
         """
         I calculate the total reward for a unified multi-market step.
@@ -206,7 +228,18 @@ class UnifiedRewardCalculator:
         components['afrr_nonresponse_cost'] = afrr_nonresponse_cost
 
         # =====================================================================
-        # 4. mFRR ENERGY REVENUE
+        # 4. INTRADAY ENERGY REVENUE
+        # =====================================================================
+        intraday_revenue = 0.0
+        if abs(intraday_energy_mw) > 0.1:
+            if intraday_energy_mw > 0:  # Sell at bid
+                intraday_revenue = intraday_energy_mw * market.intraday_bid * time_step_hours
+            else:  # Buy at ask
+                intraday_revenue = intraday_energy_mw * market.intraday_ask * time_step_hours
+        components['intraday_revenue'] = intraday_revenue
+
+        # =====================================================================
+        # 5. mFRR ENERGY REVENUE
         # =====================================================================
         mfrr_revenue = 0.0
         if abs(mfrr_energy_mw) > 0.1:
@@ -220,7 +253,40 @@ class UnifiedRewardCalculator:
         components['mfrr_revenue'] = mfrr_revenue
 
         # =====================================================================
-        # 5. DEGRADATION COST
+        # 5b. IDA SETTLEMENT (pay-as-cleared, locked positions)
+        # =====================================================================
+        ida_revenue = 0.0
+        if abs(ida_energy_mw) > 0.1:
+            # I use weighted average of IDA clearing prices
+            ida_revenue = ida_energy_mw * self._weighted_ida_price(market) * time_step_hours
+        components['ida_revenue'] = ida_revenue
+
+        # =====================================================================
+        # 5c. XBID SETTLEMENT (pay-as-bid, continuous)
+        # =====================================================================
+        xbid_revenue = 0.0
+        if abs(xbid_energy_mw) > 0.1:
+            if xbid_energy_mw > 0:
+                # I sell at XBID bid price
+                xbid_revenue = xbid_energy_mw * market.xbid_bid * time_step_hours
+            else:
+                # I buy at XBID ask price
+                xbid_revenue = xbid_energy_mw * market.xbid_ask * time_step_hours
+        components['xbid_revenue'] = xbid_revenue
+
+        # =====================================================================
+        # 5d. FREE BID SETTLEMENT (pay-as-bid, agent's price)
+        # =====================================================================
+        free_bid_revenue = 0.0
+        if market.free_bid_activated and abs(free_bid_energy_mw) > 0.1:
+            # I use the agent's bid price (pay-as-bid settlement)
+            free_bid_revenue = abs(free_bid_energy_mw) * market.free_bid_agent_price * time_step_hours
+            if free_bid_energy_mw < 0:
+                free_bid_revenue = -free_bid_revenue
+        components['free_bid_revenue'] = free_bid_revenue
+
+        # =====================================================================
+        # 6. DEGRADATION COST
         # =====================================================================
         # I calculate degradation based on total energy cycled
         total_energy_cycled = abs(actual_energy_mw) * time_step_hours
@@ -231,23 +297,23 @@ class UnifiedRewardCalculator:
         components['cycle_fraction'] = cycle_fraction
 
         # =====================================================================
-        # 6. PHYSICAL VIOLATION PENALTY
+        # 7. PHYSICAL VIOLATION PENALTY
         # =====================================================================
         physical_penalty = self.physical_violation_penalty if is_physical_violation else 0.0
         components['physical_penalty'] = physical_penalty
 
         # =====================================================================
-        # 7. SHORTFALL RISK PENALTY (proactive)
+        # 8. SHORTFALL RISK PENALTY (proactive)
         # =====================================================================
         # I penalize risky SoC states before they become violations
         risk_penalty = 0.0
-        if shortfall_risk > 0.2:
-            risk_factor = (shortfall_risk - 0.2) / 0.8  # Normalize to [0, 1]
+        if shortfall_risk > 0.1:
+            risk_factor = (shortfall_risk - 0.1) / 0.9  # Normalize to [0, 1] (threshold lowered from 0.2)
             risk_penalty = self.shortfall_risk_penalty * (risk_factor ** 1.5)  # Quadratic scaling
         components['risk_penalty'] = risk_penalty
 
         # =====================================================================
-        # 8. SoC BUFFER BONUS
+        # 9. SoC BUFFER BONUS
         # =====================================================================
         # I reward maintaining healthy SoC levels (flexible for commitments)
         soc_bonus = 0.0
@@ -263,7 +329,7 @@ class UnifiedRewardCalculator:
         components['soc_bonus'] = soc_bonus
 
         # =====================================================================
-        # 9. PRICE TIMING BONUS
+        # 10. PRICE TIMING BONUS
         # =====================================================================
         # I reward trading with momentum (backward-looking)
         timing_bonus = 0.0
@@ -280,12 +346,14 @@ class UnifiedRewardCalculator:
         components['timing_bonus'] = timing_bonus
 
         # =====================================================================
-        # 10. TOTAL REWARD
+        # 11. TOTAL REWARD
         # =====================================================================
         total_revenue = (
             dam_revenue + dam_balancing + dam_bonus +
             afrr_capacity_revenue + afrr_energy_revenue +
-            mfrr_revenue +
+            intraday_revenue +
+            ida_revenue + xbid_revenue +
+            free_bid_revenue + mfrr_revenue +
             soc_bonus + timing_bonus
         )
 
@@ -314,14 +382,28 @@ class UnifiedRewardCalculator:
             'components': components
         }
 
+    def _weighted_ida_price(self, market: UnifiedMarketState) -> float:
+        """I compute a weighted average of IDA clearing prices for settlement."""
+        prices = []
+        if market.ida1_clearing_price > 0:
+            prices.append(market.ida1_clearing_price)
+        if market.ida2_clearing_price > 0:
+            prices.append(market.ida2_clearing_price)
+        if market.ida3_clearing_price > 0 and not np.isnan(market.ida3_clearing_price):
+            prices.append(market.ida3_clearing_price)
+        if len(prices) == 0:
+            return market.dam_price  # I fall back to DAM price
+        return np.mean(prices)
+
     def calculate_simple(
         self,
         dam_profit: float,
         afrr_capacity_profit: float,
         afrr_energy_profit: float,
-        mfrr_profit: float,
-        degradation_cost: float,
-        penalties: float
+        intraday_profit: float = 0.0,
+        mfrr_profit: float = 0.0,
+        degradation_cost: float = 0.0,
+        penalties: float = 0.0
     ) -> float:
         """
         I provide a simplified reward calculation for quick evaluation.
@@ -333,6 +415,7 @@ class UnifiedRewardCalculator:
             dam_profit +
             afrr_capacity_profit +
             afrr_energy_profit +
+            intraday_profit +
             mfrr_profit -
             degradation_cost -
             penalties

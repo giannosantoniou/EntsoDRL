@@ -205,6 +205,11 @@ def create_unified_dataset_from_admie(
     all_mask = pd.Series(True, index=unified.index)
     unified = _synthesize_intraday_data(unified, all_mask)
 
+    # Step 9b: I synthesize IDA sub-market data and Free Bids
+    unified = _synthesize_ida_prices(unified, all_mask, time_step_hours=1.0)
+    unified = _generate_ida_positions(unified, max_power_mw=30.0)
+    unified = _synthesize_free_bid_data(unified, all_mask)
+
     # Step 10: I add all derived features (lags, rolling stats, time features)
     unified = _add_derived_features(unified)
 
@@ -398,6 +403,13 @@ def create_unified_dataset_from_admie_15min(
     # OU processes use sqrt(0.25) scaling -> finer intra-hour variation
     all_mask = pd.Series(True, index=unified.index)
     unified = _synthesize_intraday_data(unified, all_mask, time_step_hours=0.25)
+
+    # Step 9b: I synthesize IDA sub-market data and Free Bids (--full-market)
+    # These columns are always generated so the data file is complete;
+    # the environment flag controls whether they are used.
+    unified = _synthesize_ida_prices(unified, all_mask, time_step_hours=0.25)
+    unified = _generate_ida_positions(unified, max_power_mw=30.0)
+    unified = _synthesize_free_bid_data(unified, all_mask)
 
     # Step 10: I add all derived features with 15-min-aware window sizes
     unified = _add_derived_features(unified, steps_per_hour=steps_per_hour)
@@ -840,6 +852,101 @@ def _generate_dam_commitments(df: pd.DataFrame) -> np.ndarray:
     return commitments
 
 
+def _generate_ou_process(n, theta, sigma, dt, price_scale=None):
+    """I generate an Ornstein-Uhlenbeck process for synthetic market data."""
+    process = np.zeros(n)
+    process[0] = np.random.normal(0, sigma)
+    for i in range(1, n):
+        scale = sigma * (price_scale[i] if price_scale is not None else 1.0)
+        process[i] = (
+            process[i - 1]
+            + theta * dt * (0 - process[i - 1])
+            + scale * np.random.normal() * np.sqrt(dt)
+        )
+    return process
+
+
+def _compute_hours_to_delivery(index):
+    """I compute approximate hours to delivery for each ISP."""
+    # I use a simple model: within-day delivery, time to end-of-hour
+    hours = index.hour.values
+    minutes = index.minute.values
+    # I approximate time-to-delivery as hours remaining in the day
+    return np.clip(24.0 - (hours + minutes / 60.0), 0.5, 24.0)
+
+
+def _synthesize_ida_prices(df, mask, time_step_hours=0.25):
+    """I synthesize IDA1/2/3 clearing prices and XBID bid/ask."""
+    dam_prices = df.loc[mask, 'price'].values
+    n = len(dam_prices)
+    hours = df.loc[mask].index.hour.values
+
+    # IDA1 (D-1 15:00): largest forecast error, sigma=12 EUR
+    # IDA2 (D-1 22:00): better info, sigma=8 EUR
+    # IDA3 (D   10:00): close to delivery, sigma=4 EUR
+    ida1_noise = _generate_ou_process(n, theta=0.03, sigma=12.0, dt=time_step_hours)
+    ida2_noise = _generate_ou_process(n, theta=0.05, sigma=8.0, dt=time_step_hours)
+    ida3_noise = _generate_ou_process(n, theta=0.08, sigma=4.0, dt=time_step_hours)
+
+    df.loc[mask, 'ida1_clearing_price'] = np.maximum(dam_prices + ida1_noise, 0.0)
+    df.loc[mask, 'ida2_clearing_price'] = np.maximum(dam_prices + ida2_noise, 0.0)
+    # IDA3 only covers hours 12-24
+    ida3_prices = np.where(hours >= 12, dam_prices + ida3_noise, np.nan)
+    df.loc[mask, 'ida3_clearing_price'] = ida3_prices
+
+    # XBID: tighter spread near delivery
+    xbid_mid = dam_prices + ida3_noise * 0.5  # I track closest IDA
+    time_to_delivery = _compute_hours_to_delivery(df.loc[mask].index)
+    spread_base = 2.0   # EUR at delivery
+    spread_far = 8.0    # EUR far from delivery
+    xbid_spread = spread_base + (spread_far - spread_base) * np.clip(
+        time_to_delivery / 12.0, 0, 1
+    )
+
+    df.loc[mask, 'xbid_bid'] = xbid_mid - xbid_spread / 2
+    df.loc[mask, 'xbid_ask'] = xbid_mid + xbid_spread / 2
+    df.loc[mask, 'xbid_spread'] = xbid_spread
+    return df
+
+
+def _generate_ida_positions(df, max_power_mw=30.0):
+    """I generate IDA correction positions (like DAM but smaller)."""
+    n = len(df)
+    dam = df['dam_commitment'].values
+
+    # I generate corrections based on price spread signals
+    ida1_corr = np.clip(np.random.normal(0, 2.0, n), -5.0, 5.0)
+    ida2_corr = np.clip(np.random.normal(0, 1.5, n), -3.0, 3.0)
+    ida3_corr = np.zeros(n)
+    afternoon_mask = df.index.hour >= 12
+    ida3_corr[afternoon_mask] = np.clip(
+        np.random.normal(0, 1.0, afternoon_mask.sum()), -2.0, 2.0
+    )
+
+    # I ensure total position doesn't exceed capacity
+    total = dam + ida1_corr + ida2_corr + ida3_corr
+    total = np.clip(total, -max_power_mw, max_power_mw)
+
+    df['ida1_position'] = ida1_corr
+    df['ida2_position'] = ida2_corr
+    df['ida3_position'] = ida3_corr
+    df['net_ida_position'] = ida1_corr + ida2_corr + ida3_corr
+    return df
+
+
+def _synthesize_free_bid_data(df, mask):
+    """I synthesize Free Bid activation probability and reference price."""
+    imbalance = df.loc[mask, 'net_imbalance_mw'].values
+
+    # Activation probability: higher |imbalance| -> more volume needed
+    activation_base = np.clip(np.abs(imbalance) / 500.0, 0.0, 0.8)
+    df.loc[mask, 'free_bid_activation_base'] = activation_base
+
+    # Reference price = mFRR marginal price (agent competes against this)
+    df.loc[mask, 'free_bid_reference_price'] = df.loc[mask, 'mfrr_price_up'].values
+    return df
+
+
 def _synthesize_intraday_data(
     df: pd.DataFrame,
     mask: pd.Series,
@@ -977,6 +1084,11 @@ def _add_derived_features(df: pd.DataFrame, steps_per_hour: int = 1) -> pd.DataF
         if col in df.columns:
             df[f'{col}_lag_1h'] = df[col].shift(1 * sph)
 
+    # I add IDA/XBID lagged features for full-market mode
+    for col in ['ida1_clearing_price', 'ida2_clearing_price', 'xbid_bid', 'xbid_ask']:
+        if col in df.columns:
+            df[f'{col}_lag_1h'] = df[col].shift(1 * sph)
+
     # I add rolling statistics (backward-looking only!)
     # At 15-min: 24h window = 96 steps, at hourly: 24 steps
     window_24h = 24 * sph
@@ -1051,6 +1163,27 @@ def _validate_dataset(df: pd.DataFrame) -> None:
 
     if 'afrr_cap_up_price' in df.columns:
         print(f"  aFRR cap price: mean={df['afrr_cap_up_price'].mean():.2f}")
+
+    # I print IDA/XBID/FreeBid statistics if present
+    if 'ida1_clearing_price' in df.columns:
+        print(f"\nIDA Sub-Market Statistics:")
+        print(f"  IDA1 clearing: mean={df['ida1_clearing_price'].mean():.2f}, "
+              f"std={df['ida1_clearing_price'].std():.2f}")
+        print(f"  IDA2 clearing: mean={df['ida2_clearing_price'].mean():.2f}, "
+              f"std={df['ida2_clearing_price'].std():.2f}")
+        ida3_valid = df['ida3_clearing_price'].dropna()
+        if len(ida3_valid) > 0:
+            print(f"  IDA3 clearing: mean={ida3_valid.mean():.2f}, "
+                  f"std={ida3_valid.std():.2f} ({len(ida3_valid)} valid rows)")
+        print(f"  XBID bid: mean={df['xbid_bid'].mean():.2f}")
+        print(f"  XBID ask: mean={df['xbid_ask'].mean():.2f}")
+        print(f"  XBID spread: mean={df['xbid_spread'].mean():.2f}")
+    if 'ida1_position' in df.columns:
+        print(f"  IDA1 position: mean={df['ida1_position'].mean():.2f}, "
+              f"std={df['ida1_position'].std():.2f}")
+        print(f"  Net IDA position: mean={df['net_ida_position'].mean():.2f}")
+    if 'free_bid_activation_base' in df.columns:
+        print(f"  Free Bid activation base: mean={df['free_bid_activation_base'].mean():.3f}")
 
 
 def main():

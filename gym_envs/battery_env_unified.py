@@ -60,6 +60,10 @@ class BatteryEnvUnified(gym.Env):
     N_INTRADAY_ACTIONS = 11
     N_MFRR_ACTIONS = 11
 
+    # I define Free Bid price tier multipliers (full market mode)
+    FREEBID_PRICE_TIERS = np.array([0.8, 0.9, 1.0, 1.1, 1.2])  # 5 tiers
+    N_FREEBID_PRICE_TIERS = 5
+
     def __init__(
         self,
         df: pd.DataFrame,
@@ -95,9 +99,15 @@ class BatteryEnvUnified(gym.Env):
 
         # Training configuration
         episode_length: Optional[int] = None,  # None = full dataset
-        random_start: bool = True
+        random_start: bool = True,
+
+        # Full market mode (IDA1/2/3/XBID + Free Bids)
+        enable_full_market: bool = False
     ):
         super().__init__()
+
+        # I store full market mode flag
+        self.enable_full_market = enable_full_market
 
         # I store configuration
         self.df = df.copy()
@@ -151,7 +161,8 @@ class BatteryEnvUnified(gym.Env):
         # I initialize state
         self._reset_state()
 
-        print(f"Unified Multi-Market Environment Initialized (IntraDay/mFRR separated)")
+        mode_str = "FULL MARKET (IDA1/2/3/XBID/FreeBids)" if enable_full_market else "IntraDay/mFRR separated"
+        print(f"Unified Multi-Market Environment Initialized ({mode_str})")
         print(f"  Battery: {capacity_mwh} MWh, {max_power_mw} MW")
         print(f"  Action Space: MultiDiscrete({list(self.action_space.nvec)}) = {np.prod(self.action_space.nvec)} combos")
         print(f"  Observation Space: {self.observation_space.shape[0]} features")
@@ -249,18 +260,28 @@ class BatteryEnvUnified(gym.Env):
 
     def _setup_spaces(self):
         """I define action and observation spaces."""
-        # Action space: MultiDiscrete([aFRR_commitment, aFRR_price_tier, intraday_action, mfrr_action])
-        self.action_space = spaces.MultiDiscrete([
-            len(self.AFRR_LEVELS),      # 5 aFRR commitment levels
-            len(self.AFRR_PRICE_TIERS), # 5 aFRR price tiers
-            self.N_INTRADAY_ACTIONS,    # 11 IntraDay actions
-            self.N_MFRR_ACTIONS         # 11 mFRR actions
-        ])
+        if self.enable_full_market:
+            # I use 5-dim action space with Free Bid price tier
+            self.action_space = spaces.MultiDiscrete([
+                len(self.AFRR_LEVELS),          # 5 aFRR commitment levels
+                len(self.AFRR_PRICE_TIERS),     # 5 aFRR price tiers
+                self.N_INTRADAY_ACTIONS,        # 11 XBID actions
+                self.N_MFRR_ACTIONS,            # 11 Balancing qty actions
+                self.N_FREEBID_PRICE_TIERS      # 5 Free Bid price tiers
+            ])
+            n_obs = 75
+        else:
+            # I use legacy 4-dim action space
+            self.action_space = spaces.MultiDiscrete([
+                len(self.AFRR_LEVELS),      # 5 aFRR commitment levels
+                len(self.AFRR_PRICE_TIERS), # 5 aFRR price tiers
+                self.N_INTRADAY_ACTIONS,    # 11 IntraDay actions
+                self.N_MFRR_ACTIONS         # 11 mFRR actions
+            ])
+            n_obs = 63
 
-        # Observation space: 63 features (was 58, +5 for separate IntraDay features)
-        # See _build_observation for detailed breakdown
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(63,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(n_obs,), dtype=np.float32
         )
 
     def _reset_state(self):
@@ -279,6 +300,13 @@ class BatteryEnvUnified(gym.Env):
         self.afrr_capacity_profit = 0.0
         self.afrr_energy_profit = 0.0
         self.mfrr_profit = 0.0
+
+        # I track full market mode profits
+        self.ida_profit = 0.0
+        self.xbid_profit = 0.0
+        self.free_bid_profit = 0.0
+        self.free_bid_activations = 0
+        self.free_bid_submissions = 0
 
         # I track cycling
         self.total_cycles = 0.0
@@ -418,7 +446,21 @@ class BatteryEnvUnified(gym.Env):
         mfrr_mask[self.N_MFRR_ACTIONS // 2] = True  # I always allow idle
 
         # I concatenate masks for MultiDiscrete format
-        full_mask = np.concatenate([afrr_mask, price_mask, intraday_mask, mfrr_mask])
+        if self.enable_full_market:
+            # Mask 5: Free Bid price tier (5 options)
+            price_tier_mask = np.ones(self.N_FREEBID_PRICE_TIERS, dtype=bool)
+
+            # I only allow price setting during Free Bid window or active mFRR
+            if abs(imbalance) <= self.mfrr_imbalance_threshold:
+                # No balancing need -> force neutral price (index 2 = 1.0x)
+                price_tier_mask = np.zeros(self.N_FREEBID_PRICE_TIERS, dtype=bool)
+                price_tier_mask[2] = True
+
+            full_mask = np.concatenate([
+                afrr_mask, price_mask, intraday_mask, mfrr_mask, price_tier_mask
+            ])
+        else:
+            full_mask = np.concatenate([afrr_mask, price_mask, intraday_mask, mfrr_mask])
 
         return full_mask
 
@@ -427,12 +469,13 @@ class BatteryEnvUnified(gym.Env):
         self._check_day_reset()
 
         # =====================================================================
-        # STAGE 1: UNPACK ACTION [afrr, price, intraday, mfrr]
+        # STAGE 1: UNPACK ACTION
         # =====================================================================
         afrr_action = action[0]
         price_tier_action = action[1]
-        intraday_action = action[2]
-        mfrr_action = action[3]
+        xbid_action = action[2]                    # Renamed from intraday_action
+        balancing_qty_action = action[3]            # Renamed from mfrr_action
+        balancing_price_action = action[4] if self.enable_full_market else 2  # Default neutral
 
         # I get current market data
         row = self.df.iloc[self.current_step]
@@ -586,14 +629,56 @@ class BatteryEnvUnified(gym.Env):
             remaining_after_afrr = remaining_capacity
 
         # =====================================================================
-        # STAGE 6: EXECUTE INTRADAY TRADE (voluntary arbitrage)
+        # STAGE 6: EXECUTE IDA POSITIONS (locked, mandatory like DAM)
+        # =====================================================================
+        ida_energy_mw = 0.0
+        if self.enable_full_market:
+            net_ida = row.get('net_ida_position', 0.0)
+            net_ida = np.clip(net_ida, -remaining_after_afrr, remaining_after_afrr)
+
+            if abs(net_ida) > 0.1:
+                # I recalculate limits for IDA execution
+                available_discharge_mwh_ida = (self.soc - self.min_soc) * self.capacity_mwh
+                available_charge_mwh_ida = (self.max_soc - self.soc) * self.capacity_mwh
+
+                if net_ida > 0:  # Discharge
+                    max_ida = min(net_ida,
+                                  available_discharge_mwh_ida * self.eff_sqrt / self.time_step_hours)
+                    if max_ida > 0.1:
+                        energy_mwh = max_ida * self.time_step_hours
+                        soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
+                        self.soc = max(self.min_soc, self.soc - soc_delta)
+                        ida_energy_mw = max_ida
+                        cycle_fraction = energy_mwh / self.capacity_mwh
+                        self.total_cycles += cycle_fraction
+                        self.daily_cycles += cycle_fraction
+                else:  # Charge
+                    max_ida = min(abs(net_ida),
+                                  available_charge_mwh_ida / self.eff_sqrt / self.time_step_hours)
+                    if max_ida > 0.1:
+                        energy_mwh = max_ida * self.time_step_hours
+                        soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
+                        self.soc = min(self.max_soc, self.soc + soc_delta)
+                        ida_energy_mw = -max_ida
+                        cycle_fraction = energy_mwh / self.capacity_mwh
+                        self.total_cycles += cycle_fraction
+                        self.daily_cycles += cycle_fraction
+
+                actual_energy_mw += ida_energy_mw
+                remaining_after_afrr -= abs(ida_energy_mw)
+
+        remaining_after_ida = remaining_after_afrr
+
+        # =====================================================================
+        # STAGE 7: EXECUTE XBID/INTRADAY TRADE (voluntary arbitrage)
         # =====================================================================
         intraday_energy_mw = 0.0
+        xbid_energy_mw = 0.0
         intraday_revenue = 0.0
 
         if not afrr_activated:
-            intraday_level = self.INTRADAY_LEVELS[intraday_action]
-            requested_intraday = intraday_level * remaining_after_afrr
+            intraday_level = self.INTRADAY_LEVELS[xbid_action]
+            requested_intraday = intraday_level * remaining_after_ida
 
             if abs(requested_intraday) > 0.1:
                 # I recalculate limits after previous stages
@@ -601,11 +686,11 @@ class BatteryEnvUnified(gym.Env):
                 available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
 
                 max_discharge = min(
-                    remaining_after_afrr,
+                    remaining_after_ida,
                     available_discharge_mwh * self.eff_sqrt / self.time_step_hours
                 )
                 max_charge = min(
-                    remaining_after_afrr,
+                    remaining_after_ida,
                     available_charge_mwh / self.eff_sqrt / self.time_step_hours
                 )
 
@@ -622,7 +707,11 @@ class BatteryEnvUnified(gym.Env):
                         self.soc = max(self.min_soc, self.soc - soc_delta)
                         actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
 
-                        id_price = row.get('intraday_bid', row.get('price', 100.0) - 2.0)
+                        # I use XBID prices in full market mode, IntraDay in legacy
+                        if self.enable_full_market:
+                            id_price = row.get('xbid_bid', row.get('intraday_bid', 98.0))
+                        else:
+                            id_price = row.get('intraday_bid', row.get('price', 100.0) - 2.0)
                         intraday_revenue = actual_energy * id_price
 
                     else:  # Buy (charge) at ask
@@ -632,7 +721,10 @@ class BatteryEnvUnified(gym.Env):
                         self.soc = min(self.max_soc, self.soc + soc_delta)
                         actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
 
-                        id_price = row.get('intraday_ask', row.get('price', 100.0) + 2.0)
+                        if self.enable_full_market:
+                            id_price = row.get('xbid_ask', row.get('intraday_ask', 102.0))
+                        else:
+                            id_price = row.get('intraday_ask', row.get('price', 100.0) + 2.0)
                         intraday_revenue = -actual_energy * id_price
 
                     cycle_fraction = actual_energy / self.capacity_mwh
@@ -640,33 +732,40 @@ class BatteryEnvUnified(gym.Env):
                     self.daily_cycles += cycle_fraction
 
                     intraday_energy_mw = actual_intraday
-                    self.intraday_profit += intraday_revenue
+                    xbid_energy_mw = actual_intraday if self.enable_full_market else 0.0
+                    if self.enable_full_market:
+                        self.xbid_profit += intraday_revenue
+                    else:
+                        self.intraday_profit += intraday_revenue
                     actual_energy_mw += actual_intraday
 
-        # I calculate remaining after IntraDay for mFRR
-        remaining_after_intraday = remaining_after_afrr - abs(intraday_energy_mw)
+        # I calculate remaining after XBID/IntraDay for balancing
+        remaining_after_intraday = remaining_after_ida - abs(intraday_energy_mw)
 
         # =====================================================================
-        # STAGE 7: EXECUTE mFRR TRADE (uses remaining after IntraDay)
+        # STAGE 8: EXECUTE BALANCING (Free Bid / mFRR)
         # =====================================================================
         mfrr_energy_mw = 0.0
+        free_bid_energy_mw = 0.0
         mfrr_revenue = 0.0
+        free_bid_activated = False
+        agent_bid_price = 0.0
 
         if not afrr_activated:
-            mfrr_level = self.MFRR_LEVELS[mfrr_action]
+            mfrr_level = self.MFRR_LEVELS[balancing_qty_action]
             requested_mfrr = mfrr_level * remaining_after_intraday
 
             # I enforce mFRR direction constraint (defense-in-depth for stale masks)
             imbalance = row.get('net_imbalance_mw', 0.0)
             if abs(imbalance) <= self.mfrr_imbalance_threshold:
-                requested_mfrr = 0.0  # Balanced → mFRR closed
+                requested_mfrr = 0.0  # Balanced -> mFRR closed
             elif imbalance < -self.mfrr_imbalance_threshold and requested_mfrr < 0:
                 requested_mfrr = 0.0  # Can't charge during deficit
             elif imbalance > self.mfrr_imbalance_threshold and requested_mfrr > 0:
                 requested_mfrr = 0.0  # Can't discharge during surplus
 
             if abs(requested_mfrr) > 0.1:
-                # I recalculate limits after IntraDay
+                # I recalculate limits after XBID/IntraDay
                 available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
                 available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
 
@@ -685,36 +784,64 @@ class BatteryEnvUnified(gym.Env):
                     actual_mfrr = max(requested_mfrr, -max_charge)
 
                 if abs(actual_mfrr) > 0.1:
-                    if actual_mfrr > 0:  # Sell (discharge) at mfrr_up
-                        energy_mwh = actual_mfrr * self.time_step_hours
-                        soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
-                        old_soc = self.soc
-                        self.soc = max(self.min_soc, self.soc - soc_delta)
-                        actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
+                    if self.enable_full_market:
+                        # I use Free Bid: agent sets price, activation is probabilistic
+                        price_tier = self.FREEBID_PRICE_TIERS[balancing_price_action]
+                        ref_price = row.get('free_bid_reference_price',
+                                            row.get('mfrr_price_up', 100.0))
+                        agent_bid_price = ref_price * price_tier
+                        self.free_bid_submissions += 1
 
-                        mfrr_price = row.get('mfrr_price_up', 120.0)
-                        mfrr_revenue = actual_energy * mfrr_price
+                        free_bid_activated = self._simulate_free_bid_activation(
+                            agent_bid_price, ref_price, imbalance, row
+                        )
 
-                    else:  # Buy (charge) at mfrr_down
-                        energy_mwh = abs(actual_mfrr) * self.time_step_hours
-                        soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
-                        old_soc = self.soc
-                        self.soc = min(self.max_soc, self.soc + soc_delta)
-                        actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
+                        if not free_bid_activated:
+                            actual_mfrr = 0.0  # I don't execute if not activated
 
-                        mfrr_price = row.get('mfrr_price_down', 60.0)
-                        mfrr_revenue = -actual_energy * mfrr_price
+                    if abs(actual_mfrr) > 0.1:
+                        if actual_mfrr > 0:  # Sell (discharge)
+                            energy_mwh = actual_mfrr * self.time_step_hours
+                            soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
+                            old_soc = self.soc
+                            self.soc = max(self.min_soc, self.soc - soc_delta)
+                            actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
 
-                    cycle_fraction = actual_energy / self.capacity_mwh
-                    self.total_cycles += cycle_fraction
-                    self.daily_cycles += cycle_fraction
+                            if self.enable_full_market:
+                                # Free Bid: pay-as-bid (agent's price)
+                                mfrr_revenue = actual_energy * agent_bid_price
+                            else:
+                                mfrr_price = row.get('mfrr_price_up', 120.0)
+                                mfrr_revenue = actual_energy * mfrr_price
 
-                    mfrr_energy_mw = actual_mfrr
-                    self.mfrr_profit += mfrr_revenue
-                    actual_energy_mw += actual_mfrr
+                        else:  # Buy (charge)
+                            energy_mwh = abs(actual_mfrr) * self.time_step_hours
+                            soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
+                            old_soc = self.soc
+                            self.soc = min(self.max_soc, self.soc + soc_delta)
+                            actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
+
+                            if self.enable_full_market:
+                                mfrr_revenue = -actual_energy * agent_bid_price
+                            else:
+                                mfrr_price = row.get('mfrr_price_down', 60.0)
+                                mfrr_revenue = -actual_energy * mfrr_price
+
+                        cycle_fraction = actual_energy / self.capacity_mwh
+                        self.total_cycles += cycle_fraction
+                        self.daily_cycles += cycle_fraction
+
+                        if self.enable_full_market:
+                            free_bid_energy_mw = actual_mfrr
+                            self.free_bid_profit += mfrr_revenue
+                            self.free_bid_activations += 1
+                        else:
+                            mfrr_energy_mw = actual_mfrr
+                            self.mfrr_profit += mfrr_revenue
+                        actual_energy_mw += actual_mfrr
 
         # =====================================================================
-        # STAGE 8: CALCULATE REWARD
+        # STAGE 9: CALCULATE REWARD
         # =====================================================================
         market_state = UnifiedMarketState(
             dam_price=row.get('price', 100.0),
@@ -729,7 +856,16 @@ class BatteryEnvUnified(gym.Env):
             afrr_activated=afrr_activated,
             afrr_activation_direction=afrr_direction,
             mfrr_price_up=row.get('mfrr_price_up', 120.0),
-            mfrr_price_down=row.get('mfrr_price_down', 60.0)
+            mfrr_price_down=row.get('mfrr_price_down', 60.0),
+            # IDA sub-market fields (full market mode)
+            ida1_clearing_price=row.get('ida1_clearing_price', 0.0),
+            ida2_clearing_price=row.get('ida2_clearing_price', 0.0),
+            ida3_clearing_price=row.get('ida3_clearing_price', 0.0) if not np.isnan(row.get('ida3_clearing_price', 0.0)) else 0.0,
+            net_ida_position=row.get('net_ida_position', 0.0),
+            xbid_bid=row.get('xbid_bid', row.get('intraday_bid', 98.0)),
+            xbid_ask=row.get('xbid_ask', row.get('intraday_ask', 102.0)),
+            free_bid_activated=free_bid_activated,
+            free_bid_agent_price=agent_bid_price if self.enable_full_market else 0.0,
         )
 
         shortfall_risk = self._calculate_shortfall_risk()
@@ -740,7 +876,7 @@ class BatteryEnvUnified(gym.Env):
             actual_energy_mw=actual_energy_mw,
             afrr_capacity_committed_mw=self.afrr_commitment_mw if self.is_selected_for_afrr else 0.0,
             afrr_energy_delivered_mw=afrr_energy_delivered,
-            intraday_energy_mw=intraday_energy_mw,
+            intraday_energy_mw=intraday_energy_mw if not self.enable_full_market else 0.0,
             mfrr_energy_mw=mfrr_energy_mw,
             current_soc=self.soc,
             capacity_mwh=self.capacity_mwh,
@@ -748,7 +884,11 @@ class BatteryEnvUnified(gym.Env):
             is_physical_violation=False,
             shortfall_risk=shortfall_risk,
             price_momentum=price_momentum,
-            is_selected_for_afrr=self.is_selected_for_afrr
+            is_selected_for_afrr=self.is_selected_for_afrr,
+            # Full market mode params
+            ida_energy_mw=ida_energy_mw,
+            xbid_energy_mw=xbid_energy_mw,
+            free_bid_energy_mw=free_bid_energy_mw,
         )
 
         reward = reward_info['reward']
@@ -756,7 +896,7 @@ class BatteryEnvUnified(gym.Env):
         self.episode_profit += reward_info['components'].get('net_profit', 0)
 
         # =====================================================================
-        # STAGE 9: ADVANCE STEP
+        # STAGE 10: ADVANCE STEP
         # =====================================================================
         self.current_step += 1
 
@@ -780,6 +920,11 @@ class BatteryEnvUnified(gym.Env):
             'intraday_revenue': intraday_revenue,
             'mfrr_energy_mw': mfrr_energy_mw,
             'mfrr_revenue': mfrr_revenue,
+            # Full market mode fields
+            'ida_energy_mw': ida_energy_mw,
+            'xbid_energy_mw': xbid_energy_mw,
+            'free_bid_energy_mw': free_bid_energy_mw,
+            'free_bid_activated': free_bid_activated,
             **reward_info['components']
         })
 
@@ -1138,10 +1283,12 @@ class BatteryEnvUnified(gym.Env):
         # =====================================================================
         # 8. MARKET PHASE & SYSTEM STATE (4 features)
         # =====================================================================
-        # [55] IDA3 correction signal — hours 12+ have fresher IntraDay prices
-        # (IDA3 auction at 10:00 covers hours 12-24; before that only IDA1+IDA2)
-        ida3_applies = 1.0 if hour >= 12 else 0.0
-        features.append(ida3_applies)
+        # [55] IDA phase indicator (full market) or IDA3 correction (legacy)
+        if self.enable_full_market:
+            features.append(self._get_ida_phase(row))
+        else:
+            ida3_applies = 1.0 if hour >= 12 else 0.0
+            features.append(ida3_applies)
 
         # [56] System stress magnitude — |imbalance| normalized (0=balanced, 1=severe)
         # I use this to help predict aFRR activation and mFRR availability
@@ -1193,20 +1340,87 @@ class BatteryEnvUnified(gym.Env):
         features.append(hours_to_peak)
 
         # =====================================================================
+        # 10. FULL MARKET FEATURES (12 features, indices 63-74)
+        # =====================================================================
+        if self.enable_full_market:
+            imbalance_fm = row.get('net_imbalance_mw', 0.0)
+
+            # Group 10: IDA State (63-69)
+            features.append(row.get('ida1_position', 0.0) / self.max_power_mw)    # [63]
+            features.append(row.get('ida2_position', 0.0) / self.max_power_mw)    # [64]
+            features.append(row.get('ida3_position', 0.0) / self.max_power_mw)    # [65]
+            features.append(row.get('ida1_clearing_price', 0.0) / 100.0)          # [66]
+            features.append(row.get('ida2_clearing_price', 0.0) / 100.0)          # [67]
+            features.append(row.get('net_ida_position', 0.0) / self.max_power_mw) # [68]
+            features.append(1.0 if self._is_xbid_gate_open(row) else 0.0)         # [69]
+
+            # Group 11: Free Bid State (70-72)
+            features.append(1.0 if abs(imbalance_fm) > self.mfrr_imbalance_threshold else 0.0)  # [70]
+            features.append(row.get('free_bid_activation_base', 0.3))              # [71]
+            features.append(row.get('free_bid_reference_price', 100.0) / 100.0)   # [72]
+
+            # Group 12: XBID Quality (73-74)
+            features.append(row.get('xbid_spread', 5.0) / 100.0)                  # [73]
+            features.append(self._get_time_to_delivery(row) / 24.0)               # [74]
+
+        # =====================================================================
         # VALIDATION
         # =====================================================================
         obs = np.array(features, dtype=np.float32)
 
-        assert len(obs) == 63, f"Expected 63 features, got {len(obs)}"
+        expected_features = 75 if self.enable_full_market else 63
+        assert len(obs) == expected_features, f"Expected {expected_features} features, got {len(obs)}"
 
         # I replace any NaN/Inf with 0
         obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
 
         return obs
 
+    def _is_xbid_gate_open(self, row):
+        """I check if XBID is open (closes H-1 before delivery)."""
+        # In training, always open except when aFRR is activated
+        # (can't trade XBID during aFRR activation)
+        return self.steps_since_afrr_activation > 0
+
+    def _get_ida_phase(self, row):
+        """I return IDA phase indicator: 0.0 -> 0.33 -> 0.67 -> 1.0."""
+        hour = self.df.index[self.current_step].hour
+        if hour < 15:
+            return 0.0    # Before IDA1 results
+        elif hour < 22:
+            return 0.33   # After IDA1, before IDA2
+        else:
+            return 0.67   # After IDA2, before IDA3
+
+    def _simulate_free_bid_activation(self, bid_price, ref_price, imbalance, row):
+        """I simulate merit-order based Free Bid activation."""
+        if abs(imbalance) < 30.0:
+            return False
+
+        base_prob = row.get('free_bid_activation_base', 0.3)
+
+        # Lower bid price -> higher activation probability
+        if ref_price > 0:
+            price_ratio = bid_price / ref_price
+        else:
+            price_ratio = 1.0
+
+        if price_ratio <= 1.0:
+            price_factor = 1.0 + (1.0 - price_ratio) * 2.5  # Aggressive = more activation
+        else:
+            price_factor = max(0.05, 1.0 - (price_ratio - 1.0) * 3.5)  # Conservative = less
+
+        activation_prob = np.clip(base_prob * price_factor, 0.0, 0.95)
+        return np.random.random() < activation_prob
+
+    def _get_time_to_delivery(self, row):
+        """I compute approximate hours to delivery for this ISP."""
+        ts = self.df.index[self.current_step]
+        return max(0.5, 24.0 - (ts.hour + ts.minute / 60.0))
+
     def _get_info(self) -> Dict:
         """I return step information."""
-        return {
+        info = {
             'soc': self.soc,
             'step': self.current_step,
             'afrr_commitment': self.afrr_commitment_mw,
@@ -1218,8 +1432,18 @@ class BatteryEnvUnified(gym.Env):
             'afrr_energy_profit': self.afrr_energy_profit,
             'mfrr_profit': self.mfrr_profit,
             'total_cycles': self.total_cycles,
-            'daily_cycles': self.daily_cycles
+            'daily_cycles': self.daily_cycles,
         }
+        if self.enable_full_market:
+            info.update({
+                'ida_profit': self.ida_profit,
+                'xbid_profit': self.xbid_profit,
+                'free_bid_profit': self.free_bid_profit,
+                'free_bid_activation_rate': (
+                    self.free_bid_activations / max(1, self.free_bid_submissions)
+                ),
+            })
+        return info
 
     def render(self, mode='human'):
         """I render the environment state."""

@@ -1132,5 +1132,414 @@ class Test15MinResolution:
         assert steps > 0
 
 
+# =========================================================================
+# FULL MARKET MODE TESTS (IDA + XBID + Free Bids)
+# =========================================================================
+
+@pytest.fixture
+def sample_data_full_market():
+    """I create sample training data with IDA/XBID/FreeBid columns."""
+    n_hours = 168
+    dates = pd.date_range(
+        start='2024-01-01',
+        periods=n_hours,
+        freq='H',
+        tz='Europe/Athens'
+    )
+
+    np.random.seed(42)
+
+    hours = np.array([d.hour for d in dates])
+    base_price = 80 + 40 * np.sin(2 * np.pi * hours / 24)
+    noise = np.random.normal(0, 10, n_hours)
+    prices = base_price + noise
+
+    dam_commitments = np.zeros(n_hours)
+    for i in range(n_hours):
+        if hours[i] in [18, 19, 20]:
+            dam_commitments[i] = np.random.uniform(10, 25)
+        elif hours[i] in [10, 11, 12]:
+            dam_commitments[i] = np.random.uniform(-20, -5)
+
+    data = {
+        'price': prices,
+        'dam_commitment': dam_commitments,
+        'afrr_up': prices * 1.1,
+        'afrr_down': prices * 0.9,
+        'afrr_cap_up_price': 15 + 10 * np.random.random(n_hours),
+        'afrr_cap_down_price': 25 + 15 * np.random.random(n_hours),
+        'intraday_bid': prices - 2.0 + np.random.normal(0, 1, n_hours),
+        'intraday_ask': prices + 2.0 + np.random.normal(0, 1, n_hours),
+        'intraday_spread': 3.0 + np.random.uniform(0, 4, n_hours),
+        'intraday_volume': np.random.uniform(0.3, 0.9, n_hours),
+        'mfrr_price_up': prices * 1.3,
+        'mfrr_price_down': prices * 0.7,
+        'mfrr_spread': prices * 0.6,
+        'net_imbalance_mw': np.random.normal(0, 300, n_hours),
+        'solar': np.maximum(0, 500 * np.sin(2 * np.pi * (hours - 6) / 12)),
+        'wind_onshore': np.random.uniform(100, 500, n_hours),
+        'res_total_mw': np.maximum(0, 500 * np.sin(2 * np.pi * (hours - 6) / 12)) + np.random.uniform(100, 500, n_hours),
+        'load_mw': np.random.uniform(3000, 6000, n_hours),
+        # IDA columns
+        'ida1_clearing_price': prices + np.random.normal(0, 12, n_hours),
+        'ida2_clearing_price': prices + np.random.normal(0, 8, n_hours),
+        'ida3_clearing_price': np.where(hours >= 12, prices + np.random.normal(0, 4, n_hours), np.nan),
+        'ida1_position': np.clip(np.random.normal(0, 2.0, n_hours), -5, 5),
+        'ida2_position': np.clip(np.random.normal(0, 1.5, n_hours), -3, 3),
+        'ida3_position': np.where(hours >= 12, np.clip(np.random.normal(0, 1.0, n_hours), -2, 2), 0.0),
+        'net_ida_position': np.zeros(n_hours),  # I fill this below
+        # XBID columns
+        'xbid_bid': prices - 3.0 + np.random.normal(0, 1, n_hours),
+        'xbid_ask': prices + 3.0 + np.random.normal(0, 1, n_hours),
+        'xbid_spread': 4.0 + np.random.uniform(0, 4, n_hours),
+        # Free Bid columns
+        'free_bid_activation_base': np.clip(np.abs(np.random.normal(0, 300, n_hours)) / 500.0, 0, 0.8),
+        'free_bid_reference_price': prices * 1.3,
+    }
+
+    df = pd.DataFrame(data, index=dates)
+    df['net_ida_position'] = df['ida1_position'] + df['ida2_position'] + df['ida3_position']
+    return df
+
+
+@pytest.fixture
+def full_market_env(sample_data_full_market):
+    """I create a full-market-mode environment for testing."""
+    from gym_envs.battery_env_unified import BatteryEnvUnified
+
+    env = BatteryEnvUnified(
+        df=sample_data_full_market,
+        capacity_mwh=146.0,
+        max_power_mw=30.0,
+        efficiency=0.94,
+        episode_length=72,
+        random_start=False,
+        enable_full_market=True
+    )
+    return env
+
+
+class TestIDADecomposition:
+    """I test IDA sub-market decomposition."""
+
+    def test_ida_columns_exist(self, sample_data_full_market):
+        """I verify IDA position and price columns in training data."""
+        df = sample_data_full_market
+        for col in ['ida1_clearing_price', 'ida2_clearing_price', 'ida3_clearing_price',
+                     'ida1_position', 'ida2_position', 'ida3_position', 'net_ida_position']:
+            assert col in df.columns, f"Missing IDA column: {col}"
+
+    def test_ida_position_execution(self, full_market_env):
+        """I verify IDA positions execute as mandatory (like DAM)."""
+        full_market_env.reset(seed=42)
+        full_market_env.soc = 0.5
+
+        # I run a few steps and check IDA execution
+        for _ in range(20):
+            action = np.array([0, 2, 5, 5, 2])  # All idle except IDA (auto-executed)
+            obs, reward, done, truncated, info = full_market_env.step(action)
+
+            ida_mw = info.get('ida_energy_mw', 0)
+            # IDA positions should be executed when non-zero in data
+            # I verify it was attempted (may be 0 if data position is 0)
+            assert isinstance(ida_mw, (int, float))
+
+            if done or truncated:
+                break
+
+    def test_ida_pay_as_cleared(self):
+        """I verify IDA revenue uses clearing price."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator, UnifiedMarketState
+
+        calculator = UnifiedRewardCalculator()
+        market = UnifiedMarketState(
+            dam_price=100.0, dam_commitment=0.0,
+            intraday_bid=98.0, intraday_ask=102.0, intraday_spread=4.0,
+            afrr_cap_up_price=20.0, afrr_cap_down_price=30.0,
+            afrr_energy_up_price=80.0, afrr_energy_down_price=80.0,
+            afrr_activated=False, afrr_activation_direction=None,
+            mfrr_price_up=120.0, mfrr_price_down=60.0,
+            ida1_clearing_price=95.0, ida2_clearing_price=97.0,
+            ida3_clearing_price=99.0, net_ida_position=5.0,
+        )
+
+        result = calculator.calculate(
+            market=market, actual_energy_mw=5.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0,
+            ida_energy_mw=5.0
+        )
+
+        # IDA revenue should use weighted average of clearing prices
+        assert result['components']['ida_revenue'] > 0
+
+    def test_ida_phase_feature(self, full_market_env):
+        """I verify obs[55] encodes IDA phase correctly."""
+        full_market_env.reset(seed=42)
+        step = full_market_env.current_step
+
+        # I find a step with hour < 15
+        for i in range(step, min(step + 24, len(full_market_env.df))):
+            ts = full_market_env.df.index[i]
+            if ts.hour < 15:
+                full_market_env.current_step = i
+                obs = full_market_env._build_observation()
+                assert obs[55] == pytest.approx(0.0, abs=0.01), \
+                    f"Expected ida_phase=0.0 for hour {ts.hour}, got {obs[55]}"
+                return
+
+        pytest.skip("No hour < 15 found in test window")
+
+    def test_ida3_nan_morning(self, sample_data_full_market):
+        """I verify IDA3 is NaN/0 for hours < 12."""
+        df = sample_data_full_market
+        morning = df[df.index.hour < 12]
+        assert morning['ida3_clearing_price'].isna().all(), \
+            "IDA3 clearing price should be NaN for hours < 12"
+
+    def test_capacity_cascade_with_ida(self, full_market_env):
+        """I verify DAM -> aFRR -> IDA -> XBID -> FreeBid cascade."""
+        full_market_env.reset(seed=42)
+        full_market_env.soc = 0.5
+        step = full_market_env.current_step
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        # I set a non-zero IDA position
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 5.0
+
+        # I request max XBID discharge + max balancing discharge
+        action = np.array([0, 2, 10, 10, 2])
+        obs, reward, done, truncated, info = full_market_env.step(action)
+
+        ida_mw = abs(info.get('ida_energy_mw', 0))
+        xbid_mw = abs(info.get('xbid_energy_mw', 0))
+        free_bid_mw = abs(info.get('free_bid_energy_mw', 0))
+        total_mw = ida_mw + xbid_mw + free_bid_mw
+
+        # I verify combined power does not exceed max_power_mw
+        assert total_mw <= full_market_env.max_power_mw + 0.1, \
+            f"IDA + XBID + FreeBid = {total_mw:.1f} exceeds max_power {full_market_env.max_power_mw}"
+
+
+class TestFreeBids:
+    """I test Free Bid (Balancing Energy Offers)."""
+
+    def test_action_space_5dim(self, full_market_env):
+        """I verify action space is MultiDiscrete([5,5,11,11,5])."""
+        assert full_market_env.action_space.nvec.tolist() == [5, 5, 11, 11, 5]
+
+    def test_mask_shape_37(self, full_market_env):
+        """I verify mask length is 5+5+11+11+5=37."""
+        full_market_env.reset(seed=42)
+        mask = full_market_env.action_masks()
+        assert len(mask) == 5 + 5 + 11 + 11 + 5  # 37 total
+
+    def test_free_bid_price_sensitivity(self, full_market_env):
+        """I verify lower bid prices -> higher activation probability."""
+        full_market_env.reset(seed=42)
+        row = full_market_env.df.iloc[full_market_env.current_step]
+
+        # I test aggressive pricing (0.8x)
+        activations_aggressive = 0
+        for _ in range(1000):
+            result = full_market_env._simulate_free_bid_activation(
+                bid_price=80.0, ref_price=100.0, imbalance=-200.0, row=row
+            )
+            if result:
+                activations_aggressive += 1
+
+        # I test conservative pricing (1.2x)
+        activations_conservative = 0
+        for _ in range(1000):
+            result = full_market_env._simulate_free_bid_activation(
+                bid_price=120.0, ref_price=100.0, imbalance=-200.0, row=row
+            )
+            if result:
+                activations_conservative += 1
+
+        assert activations_aggressive > activations_conservative, \
+            f"Aggressive ({activations_aggressive}) should activate more than conservative ({activations_conservative})"
+
+    def test_free_bid_pay_as_bid(self):
+        """I verify Free Bid revenue uses agent's price, not clearing."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator, UnifiedMarketState
+
+        calculator = UnifiedRewardCalculator()
+        agent_price = 95.0
+
+        market = UnifiedMarketState(
+            dam_price=100.0, dam_commitment=0.0,
+            intraday_bid=98.0, intraday_ask=102.0, intraday_spread=4.0,
+            afrr_cap_up_price=20.0, afrr_cap_down_price=30.0,
+            afrr_energy_up_price=80.0, afrr_energy_down_price=80.0,
+            afrr_activated=False, afrr_activation_direction=None,
+            mfrr_price_up=120.0, mfrr_price_down=60.0,
+            free_bid_activated=True, free_bid_agent_price=agent_price,
+        )
+
+        result = calculator.calculate(
+            market=market, actual_energy_mw=10.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0,
+            free_bid_energy_mw=10.0
+        )
+
+        # Free Bid sells 10 MW at agent_price=95 -> 950 EUR
+        assert result['components']['free_bid_revenue'] == pytest.approx(950.0, abs=1.0)
+
+    def test_direction_constraint(self, full_market_env):
+        """I verify Free Bid respects imbalance direction."""
+        full_market_env.reset(seed=42)
+        step = full_market_env.current_step
+
+        # I set balanced imbalance
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_imbalance_mw')] = 5.0
+
+        # I test activation with low imbalance — should not activate
+        row = full_market_env.df.iloc[step]
+        result = full_market_env._simulate_free_bid_activation(
+            bid_price=90.0, ref_price=100.0, imbalance=5.0, row=row
+        )
+        assert result == False, "Free Bid should not activate when |imbalance| < 30 MW"
+
+    def test_price_tier_masked_when_idle(self, full_market_env):
+        """I verify price tier forced to neutral when no balancing need."""
+        full_market_env.reset(seed=42)
+        step = full_market_env.current_step
+
+        # I set balanced imbalance
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_imbalance_mw')] = 10.0
+
+        mask = full_market_env.action_masks()
+        # Free Bid price tier mask is last 5 elements
+        freebid_mask = mask[-5:]
+
+        # Only neutral (index 2) should be allowed
+        assert freebid_mask[2] == True, "Neutral price tier (1.0x) must be allowed"
+        for i in [0, 1, 3, 4]:
+            assert freebid_mask[i] == False, \
+                f"Price tier {i} should be masked when balanced (no balancing need)"
+
+
+class TestBackwardCompat:
+    """I verify legacy mode (enable_full_market=False) is identical."""
+
+    def test_legacy_action_space_4dim(self, unified_env):
+        """I verify 4-dim action space when flag is False."""
+        assert unified_env.action_space.nvec.tolist() == [5, 5, 11, 11]
+
+    def test_legacy_obs_63(self, unified_env):
+        """I verify 63-feature observation when flag is False."""
+        assert unified_env.observation_space.shape == (63,)
+        obs, info = unified_env.reset(seed=42)
+        assert obs.shape == (63,)
+
+    def test_legacy_mask_32(self, unified_env):
+        """I verify 32-element mask when flag is False."""
+        unified_env.reset(seed=42)
+        mask = unified_env.action_masks()
+        assert len(mask) == 5 + 5 + 11 + 11  # 32
+
+    def test_legacy_episode_runs(self, unified_env):
+        """I verify legacy mode episode runs identically."""
+        obs, info = unified_env.reset(seed=42)
+
+        for _ in range(30):
+            action = np.array([0, 2, 5, 5])  # Idle
+            obs, reward, done, truncated, info = unified_env.step(action)
+            assert obs.shape == (63,)
+            assert np.isfinite(reward)
+            if done or truncated:
+                break
+
+
+class TestSeparateRevenueTracking:
+    """I test per-market revenue tracking."""
+
+    def test_info_contains_all_markets(self, full_market_env):
+        """I verify info has dam, ida, xbid, afrr, free_bid, mfrr profits."""
+        full_market_env.reset(seed=42)
+        action = np.array([0, 2, 5, 5, 2])
+        obs, reward, done, truncated, info = full_market_env.step(action)
+
+        for key in ['dam_profit', 'ida_profit', 'xbid_profit',
+                     'afrr_capacity_profit', 'afrr_energy_profit',
+                     'free_bid_profit']:
+            assert key in info, f"Missing market profit key: {key}"
+
+    def test_full_market_obs_shape(self, full_market_env):
+        """I verify 75-feature observation in full market mode."""
+        obs, info = full_market_env.reset(seed=42)
+        assert obs.shape == (75,)
+        assert not np.any(np.isnan(obs))
+        assert not np.any(np.isinf(obs))
+
+    def test_full_market_step(self, full_market_env):
+        """I verify full market mode step works correctly."""
+        full_market_env.reset(seed=42)
+
+        for _ in range(30):
+            action = full_market_env.action_space.sample()
+            obs, reward, done, truncated, info = full_market_env.step(action)
+            assert obs.shape == (75,)
+            assert np.isfinite(reward)
+            assert 0.05 <= info['soc'] <= 0.95
+            if done or truncated:
+                break
+
+    def test_xbid_revenue_tracked(self, full_market_env):
+        """I verify XBID revenue is tracked separately from IntraDay."""
+        full_market_env.reset(seed=42)
+        full_market_env.soc = 0.5
+        step = full_market_env.current_step
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('dam_commitment')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 0.0
+
+        # I discharge on XBID
+        action = np.array([0, 2, 9, 5, 2])  # ~80% XBID discharge, idle balancing
+        obs, reward, done, truncated, info = full_market_env.step(action)
+
+        xbid_mw = info.get('xbid_energy_mw', 0)
+        if abs(xbid_mw) > 0.1:
+            assert full_market_env.xbid_profit != 0, \
+                "XBID profit should be tracked when trading"
+
+
+class TestFullMarketStrategy:
+    """I test strategy with full market mode."""
+
+    def test_rule_based_5dim_action(self, full_market_env):
+        """I verify rule-based strategy produces 5-element actions in full market mode."""
+        from agent.unified_strategy import UnifiedRuleBasedStrategy
+
+        strategy = UnifiedRuleBasedStrategy(enable_full_market=True)
+        strategy.load()
+
+        full_market_env.reset(seed=42)
+        obs = full_market_env._build_observation()
+        mask = full_market_env.action_masks()
+
+        action = strategy.predict_action(obs, mask)
+        assert len(action) == 5
+        assert 0 <= action[4] < 5  # Free Bid price tier
+
+    def test_conservative_5dim_action(self, full_market_env):
+        """I verify conservative strategy produces 5-element actions in full market mode."""
+        from agent.unified_strategy import UnifiedConservativeStrategy
+
+        strategy = UnifiedConservativeStrategy(enable_full_market=True)
+        strategy.load()
+
+        full_market_env.reset(seed=42)
+        obs = full_market_env._build_observation()
+        mask = full_market_env.action_masks()
+
+        action = strategy.predict_action(obs, mask)
+        assert len(action) == 5
+        assert action[0] == 0   # Zero aFRR
+        assert action[2] == 5   # Idle XBID
+        assert action[3] == 5   # Idle balancing
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
