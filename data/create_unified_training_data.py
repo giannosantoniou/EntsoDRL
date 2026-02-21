@@ -266,7 +266,9 @@ def create_unified_dataset_v2(
 
     # I first build the base dataset using the existing 15-min pipeline
     base_df = _create_base_15min_dataset(
-        dam_path, admie_path, forecast_path_name, data_dir
+        dam_path, admie_path, forecast_path_name, data_dir,
+        use_day_ahead_forecaster=use_day_ahead_forecaster,
+        forecast_driven_ida=forecast_driven_ida,
     )
 
     # I merge real ISP clearing prices (all 3 sessions)
@@ -316,7 +318,7 @@ def create_unified_dataset_v2(
     return base_df
 
 
-def _create_base_15min_dataset(dam_path, admie_path, forecast_path_name, data_dir):
+def _create_base_15min_dataset(dam_path, admie_path, forecast_path_name, data_dir, use_day_ahead_forecaster=None, forecast_driven_ida=False):
     """I create the base 15-min dataset (same logic as create_unified_dataset_from_admie_15min)."""
     steps_per_hour = 4
 
