@@ -73,7 +73,8 @@ def load_afrr_mfrr_data(path: str = "afrr_mfrr_combined_v2.csv") -> pd.DataFrame
 def create_unified_dataset_from_admie(
     dam_path: str = 'dam_prices_2021_2026.csv',
     admie_path: str = 'admie_market_data_combined.csv',
-    output_path: str = 'unified_multimarket_training.csv'
+    output_path: str = 'unified_multimarket_training.csv',
+    forecast_driven_ida: bool = False,
 ) -> pd.DataFrame:
     """
     I create a unified training dataset from real ADMIE balancing data + DAM prices.
@@ -207,7 +208,10 @@ def create_unified_dataset_from_admie(
 
     # Step 9b: I synthesize IDA sub-market data and Free Bids
     unified = _synthesize_ida_prices(unified, all_mask, time_step_hours=1.0)
-    unified = _generate_ida_positions(unified, max_power_mw=30.0)
+    if forecast_driven_ida:
+        unified = _generate_forecast_driven_ida_positions(unified, max_power_mw=30.0)
+    else:
+        unified = _generate_ida_positions(unified, max_power_mw=30.0)
     unified = _synthesize_free_bid_data(unified, all_mask)
 
     # Step 10: I add all derived features (lags, rolling stats, time features)
@@ -243,6 +247,7 @@ def create_unified_dataset_v2(
     add_forecasts: bool = True,
     forecaster_path: str = None,
     use_day_ahead_forecaster: str = None,
+    forecast_driven_ida: bool = False,
 ) -> pd.DataFrame:
     """
     I create the v2 unified training dataset with:
@@ -430,7 +435,10 @@ def _create_base_15min_dataset(dam_path, admie_path, forecast_path_name, data_di
 
     # I add IDA/XBID/FreeBid features for full-market mode
     unified = _synthesize_ida_prices(unified, all_mask, time_step_hours=0.25)
-    unified = _generate_ida_positions(unified, max_power_mw=30.0)
+    if forecast_driven_ida:
+        unified = _generate_forecast_driven_ida_positions(unified, max_power_mw=30.0)
+    else:
+        unified = _generate_ida_positions(unified, max_power_mw=30.0)
     unified = _synthesize_free_bid_data(unified, all_mask)
 
     return unified
@@ -726,7 +734,8 @@ def create_unified_dataset_from_admie_15min(
     dam_path: str = 'dam_prices_2021_2026.csv',
     admie_path: str = 'admie_market_data_combined_15min.csv',
     forecast_path_name: str = 'dam_forecasts_2024_2026.csv',
-    output_path: str = 'unified_multimarket_training_15min.csv'
+    output_path: str = 'unified_multimarket_training_15min.csv',
+    forecast_driven_ida: bool = False,
 ) -> pd.DataFrame:
     """
     I create a native 15-min unified training dataset from real ADMIE data.
@@ -897,7 +906,10 @@ def create_unified_dataset_from_admie_15min(
     # These columns are always generated so the data file is complete;
     # the environment flag controls whether they are used.
     unified = _synthesize_ida_prices(unified, all_mask, time_step_hours=0.25)
-    unified = _generate_ida_positions(unified, max_power_mw=30.0)
+    if forecast_driven_ida:
+        unified = _generate_forecast_driven_ida_positions(unified, max_power_mw=30.0)
+    else:
+        unified = _generate_ida_positions(unified, max_power_mw=30.0)
     unified = _synthesize_free_bid_data(unified, all_mask)
 
     # Step 10: I add all derived features with 15-min-aware window sizes
@@ -1528,6 +1540,94 @@ def _generate_ida_positions(df, max_power_mw=30.0):
     return df
 
 
+def _generate_forecast_driven_ida_positions(df, max_power_mw=30.0, min_deviation_eur=8.0):
+    """
+    I generate IDA correction positions driven by a forecast error proxy.
+
+    Instead of random noise, I compute a proxy for DAM forecast error:
+        forecast_error = actual_price - shift(rolling_mean_24h, 24h)
+    and derive corrections proportional to this error.
+
+    IDA1: clip(error * 0.15, -5, 5) + small noise, zero when |error| < threshold
+    IDA2: clip(error * 0.10, -3, 3), lower threshold
+    IDA3: clip(error * 0.05, -2, 2), only for hours >= 12
+
+    I enforce total position within +/-max_power_mw via proportional scaling.
+    """
+    n = len(df)
+    dam = df['dam_commitment'].values
+    prices = df['price'].values
+
+    # I compute forecast error proxy: actual price minus 24h-lagged rolling mean
+    # This simulates what a simple forecast would have predicted vs. reality
+    sph = 1
+    if hasattr(df.index, 'freq') and df.index.freq is not None:
+        freq_seconds = pd.Timedelta(df.index.freq).total_seconds()
+        sph = max(1, int(round(3600 / freq_seconds)))
+    elif len(df) > 1:
+        diff_seconds = (df.index[1] - df.index[0]).total_seconds()
+        if diff_seconds > 0:
+            sph = max(1, int(round(3600 / diff_seconds)))
+
+    w24 = 24 * sph
+    rolling_mean = pd.Series(prices, index=df.index).rolling(w24, min_periods=1).mean().values
+    # I shift the rolling mean by 24h to simulate a D-1 forecast
+    forecast_proxy = np.zeros(n)
+    forecast_proxy[w24:] = rolling_mean[:-w24]
+    forecast_proxy[:w24] = rolling_mean[:w24]
+
+    forecast_error = prices - forecast_proxy
+
+    # I store the forecast error proxy as a column for analysis
+    df['dam_forecast_error_proxy'] = forecast_error
+
+    # I compute IDA1 corrections: proportional to error, with noise
+    ida1_raw = forecast_error * 0.15
+    ida1_raw[np.abs(forecast_error) < min_deviation_eur] = 0.0
+    ida1_noise = np.random.normal(0, 0.5, n)
+    ida1_corr = np.clip(ida1_raw + ida1_noise, -5.0, 5.0)
+
+    # I compute IDA2 corrections: smaller, lower threshold
+    ida2_raw = forecast_error * 0.10
+    ida2_raw[np.abs(forecast_error) < min_deviation_eur * 0.75] = 0.0
+    ida2_corr = np.clip(ida2_raw, -3.0, 3.0)
+
+    # I compute IDA3 corrections: smallest, only for hours >= 12
+    ida3_corr = np.zeros(n)
+    afternoon_mask = df.index.hour >= 12
+    ida3_raw = forecast_error * 0.05
+    ida3_raw[np.abs(forecast_error) < min_deviation_eur * 0.5] = 0.0
+    ida3_corr[afternoon_mask] = np.clip(ida3_raw[afternoon_mask], -2.0, 2.0)
+
+    # I enforce total position within +/-max_power_mw via proportional scaling
+    total = dam + ida1_corr + ida2_corr + ida3_corr
+    excess = np.abs(total) - max_power_mw
+    needs_scaling = excess > 0
+
+    if np.any(needs_scaling):
+        # I scale corrections proportionally where total exceeds limit
+        total_correction = ida1_corr + ida2_corr + ida3_corr
+        abs_total_corr = np.abs(total_correction)
+        abs_total_corr[abs_total_corr < 1e-6] = 1.0  # I avoid division by zero
+
+        scale_factor = np.ones(n)
+        scale_factor[needs_scaling] = (
+            (max_power_mw - np.abs(dam[needs_scaling])) /
+            np.maximum(abs_total_corr[needs_scaling], 1e-6)
+        )
+        scale_factor = np.clip(scale_factor, 0.0, 1.0)
+
+        ida1_corr *= scale_factor
+        ida2_corr *= scale_factor
+        ida3_corr *= scale_factor
+
+    df['ida1_position'] = ida1_corr
+    df['ida2_position'] = ida2_corr
+    df['ida3_position'] = ida3_corr
+    df['net_ida_position'] = ida1_corr + ida2_corr + ida3_corr
+    return df
+
+
 def _synthesize_free_bid_data(df, mask):
     """I synthesize Free Bid activation probability and reference price."""
     imbalance = df.loc[mask, 'net_imbalance_mw'].values
@@ -1815,6 +1915,10 @@ def main():
         '--use_day_ahead_forecaster', type=str, default=None,
         help='Path to trained DAMDayAheadForecaster for commitment generation'
     )
+    parser.add_argument(
+        '--forecast_driven_ida', action='store_true',
+        help='Use forecast-error-driven IDA positions instead of random noise'
+    )
     args = parser.parse_args()
 
     data_dir = Path(__file__).parent
@@ -1830,17 +1934,22 @@ def main():
             kwargs['forecaster_path'] = args.forecaster
         if args.use_day_ahead_forecaster:
             kwargs['use_day_ahead_forecaster'] = args.use_day_ahead_forecaster
+        kwargs['forecast_driven_ida'] = args.forecast_driven_ida
         unified_df = create_unified_dataset_v2(**kwargs)
     elif args.resolution == '15min':
         # I use the native 15-min pipeline
         print("Resolution: 15-min (native ADMIE)")
-        unified_df = create_unified_dataset_from_admie_15min()
+        unified_df = create_unified_dataset_from_admie_15min(
+            forecast_driven_ida=args.forecast_driven_ida
+        )
     else:
         # I use the standard hourly pipeline
         admie_path = data_dir / "admie_market_data_combined.csv"
         if admie_path.exists() and dam_path.exists():
             print("ADMIE data found - using real market data")
-            unified_df = create_unified_dataset_from_admie()
+            unified_df = create_unified_dataset_from_admie(
+                forecast_driven_ida=args.forecast_driven_ida
+            )
         else:
             print("ADMIE data not found - falling back to synthetic generation")
             print("=" * 60)

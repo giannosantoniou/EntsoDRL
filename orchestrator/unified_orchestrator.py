@@ -28,6 +28,13 @@ from orchestrator.interfaces import (
 )
 from agent.unified_strategy import UnifiedStrategy, create_unified_strategy
 
+# I use Optional import for PositionCorrector to avoid circular deps
+try:
+    from orchestrator.position_corrector import PositionCorrector, CorrectionResult
+except ImportError:
+    PositionCorrector = None
+    CorrectionResult = None
+
 
 class UnifiedOrchestrator(IUnifiedOrchestrator):
     """
@@ -52,6 +59,7 @@ class UnifiedOrchestrator(IUnifiedOrchestrator):
         dam_forecaster: Optional[IDAMForecaster] = None,
         dam_bidder: Optional[IDAMBidder] = None,
         commitment_executor: Optional[ICommitmentExecutor] = None,
+        position_corrector: Optional['PositionCorrector'] = None,
 
         # Battery configuration
         capacity_mwh: float = 146.0,
@@ -77,6 +85,11 @@ class UnifiedOrchestrator(IUnifiedOrchestrator):
         self.dam_forecaster = dam_forecaster
         self.dam_bidder = dam_bidder
         self.commitment_executor = commitment_executor
+        self.position_corrector = position_corrector
+
+        # I store original forecast for IDA correction cycles
+        self._original_forecast = None
+        self._original_commitment = None
 
         # I store battery configuration
         self.capacity_mwh = capacity_mwh
@@ -138,11 +151,73 @@ class UnifiedOrchestrator(IUnifiedOrchestrator):
 
         commitment = self.dam_bidder.generate_bids(forecast, battery_state, constraints)
 
+        # I store original forecast and commitment for IDA correction cycles
+        self._original_forecast = getattr(forecast, '_raw_forecast', None)
+        self._original_commitment = commitment.power_mw.copy() if commitment is not None else None
+
         # I load commitment for execution
         if self.commitment_executor is not None:
             self.commitment_executor.load_commitment(commitment)
 
         return commitment
+
+    def run_ida_correction(
+        self,
+        session: str,
+        current_time: datetime,
+        target_date: date,
+        df: pd.DataFrame,
+        serbia_24h: np.ndarray,
+        original_forecast: Dict[str, np.ndarray],
+        original_commitment: np.ndarray,
+        battery_state: Optional[BatteryState] = None,
+        sph: int = 1,
+        dam_actuals: Optional[np.ndarray] = None,
+        ida1_results: Optional[np.ndarray] = None,
+    ) -> Optional['CorrectionResult']:
+        """I trigger position correction before IDA gate closure.
+
+        Args:
+            session: 'IDA1', 'IDA2', or 'IDA3'
+            current_time: Current time (should be before gate closure)
+            target_date: Delivery date
+            df: Historical data DataFrame
+            serbia_24h: 24 hourly Serbia D+1 prices
+            original_forecast: Dict with 'hourly', 'p10', 'p90'
+            original_commitment: 24 hourly commitment values
+            battery_state: Current battery state (uses internal if None)
+            sph: Steps per hour
+            dam_actuals: Actual DAM prices (if known)
+            ida1_results: IDA1 clearing prices (for IDA2/IDA3)
+
+        Returns:
+            CorrectionResult or None if position corrector not configured
+        """
+        if self.position_corrector is None:
+            return None
+
+        if battery_state is None:
+            battery_state = BatteryState(
+                timestamp=current_time,
+                soc=self.current_soc,
+                available_power_mw=self.max_power_mw,
+                capacity_mwh=self.capacity_mwh
+            )
+
+        result = self.position_corrector.run_correction_cycle(
+            session=session,
+            target_date=target_date,
+            df=df,
+            serbia_24h=serbia_24h,
+            original_forecast=original_forecast,
+            original_commitment=original_commitment,
+            battery_state=battery_state,
+            sph=sph,
+            ida1_results=ida1_results,
+            dam_actuals=dam_actuals,
+        )
+
+        return result
 
     def run_realtime(self, timestamp: datetime) -> dict:
         """I run real-time unified trading."""
