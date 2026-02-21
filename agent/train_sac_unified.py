@@ -241,7 +241,7 @@ def train_sac_unified(
     data_path: str = "data/unified_multimarket_training_v2.csv",
     output_dir: str = "models/unified_sac",
     total_timesteps: int = 5_000_000,
-    n_envs: int = 1,  # SAC is off-policy; 1 env is standard
+    n_envs: int = 8,  # I use 8 parallel envs for faster buffer filling
     learning_rate: float = 3e-4,
     buffer_size: int = 2_000_000,
     learning_starts: int = 10_000,
@@ -746,8 +746,8 @@ if __name__ == "__main__":
                         help="Output directory")
     parser.add_argument("--timesteps", type=int, default=5_000_000,
                         help="Total training timesteps")
-    parser.add_argument("--n_envs", type=int, default=1,
-                        help="Number of parallel environments (default: 1 for SAC)")
+    parser.add_argument("--n_envs", type=int, default=8,
+                        help="Number of parallel environments (default: 8)")
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="Learning rate")
     parser.add_argument("--buffer-size", type=int, default=1_000_000,
