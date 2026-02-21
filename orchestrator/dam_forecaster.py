@@ -1,10 +1,11 @@
 """
-DAM Forecaster - Wrapper for EntsoE3 Price Forecasting
+DAM Forecaster - D+1 Price Forecasting for Greek DAM
 
-I connect to the EntsoE3 forecasting system and provide
-DAM price forecasts in the format required by the orchestrator.
+I provide DAM price forecasts using either:
+1. DAMDayAheadForecaster (LightGBM, trained on historical data)
+2. Serbia regression fallback (hourly linear regression)
 
-Output: 2 rows × 96 values (buy/sell prices at 15-min resolution)
+Output: PriceForecast with 96 values (24h x 4 quarters) at 15-min resolution
 """
 
 import sys
@@ -14,20 +15,16 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
 
-# Add EntsoE3 to path
-ENTSOE3_PATH = Path("D:/WSLUbuntu/EntsoE3")
-sys.path.insert(0, str(ENTSOE3_PATH / "src"))
-
 from .interfaces import IDAMForecaster, PriceForecast
 
 
 # Hourly regression parameters: Greek = slope * Serbia + intercept
-# Based on 6-month correlation analysis (R² varies 0.28-0.60 by hour)
+# Based on 6-month correlation analysis (R^2 varies 0.28-0.60 by hour)
 HOURLY_GR_RS_PARAMS = {
     0:  {'slope': 0.8649, 'intercept':  21.93},  # Night
     1:  {'slope': 0.6405, 'intercept':  38.62},
-    2:  {'slope': 0.6709, 'intercept':  33.56},  # Best R²=0.59
-    3:  {'slope': 0.6249, 'intercept':  35.26},  # Best R²=0.60
+    2:  {'slope': 0.6709, 'intercept':  33.56},  # Best R^2=0.59
+    3:  {'slope': 0.6249, 'intercept':  35.26},  # Best R^2=0.60
     4:  {'slope': 0.5040, 'intercept':  41.91},
     5:  {'slope': 0.4231, 'intercept':  43.88},  # Morning ramp starts
     6:  {'slope': 0.2152, 'intercept':  64.67},  # Low correlation
@@ -44,7 +41,7 @@ HOURLY_GR_RS_PARAMS = {
     17: {'slope': 0.4893, 'intercept':  37.96},
     18: {'slope': 0.3996, 'intercept':  74.02},  # Low correlation
     19: {'slope': 0.5689, 'intercept':  58.52},
-    20: {'slope': 1.3837, 'intercept': -25.64},  # Evening peak - GR spikes! Best R²=0.60
+    20: {'slope': 1.3837, 'intercept': -25.64},  # Evening peak - GR spikes!
     21: {'slope': 1.2570, 'intercept':   5.70},  # Evening peak
     22: {'slope': 0.9221, 'intercept':  29.32},
     23: {'slope': 0.7662, 'intercept':  43.76},
@@ -52,94 +49,104 @@ HOURLY_GR_RS_PARAMS = {
 
 
 class DAMForecaster(IDAMForecaster):
-    """DAM Price Forecaster using EntsoE3 models.
+    """DAM Price Forecaster backed by DAMDayAheadForecaster or Serbia regression.
 
     Key insight: Serbia DAM clears ~12:00, before Greek gate closure at 13:00.
-    We can use Serbia D+1 prices as a strong feature for Greek price prediction.
+    I use Serbia D+1 prices as a strong feature for Greek price prediction.
 
     Hourly patterns (from correlation analysis):
     - Solar hours (11-16h): Greek much cheaper than Serbia (more solar capacity)
     - Evening peak (20-21h): Greek spikes higher than Serbia
     - Night hours: Similar prices, good correlation
     """
-    """DAM Price Forecaster using EntsoE3 models.
-
-    I wrap the EntsoE3 forecasting system to provide:
-    - 96 buy prices (15-min resolution)
-    - 96 sell prices (15-min resolution)
-
-    The EntsoE3 model provides hourly forecasts, which I expand
-    to 15-min resolution for dispatch purposes.
-    """
 
     def __init__(
         self,
-        model_path: Optional[str] = None,
-        spread_percent: float = 0.02,  # 2% bid-ask spread
+        day_ahead_model_path: Optional[str] = None,
+        historical_df: Optional[pd.DataFrame] = None,
+        spread_percent: float = 0.02,
     ):
         """Initialize the forecaster.
 
         Args:
-            model_path: Path to trained model (default: EntsoE3 best model)
+            day_ahead_model_path: Path to trained DAMDayAheadForecaster pickle
+            historical_df: Historical Greek DAM DataFrame (for feature computation)
             spread_percent: Bid-ask spread as percentage of price
         """
-        self.model_path = model_path or str(ENTSOE3_PATH / "models" / "tft_v2_best.ckpt")
         self.spread_percent = spread_percent
-        self._model = None
-        self._feature_names = None
-        self._serbia_prices = None  # Cache for Serbia D+1 prices
+        self._day_ahead_forecaster = None
+        self._historical_df = historical_df
+        self._serbia_prices = None
 
-        print(f"DAM Forecaster initialized")
-        print(f"  Model: {self.model_path}")
-        print(f"  Spread: {spread_percent:.1%}")
+        if day_ahead_model_path is not None:
+            model_path = Path(day_ahead_model_path)
+            if model_path.exists():
+                try:
+                    from models.market_forecaster import DAMDayAheadForecaster
+                    self._day_ahead_forecaster = DAMDayAheadForecaster.load(str(model_path))
+                    print(f"DAM Forecaster: loaded DAMDayAheadForecaster from {model_path}")
+                except Exception as e:
+                    print(f"DAM Forecaster: could not load D+1 model ({e}), using regression fallback")
 
-    def _load_model(self):
-        """Lazy load the forecasting model."""
-        if self._model is not None:
-            return
+        print(f"DAM Forecaster initialized (spread={spread_percent:.1%})")
 
-        try:
-            from energy_forecasting.inference.model_loader import ModelLoader
-            loaded = ModelLoader.load(self.model_path)
-            self._model = loaded.model
-            self._feature_names = loaded.feature_names
-            print(f"  Loaded model with {len(self._feature_names)} features")
-        except (ImportError, AttributeError, Exception) as e:
-            print(f"  NOTE: EntsoE3 not available ({type(e).__name__}), using fallback")
-            self._model = "fallback"
-
-    def forecast(self, target_date: date) -> PriceForecast:
+    def forecast(
+        self,
+        target_date: date,
+        serbia_24h: Optional[np.ndarray] = None,
+    ) -> PriceForecast:
         """Generate price forecast for target date.
 
         Args:
             target_date: Date to forecast
+            serbia_24h: Optional 24 hourly Serbia D+1 prices
 
         Returns:
             PriceForecast with 96 buy/sell prices
         """
-        self._load_model()
-
-        # Generate 96 timestamps (15-min intervals)
+        # I generate 96 timestamps (15-min intervals)
         timestamps = []
         base_dt = datetime.combine(target_date, datetime.min.time())
         for i in range(96):
             timestamps.append(base_dt + timedelta(minutes=15 * i))
 
-        if self._model == "fallback":
-            # Fallback: Use typical daily pattern
-            prices = self._generate_fallback_forecast(target_date)
+        if serbia_24h is None:
+            serbia_24h = self.fetch_serbia_dam(target_date)
+
+        # I try DAMDayAheadForecaster first, then regression fallback
+        if (
+            self._day_ahead_forecaster is not None
+            and self._day_ahead_forecaster.is_trained
+            and self._historical_df is not None
+            and serbia_24h is not None
+            and len(serbia_24h) == 24
+        ):
+            sph = 1
+            if len(self._historical_df) > 1:
+                delta = (self._historical_df.index[1] - self._historical_df.index[0]).total_seconds()
+                sph = max(1, int(round(3600 / delta)))
+
+            # I find the day index in historical data
+            day_mask = self._historical_df.index.normalize() == pd.Timestamp(target_date)
+            day_indices = np.where(day_mask.values)[0] if hasattr(day_mask, 'values') else np.where(day_mask)[0]
+
+            if len(day_indices) > 0:
+                day_idx = day_indices[0]
+                result = self._day_ahead_forecaster.predict_96qh(
+                    self._historical_df, day_idx, serbia_24h, sph
+                )
+                prices_15min = result['qh']
+            else:
+                prices_15min = self._regression_forecast_96qh(target_date, serbia_24h)
+        elif serbia_24h is not None and len(serbia_24h) == 24:
+            prices_15min = self._regression_forecast_96qh(target_date, serbia_24h)
         else:
-            # Use EntsoE3 model
-            prices = self._generate_model_forecast(target_date)
+            prices_15min = np.repeat(self._generate_fallback_forecast(target_date), 4)
 
-        # Expand hourly to 15-min (repeat each hour 4 times)
-        prices_15min = np.repeat(prices, 4)
-
-        # Calculate buy/sell prices with spread
-        mid_price = prices_15min
-        half_spread = mid_price * self.spread_percent / 2
-        buy_prices = mid_price + half_spread   # Higher price to buy
-        sell_prices = mid_price - half_spread  # Lower price to sell
+        # I calculate buy/sell prices with spread
+        half_spread = prices_15min * self.spread_percent / 2
+        buy_prices = prices_15min + half_spread
+        sell_prices = prices_15min - half_spread
 
         return PriceForecast(
             target_date=target_date,
@@ -148,20 +155,29 @@ class DAMForecaster(IDAMForecaster):
             sell_prices=sell_prices,
         )
 
-    def _generate_model_forecast(self, target_date: date) -> np.ndarray:
-        """Generate forecast using EntsoE3 model."""
+    def _regression_forecast_96qh(
+        self,
+        target_date: date,
+        serbia_24h: np.ndarray,
+    ) -> np.ndarray:
+        """I generate 96 QH forecast using Serbia regression + cubic spline."""
+        hourly = np.zeros(24)
+        for h in range(24):
+            params = HOURLY_GR_RS_PARAMS[h]
+            hourly[h] = serbia_24h[h] * params['slope'] + params['intercept']
+        hourly = np.maximum(hourly, 0.0)
+
+        # I use cubic spline for smooth 96 QH expansion
         try:
-            from energy_forecasting.inference.forecaster import Forecaster
-            from energy_forecasting.inference.future_frame import FutureFrameGenerator
-
-            # This would need proper implementation with EntsoE3 pipeline
-            # For now, use fallback
-            print(f"  NOTE: Full EntsoE3 integration pending, using pattern-based forecast")
-            return self._generate_fallback_forecast(target_date)
-
-        except Exception as e:
-            print(f"  Model forecast error: {e}, using fallback")
-            return self._generate_fallback_forecast(target_date)
+            from scipy.interpolate import CubicSpline
+            hour_midpoints = np.arange(24) * 4 + 1.5
+            extended_x = np.concatenate([[-2.5], hour_midpoints, [97.5]])
+            extended_y = np.concatenate([[hourly[-1]], hourly, [hourly[0]]])
+            cs = CubicSpline(extended_x, extended_y, bc_type='not-a-knot')
+            qh = np.maximum(cs(np.arange(96)), 0.0)
+            return qh
+        except ImportError:
+            return np.repeat(hourly, 4)
 
     def fetch_serbia_dam(self, target_date: date) -> Optional[np.ndarray]:
         """Fetch Serbia DAM prices for D+1.

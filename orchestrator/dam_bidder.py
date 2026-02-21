@@ -11,8 +11,10 @@ while respecting cycle limits and SoC constraints.
 """
 
 import numpy as np
-from datetime import date, datetime
+import pandas as pd
+from datetime import date, datetime, timedelta
 from typing import Optional
+from pathlib import Path
 
 from .interfaces import (
     IDAMBidder,
@@ -42,6 +44,8 @@ class DAMBidder(IDAMBidder):
         buy_threshold_percentile: float = 25,   # Buy when price < 25th percentile
         sell_threshold_percentile: float = 75,  # Sell when price > 75th percentile
         min_spread_eur: float = 30.0,           # Minimum spread to trade
+        market_forecaster_path: Optional[str] = None,
+        day_ahead_forecaster: Optional[object] = None,
     ):
         self.max_power_mw = max_power_mw
         self.capacity_mwh = capacity_mwh
@@ -53,11 +57,30 @@ class DAMBidder(IDAMBidder):
         self.sell_threshold_pct = sell_threshold_percentile
         self.min_spread = min_spread_eur
 
+        # I store the DAMDayAheadForecaster for forecast_and_bid()
+        self.day_ahead_forecaster = day_ahead_forecaster
+
+        # I load MarketForecaster if path provided (Phase 4: enhanced DAM bidding)
+        self.market_forecaster = None
+        if market_forecaster_path is not None:
+            fc_path = Path(market_forecaster_path)
+            if fc_path.exists():
+                try:
+                    from models.market_forecaster import MarketForecaster
+                    self.market_forecaster = MarketForecaster.load(str(fc_path))
+                    print(f"  DAM Bidder: MarketForecaster loaded from {fc_path}")
+                except Exception as e:
+                    print(f"  DAM Bidder: Could not load MarketForecaster: {e}")
+
         print(f"DAM Bidder initialized")
         print(f"  Max power: {max_power_mw} MW, Capacity: {capacity_mwh} MWh")
         print(f"  Max daily cycles: {max_daily_cycles}")
         print(f"  Buy threshold: {buy_threshold_percentile}th percentile")
         print(f"  Sell threshold: {sell_threshold_percentile}th percentile")
+        if self.day_ahead_forecaster:
+            print(f"  Using DAMDayAheadForecaster for D+1 prediction")
+        if self.market_forecaster:
+            print(f"  Using MarketForecaster for enhanced price prediction")
 
     def generate_bids(
         self,
@@ -187,6 +210,67 @@ class DAMBidder(IDAMBidder):
             timestamps=forecast.timestamps,
             power_mw=power_mw,
         )
+
+    def forecast_and_bid(
+        self,
+        target_date: date,
+        df: pd.DataFrame,
+        serbia_24h: np.ndarray,
+        battery_state: BatteryState,
+        sph: int = 1,
+    ) -> tuple:
+        """I forecast D+1 prices and generate bids in one step.
+
+        Args:
+            target_date: The delivery date (D+1)
+            df: Historical Greek DAM DataFrame for feature computation
+            serbia_24h: 24 hourly Serbia D+1 prices
+            battery_state: Current battery state
+            sph: Steps per hour (1=hourly, 4=15-min)
+
+        Returns:
+            Tuple of (PriceForecast, DAMCommitment)
+        """
+        from .dam_forecaster import HOURLY_GR_RS_PARAMS
+
+        timestamps = []
+        base_dt = datetime.combine(target_date, datetime.min.time())
+        for i in range(96):
+            timestamps.append(base_dt + timedelta(minutes=15 * i))
+
+        # I find the day index in the historical data
+        day_mask = df.index.normalize() == pd.Timestamp(target_date)
+        day_indices = np.where(day_mask.values)[0] if hasattr(day_mask, 'values') else np.where(day_mask)[0]
+        day_idx = day_indices[0] if len(day_indices) > 0 else len(df) - 24 * sph
+
+        if (
+            self.day_ahead_forecaster is not None
+            and self.day_ahead_forecaster.is_trained
+        ):
+            result = self.day_ahead_forecaster.predict_96qh(df, day_idx, serbia_24h, sph)
+            prices_15min = result['qh']
+        else:
+            # I use Serbia regression fallback
+            hourly = np.zeros(24)
+            for h in range(24):
+                params = HOURLY_GR_RS_PARAMS.get(h, {'slope': 0.7, 'intercept': 20.0})
+                hourly[h] = max(0.0, params['slope'] * serbia_24h[h] + params['intercept'])
+            prices_15min = np.repeat(hourly, 4)
+
+        spread_pct = 0.02
+        half_spread = prices_15min * spread_pct / 2
+        buy_prices = prices_15min + half_spread
+        sell_prices = prices_15min - half_spread
+
+        forecast = PriceForecast(
+            target_date=target_date,
+            timestamps=timestamps,
+            buy_prices=buy_prices,
+            sell_prices=sell_prices,
+        )
+
+        commitment = self.generate_bids(forecast, battery_state)
+        return forecast, commitment
 
     def _validate_and_adjust(
         self,

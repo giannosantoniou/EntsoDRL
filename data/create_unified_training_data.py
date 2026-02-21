@@ -233,6 +233,495 @@ def create_unified_dataset_from_admie(
     return unified
 
 
+def create_unified_dataset_v2(
+    dam_path: str = 'dam_prices_2021_2026.csv',
+    admie_path: str = 'admie_market_data_combined_15min.csv',
+    isp_path: str = 'isp_clearing_prices.csv',
+    serbia_path: str = 'serbia_dam_historical.csv',
+    forecast_path_name: str = 'dam_forecasts_2024_2026.csv',
+    output_path: str = 'unified_multimarket_training_v2.csv',
+    add_forecasts: bool = True,
+    forecaster_path: str = None,
+    use_day_ahead_forecaster: str = None,
+) -> pd.DataFrame:
+    """
+    I create the v2 unified training dataset with:
+    1. Real ISP1/ISP2/ISP3 clearing prices (replacing synthetic IntraDay)
+    2. Serbia DAM prices aligned for cross-border signal
+    3. Pre-computed forecast columns (from MarketForecaster)
+    4. ISP cascade features (cross-session price evolution)
+
+    This is the enhanced pipeline for Phase 1-2 integration.
+    """
+    data_dir = Path(__file__).parent
+
+    print("=" * 60)
+    print("CREATING V2 UNIFIED DATASET (REAL ISP1/2/3 + FORECASTS)")
+    print("=" * 60)
+
+    # I first build the base dataset using the existing 15-min pipeline
+    base_df = _create_base_15min_dataset(
+        dam_path, admie_path, forecast_path_name, data_dir
+    )
+
+    # I merge real ISP clearing prices (all 3 sessions)
+    isp_filepath = data_dir / isp_path
+    isp1_legacy_path = data_dir / 'isp1_clearing_prices.csv'
+
+    if isp_filepath.exists():
+        print(f"\nMerging all ISP clearing prices from {isp_filepath}...")
+        base_df = _merge_all_isp_prices(base_df, isp_filepath)
+    elif isp1_legacy_path.exists():
+        # I fall back to ISP1-only if unified ISP file not yet generated
+        print(f"\n  Unified ISP file not found; falling back to ISP1 only...")
+        base_df = _merge_isp1_prices(base_df, isp1_legacy_path)
+    else:
+        print(f"\n  WARNING: No ISP data found!")
+        print("  Run: python data/parse_isp_prices.py")
+        print("  Falling back to synthetic IntraDay prices.")
+
+    # I merge Serbia DAM prices for cross-border signal
+    serbia_filepath = data_dir / serbia_path
+    if serbia_filepath.exists():
+        print(f"\nMerging Serbia DAM prices from {serbia_filepath}...")
+        base_df = _merge_serbia_dam(base_df, serbia_filepath)
+    else:
+        print(f"\n  WARNING: Serbia DAM data not found at {serbia_filepath}")
+
+    # I add forecast columns (Phase 2)
+    if add_forecasts:
+        base_df = _add_forecast_columns(base_df, data_dir, forecaster_path)
+
+    # I add derived features and validate
+    steps_per_hour = 4  # 15-min
+    base_df = _add_derived_features(base_df, steps_per_hour=steps_per_hour)
+    _validate_dataset(base_df)
+    _print_admie_vs_synthetic_stats(base_df)
+    _verify_15min_variability(base_df)
+
+    # I save
+    output_filepath = data_dir / output_path
+    base_df.to_csv(output_filepath)
+    print(f"\nSaved v2 unified dataset to {output_filepath}")
+    print(f"Dataset shape: {base_df.shape}")
+
+    sample_path = data_dir / "unified_multimarket_sample.csv"
+    base_df.head(100).to_csv(sample_path)
+
+    return base_df
+
+
+def _create_base_15min_dataset(dam_path, admie_path, forecast_path_name, data_dir):
+    """I create the base 15-min dataset (same logic as create_unified_dataset_from_admie_15min)."""
+    steps_per_hour = 4
+
+    dam_filepath = data_dir / dam_path
+    print(f"\nLoading DAM prices from {dam_filepath}...")
+    dam_df = pd.read_csv(dam_filepath, index_col=0)
+    dam_df.index = pd.to_datetime(dam_df.index, utc=True)
+    dam_df.index = dam_df.index.tz_convert('Europe/Athens')
+    dam_df.index = dam_df.index.tz_localize(None)
+    dam_df = dam_df.resample('h').mean().dropna()
+    dam_df.columns = ['price']
+    dam_df = dam_df.resample('15min').ffill()
+    print(f"  DAM: {len(dam_df)} rows at 15-min")
+
+    admie_filepath = data_dir / admie_path
+    if not admie_filepath.exists():
+        admie_filepath = data_dir / 'admie_market_data_combined.csv'
+    print(f"\nLoading ADMIE data from {admie_filepath}...")
+    admie_df = pd.read_csv(admie_filepath, parse_dates=['timestamp'])
+    admie_df = admie_df.set_index('timestamp')
+    if admie_df.index.tz is not None:
+        admie_df.index = admie_df.index.tz_localize(None)
+
+    if len(admie_df) > 2:
+        median_diff = admie_df.index.to_series().diff().median()
+        if median_diff > pd.Timedelta(minutes=20):
+            admie_df = admie_df.resample('15min').ffill()
+
+    unified = dam_df.join(admie_df, how='inner')
+    print(f"  Overlap: {len(unified)} rows")
+
+    # I apply column mapping (same as existing pipeline)
+    column_mapping = {
+        'mfrr_energy_price_up': 'mfrr_price_up',
+        'mfrr_energy_price_down': 'mfrr_price_down',
+        'afrr_price_up': 'afrr_cap_up_price',
+        'afrr_price_down': 'afrr_cap_down_price',
+        'afrr_requirements_up': 'afrr_cap_up_qty',
+        'afrr_requirements_down': 'afrr_cap_down_qty',
+        'system_load_mw': 'load_mw',
+        'res_production_mw': 'res_total_mw',
+        'system_deviation_mwh': 'net_imbalance_mw',
+    }
+    for col in ['mfrr_price_up', 'mfrr_price_down']:
+        if col in unified.columns:
+            unified = unified.rename(columns={col: f'mfrr_cap_{col.split("_", 1)[1]}'})
+    unified = unified.rename(columns=column_mapping)
+
+    if 'imbalance_price' in unified.columns:
+        unified['afrr_up'] = unified['imbalance_price']
+        unified['afrr_down'] = (unified['imbalance_price'] * 0.3).clip(lower=0)
+    else:
+        unified['afrr_up'] = 80.0
+        unified['afrr_down'] = 24.0
+
+    unified['mfrr_spread'] = unified['mfrr_price_up'] - unified['mfrr_price_down']
+
+    if 'res_total_mw' in unified.columns:
+        hours = unified.index.hour.values
+        solar_fraction = np.maximum(0, np.sin(np.pi * (hours - 5) / 13)) * 0.6
+        solar_fraction[hours < 6] = 0.0
+        solar_fraction[hours > 19] = 0.0
+        unified['solar'] = unified['res_total_mw'] * solar_fraction
+        unified['wind_onshore'] = unified['res_total_mw'] * (1 - solar_fraction)
+    else:
+        unified['solar'] = 0.0
+        unified['wind_onshore'] = 0.0
+
+    # I generate DAM commitments
+    _day_ahead_fc_used = False
+    if use_day_ahead_forecaster is not None:
+        from pathlib import Path as _P
+        daf_path = _P(use_day_ahead_forecaster)
+        if not daf_path.exists():
+            daf_path = data_dir.parent / use_day_ahead_forecaster
+        if daf_path.exists():
+            try:
+                from models.market_forecaster import DAMDayAheadForecaster
+                daf = DAMDayAheadForecaster.load(str(daf_path))
+                print(f"\n  Using DAMDayAheadForecaster from {daf_path} for commitments")
+                commitments = _generate_dam_commitments_with_day_ahead(
+                    unified, daf, data_dir / serbia_path, steps_per_hour
+                )
+                unified['dam_commitment'] = commitments
+                _day_ahead_fc_used = True
+            except Exception as e:
+                print(f"  WARNING: Could not use DAMDayAheadForecaster ({e}), falling back")
+
+    if not _day_ahead_fc_used:
+        forecast_path = data_dir / forecast_path_name
+        if forecast_path.exists():
+            hourly_index = unified.index[unified.index.minute == 0]
+            hourly_proxy = unified.loc[hourly_index].copy()
+            commitments_hourly = _generate_dam_commitments_from_forecasts(
+                hourly_proxy, forecast_path
+            )
+            commit_series = pd.Series(commitments_hourly, index=hourly_index, name='dam_commitment')
+            unified['dam_commitment'] = commit_series.reindex(unified.index).ffill().bfill()
+        else:
+            hourly_index = unified.index[unified.index.minute == 0]
+            hourly_proxy = unified.loc[hourly_index].copy()
+            commitments_hourly = _generate_dam_commitments(hourly_proxy)
+            commit_series = pd.Series(commitments_hourly, index=hourly_index, name='dam_commitment')
+            unified['dam_commitment'] = commit_series.reindex(unified.index).ffill().bfill()
+
+    # I add rolling stats before synthesizing IntraDay
+    w24 = 24 * steps_per_hour
+    unified['price_mean_24h'] = unified['price'].rolling(w24, min_periods=1).mean()
+    unified['price_std_24h'] = unified['price'].rolling(w24, min_periods=1).std().fillna(10)
+    unified['price_min_24h'] = unified['price'].rolling(w24, min_periods=1).min()
+    unified['price_max_24h'] = unified['price'].rolling(w24, min_periods=1).max()
+
+    # I synthesize IntraDay (will be replaced by ISP1 if available)
+    all_mask = pd.Series(True, index=unified.index)
+    unified = _synthesize_intraday_data(unified, all_mask, time_step_hours=0.25)
+
+    # I add IDA/XBID/FreeBid features for full-market mode
+    unified = _synthesize_ida_prices(unified, all_mask, time_step_hours=0.25)
+    unified = _generate_ida_positions(unified, max_power_mw=30.0)
+    unified = _synthesize_free_bid_data(unified, all_mask)
+
+    return unified
+
+
+def _merge_isp1_prices(df: pd.DataFrame, isp1_path: Path) -> pd.DataFrame:
+    """
+    I replace synthetic IntraDay prices with real ISP1 clearing prices.
+
+    Battery-economics convention (what the battery RECEIVES/PAYS):
+    - intraday_bid = isp1_price_up (sell-side: battery RECEIVES UP price)
+    - intraday_ask = isp1_price_down (buy-side: battery PAYS DOWN price)
+    - intraday_spread = bid - ask (positive = profitable to trade)
+    """
+    isp1 = pd.read_csv(isp1_path, index_col=0, parse_dates=True)
+
+    # I strip timezone if present
+    if isp1.index.tz is not None:
+        isp1.index = isp1.index.tz_localize(None)
+
+    # I find overlap
+    common_idx = df.index.intersection(isp1.index)
+    n_overlap = len(common_idx)
+    print(f"  ISP1 overlap: {n_overlap} rows ({n_overlap / len(df) * 100:.1f}% of dataset)")
+
+    if n_overlap == 0:
+        print("  WARNING: No ISP1 overlap found!")
+        return df
+
+    # I merge ISP1 columns into the main DataFrame
+    df['isp1_price_up'] = np.nan
+    df['isp1_price_down'] = np.nan
+    df.loc[common_idx, 'isp1_price_up'] = isp1.loc[common_idx, 'isp1_price_up'].values
+    df.loc[common_idx, 'isp1_price_down'] = isp1.loc[common_idx, 'isp1_price_down'].values
+
+    # I replace synthetic IntraDay where ISP1 is available
+    # Battery convention: bid = sell price (UP), ask = buy price (DOWN)
+    has_isp1 = df['isp1_price_up'].notna()
+    df.loc[has_isp1, 'intraday_bid'] = df.loc[has_isp1, 'isp1_price_up']
+    df.loc[has_isp1, 'intraday_ask'] = df.loc[has_isp1, 'isp1_price_down']
+    df.loc[has_isp1, 'intraday_spread'] = (
+        df.loc[has_isp1, 'intraday_bid'] - df.loc[has_isp1, 'intraday_ask']
+    )
+
+    # I forward-fill ISP1 columns for the small gaps
+    df['isp1_price_up'] = df['isp1_price_up'].ffill()
+    df['isp1_price_down'] = df['isp1_price_down'].ffill()
+
+    n_real = has_isp1.sum()
+    n_synthetic = (~has_isp1).sum()
+    print(f"  IntraDay sources: {n_real} real ISP1, {n_synthetic} synthetic")
+    print(f"  ISP1 Up (bid/sell):  mean={df.loc[has_isp1, 'intraday_bid'].mean():.2f}")
+    print(f"  ISP1 Down (ask/buy): mean={df.loc[has_isp1, 'intraday_ask'].mean():.2f}")
+    print(f"  Spread:    mean={df.loc[has_isp1, 'intraday_spread'].mean():.2f}")
+
+    return df
+
+
+def _merge_all_isp_prices(df: pd.DataFrame, isp_path: Path) -> pd.DataFrame:
+    """
+    I merge all ISP session clearing prices (ISP1 + ISP2 + ISP3) into the
+    training dataset. Each session provides a different price signal:
+
+    - ISP1: earliest session, furthest from delivery (most stable)
+    - ISP2: intermediate session, closer to delivery
+    - ISP3: final session, closest to real-time (most volatile)
+
+    I use ISP1 as the primary IntraDay price (intraday_bid/ask) with
+    battery-economics convention (bid=sell=UP, ask=buy=DOWN), and add
+    ISP2/ISP3 as additional features plus cross-ISP cascade spreads.
+    """
+    isp = pd.read_csv(isp_path, index_col=0, parse_dates=True)
+
+    if isp.index.tz is not None:
+        isp.index = isp.index.tz_localize(None)
+
+    common_idx = df.index.intersection(isp.index)
+    n_overlap = len(common_idx)
+    print(f"  ISP overlap: {n_overlap} rows ({n_overlap / len(df) * 100:.1f}% of dataset)")
+
+    if n_overlap == 0:
+        print("  WARNING: No ISP overlap found!")
+        return df
+
+    # I merge all ISP columns into the main DataFrame
+    isp_cols = isp.columns.tolist()
+    for col in isp_cols:
+        df[col] = np.nan
+        df.loc[common_idx, col] = isp.loc[common_idx, col].values
+
+    # I replace synthetic IntraDay with ISP1 prices where available
+    # Battery convention: bid = sell price (UP), ask = buy price (DOWN)
+    has_isp1 = False
+    if 'isp1_price_up' in df.columns:
+        has_isp1_mask = df['isp1_price_up'].notna()
+        df.loc[has_isp1_mask, 'intraday_bid'] = df.loc[has_isp1_mask, 'isp1_price_up']
+        df.loc[has_isp1_mask, 'intraday_ask'] = df.loc[has_isp1_mask, 'isp1_price_down']
+        df.loc[has_isp1_mask, 'intraday_spread'] = (
+            df.loc[has_isp1_mask, 'intraday_bid'] - df.loc[has_isp1_mask, 'intraday_ask']
+        )
+        has_isp1 = True
+
+        n_real = has_isp1_mask.sum()
+        n_synthetic = (~has_isp1_mask).sum()
+        print(f"  IntraDay sources: {n_real} real ISP1, {n_synthetic} synthetic")
+        print(f"  ISP1 Up (bid/sell):  mean={df.loc[has_isp1_mask, 'intraday_bid'].mean():.2f}")
+        print(f"  ISP1 Down (ask/buy): mean={df.loc[has_isp1_mask, 'intraday_ask'].mean():.2f}")
+
+    # I report coverage per ISP session
+    for isp_num in [1, 2, 3]:
+        col = f'isp{isp_num}_price_up'
+        if col in df.columns:
+            coverage = df[col].notna().sum()
+            print(f"  ISP{isp_num}: {coverage:,} rows ({coverage / len(df) * 100:.1f}%)")
+
+    # I report cascade spread statistics where all 3 ISPs are available
+    if 'isp_cascade_spread_up' in df.columns:
+        valid = df['isp_cascade_spread_up'].dropna()
+        if len(valid) > 0:
+            print(f"  Cascade spread (ISP3-ISP1) Up: "
+                  f"mean={valid.mean():.2f}, std={valid.std():.2f}")
+
+    # I forward-fill small gaps
+    for col in isp_cols:
+        if col in df.columns:
+            df[col] = df[col].ffill()
+
+    return df
+
+
+def _merge_serbia_dam(df: pd.DataFrame, serbia_path: Path) -> pd.DataFrame:
+    """I merge Serbia DAM prices aligned by hour for cross-border signal."""
+    serbia = pd.read_csv(serbia_path, index_col=0, parse_dates=True)
+
+    # I ensure the index is a proper DatetimeIndex (pandas may fail to
+    # auto-parse when the full file has mixed-offset timestamps)
+    if not isinstance(serbia.index, pd.DatetimeIndex):
+        serbia.index = pd.to_datetime(serbia.index, utc=True)
+
+    # I strip timezone
+    if serbia.index.tz is not None:
+        serbia.index = serbia.index.tz_convert('Europe/Athens').tz_localize(None)
+    else:
+        serbia.index = serbia.index.tz_localize(None)
+
+    # I drop duplicate timestamps (DST transitions can create duplicates)
+    serbia = serbia[~serbia.index.duplicated(keep='first')]
+
+    # I upsample Serbia (hourly) to 15-min for alignment
+    serbia = serbia.resample('15min').ffill()
+
+    # I join
+    common = df.index.intersection(serbia.index)
+    print(f"  Serbia DAM overlap: {len(common)} rows")
+
+    df['serbia_dam_price'] = np.nan
+    if len(common) > 0:
+        df.loc[common, 'serbia_dam_price'] = serbia.loc[common, 'price'].values
+
+    # I forward-fill gaps
+    df['serbia_dam_price'] = df['serbia_dam_price'].ffill().bfill()
+
+    # I compute forecast error (actual - persistence forecast = actual GR - Serbia regression)
+    # This helps the agent understand forecast quality
+    for hour in range(24):
+        hour_mask = df.index.hour == hour
+        params = {
+            0: 0.86, 1: 0.64, 2: 0.71, 3: 0.78, 4: 0.75, 5: 0.30,
+            6: 0.21, 7: 0.30, 8: 0.94, 9: 0.88, 10: 0.84, 11: 0.56,
+            12: 0.55, 13: 0.52, 14: 0.56, 15: 0.38, 16: 0.45, 17: 0.48,
+            18: 0.44, 19: 0.47, 20: 1.28, 21: 1.38, 22: 0.93, 23: 0.76
+        }
+        intercepts = {
+            0: 11.2, 1: 20.5, 2: 16.8, 3: 13.2, 4: 15.9, 5: 42.0,
+            6: 49.1, 7: 44.7, 8: 8.5, 9: 6.0, 10: 3.0, 11: 9.1,
+            12: 8.3, 13: 12.9, 14: 13.4, 15: 32.0, 16: 32.2, 17: 38.2,
+            18: 47.7, 19: 49.3, 20: -5.1, 21: -20.1, 22: 0.4, 23: 12.7
+        }
+        slope = params.get(hour, 0.7)
+        intercept = intercepts.get(hour, 20.0)
+        serbia_vals = df.loc[hour_mask, 'serbia_dam_price']
+        predicted = slope * serbia_vals + intercept
+        actual = df.loc[hour_mask, 'price']
+        if 'dam_forecast_error' not in df.columns:
+            df['dam_forecast_error'] = 0.0
+        df.loc[hour_mask, 'dam_forecast_error'] = actual - predicted
+
+    print(f"  Serbia DAM: mean={df['serbia_dam_price'].mean():.2f}")
+    print(f"  Forecast error: mean={df['dam_forecast_error'].mean():.2f}, "
+          f"MAE={df['dam_forecast_error'].abs().mean():.2f}")
+
+    return df
+
+
+def _add_forecast_columns(
+    df: pd.DataFrame,
+    data_dir: Path,
+    forecaster_path: str = None
+) -> pd.DataFrame:
+    """
+    I add pre-computed forecast columns to the training data.
+
+    If a trained MarketForecaster exists, I use it in batch mode.
+    Otherwise, I compute simple heuristic forecasts.
+    """
+    print("\nAdding forecast columns...")
+
+    forecaster = None
+    if forecaster_path is not None:
+        fc_path = Path(forecaster_path)
+        if not fc_path.exists():
+            fc_path = data_dir.parent / forecaster_path
+        if fc_path.exists():
+            try:
+                from models.market_forecaster import MarketForecaster
+                forecaster = MarketForecaster.load(str(fc_path))
+                print(f"  Loaded MarketForecaster from {fc_path}")
+            except Exception as e:
+                print(f"  WARNING: Could not load forecaster: {e}")
+
+    if forecaster is not None:
+        # I run batch prediction
+        print("  Running batch forecast (this may take a few minutes)...")
+        forecast_df = forecaster.batch_predict(df, verbose=True)
+        for col in forecast_df.columns:
+            df[col] = forecast_df[col].values
+    else:
+        # I compute heuristic forecast columns
+        print("  Using heuristic forecasts (no trained MarketForecaster)")
+        sph = 4  # 15-min
+
+        # I compute DAM forecast features from rolling statistics
+        w4h = 4 * sph
+        df['dam_forecast_next_4h_mean'] = df['price'].rolling(w4h, min_periods=1).mean().shift(-w4h)
+        df['dam_forecast_next_4h_max'] = df['price'].rolling(w4h, min_periods=1).max().shift(-w4h)
+        df['dam_forecast_next_4h_min'] = df['price'].rolling(w4h, min_periods=1).min().shift(-w4h)
+
+        # I back-fill the future-looking columns (they'll have NaN at the tail)
+        for col in ['dam_forecast_next_4h_mean', 'dam_forecast_next_4h_max', 'dam_forecast_next_4h_min']:
+            df[col] = df[col].bfill()
+
+        df['dam_forecast_spread'] = df['dam_forecast_next_4h_max'] - df['dam_forecast_next_4h_min']
+        df['dam_forecast_vs_current'] = df['dam_forecast_next_4h_mean'] - df['price']
+
+        # I use IntraDay prices shifted as "forecasts"
+        df['id_forecast_1h'] = df['intraday_ask'].shift(-1 * sph).bfill()
+        df['id_forecast_2h'] = df['intraday_ask'].shift(-2 * sph).bfill()
+        df['id_forecast_4h'] = df['intraday_ask'].shift(-4 * sph).bfill()
+        df['id_forecast_8h'] = df['intraday_ask'].shift(-8 * sph).bfill()
+
+        # I add noise to prevent data leakage from perfect future knowledge
+        for col in ['dam_forecast_next_4h_mean', 'dam_forecast_next_4h_max',
+                     'dam_forecast_next_4h_min', 'id_forecast_1h', 'id_forecast_2h',
+                     'id_forecast_4h', 'id_forecast_8h']:
+            noise = np.random.normal(0, df[col].std() * 0.15, len(df))
+            df[col] = df[col] + noise
+
+        # I compute imbalance forecast from recent history
+        if 'net_imbalance_mw' in df.columns:
+            w4h = 4 * sph
+            avg_imb = df['net_imbalance_mw'].rolling(w4h, min_periods=1).mean()
+            df['imbalance_forecast_dir'] = np.sign(avg_imb)
+            df['imbalance_forecast_mag'] = avg_imb.abs()
+        else:
+            df['imbalance_forecast_dir'] = 0.0
+            df['imbalance_forecast_mag'] = 0.0
+
+        # I compute mFRR opportunity score
+        if 'mfrr_spread' in df.columns:
+            df['mfrr_opportunity_score'] = np.clip(df['mfrr_spread'] / 500.0, 0, 1)
+        else:
+            df['mfrr_opportunity_score'] = 0.0
+
+        # I compute forecast confidence (inversely proportional to price volatility)
+        df['forecast_confidence'] = 1.0 / (1.0 + df['price_std_24h'] / 20.0)
+
+        # I compute timing signals
+        df['hours_to_dam_peak'] = 12.0  # I use default (will be refined by forecaster)
+        df['hours_to_dam_trough'] = 6.0
+
+    # I ensure no NaN in forecast columns
+    forecast_cols = [c for c in df.columns if 'forecast' in c or 'opportunity' in c or 'hours_to_dam' in c]
+    for col in forecast_cols:
+        df[col] = df[col].ffill().bfill().fillna(0.0)
+
+    n_fc = len(forecast_cols)
+    print(f"  Added {n_fc} forecast columns")
+
+    return df
+
+
 def create_unified_dataset_from_admie_15min(
     dam_path: str = 'dam_prices_2021_2026.csv',
     admie_path: str = 'admie_market_data_combined_15min.csv',
@@ -654,6 +1143,111 @@ def _synthesize_balancing_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFram
     df.loc[mask, 'load_mw'] = 5000 + 2000 * np.sin(2 * np.pi * hours / 24) + np.random.normal(0, 200, n)
 
     return df
+
+
+def _generate_dam_commitments_with_day_ahead(
+    df: pd.DataFrame,
+    forecaster,
+    serbia_path,
+    sph: int = 4,
+) -> np.ndarray:
+    """
+    I generate DAM commitments using the trained DAMDayAheadForecaster.
+
+    This produces more realistic commitments because the forecaster's errors
+    match what production sees (vs using the static CSV forecasts).
+    """
+    max_power_mw = 30.0
+    commitments = np.zeros(len(df))
+
+    # I load Serbia data for feature computation
+    serbia_df = pd.read_csv(serbia_path, index_col=0, parse_dates=True)
+    if 'price' not in serbia_df.columns:
+        price_cols = [c for c in serbia_df.columns if 'price' in c.lower()]
+        if price_cols:
+            serbia_df['price'] = serbia_df[price_cols[0]]
+        else:
+            print("    WARNING: No price column in Serbia data, falling back")
+            return commitments
+
+    dates = df.index.normalize().unique()
+    n_active_days = 0
+
+    for day_date in dates:
+        day_mask = df.index.normalize() == day_date
+        day_indices = np.where(day_mask)[0]
+        n_steps = len(day_indices)
+
+        if n_steps < 24 * sph:
+            continue
+
+        day_idx = day_indices[0]
+        if day_idx < 7 * 24 * sph:
+            continue
+
+        # I get Serbia D+1 prices for this day
+        serbia_day = serbia_df.loc[serbia_df.index.normalize() == day_date, 'price']
+        if len(serbia_day) < 24:
+            continue
+
+        serbia_24h = np.zeros(24)
+        for h in range(24):
+            hour_mask = serbia_day.index.hour == h
+            hour_vals = serbia_day[hour_mask].values
+            if len(hour_vals) > 0:
+                serbia_24h[h] = hour_vals[0]
+            else:
+                serbia_24h[h] = serbia_day.mean()
+
+        # I skip ~10% of days randomly (maintenance)
+        if np.random.random() < 0.10:
+            continue
+
+        # I predict D+1 prices
+        result = forecaster.predict_day(df, day_idx, serbia_24h, sph)
+        forecast_prices = result['hourly']
+
+        daily_spread = np.max(forecast_prices) - np.min(forecast_prices)
+        if daily_spread < 15.0:
+            continue
+
+        # I rank hours by forecasted price
+        price_rank = np.argsort(np.argsort(forecast_prices))
+        n_trade = min(5, 24 // 4)
+        charge_threshold = n_trade
+        discharge_threshold = 24 - n_trade
+
+        spread_factor = np.clip(daily_spread / 80.0, 0.4, 1.0)
+        base_power = max_power_mw * spread_factor
+
+        day_commitments = np.zeros(n_steps)
+        for i in range(min(n_steps, 24 * sph)):
+            hour = i // sph
+            if hour >= 24:
+                break
+            if price_rank[hour] < charge_threshold:
+                day_commitments[i] = -base_power * np.random.uniform(0.6, 1.0)
+            elif price_rank[hour] >= discharge_threshold:
+                day_commitments[i] = base_power * np.random.uniform(0.6, 1.0)
+
+        # I ensure energy balance feasibility
+        total_charge = abs(day_commitments[day_commitments < 0].sum())
+        total_discharge = day_commitments[day_commitments > 0].sum()
+        if total_charge < total_discharge * 1.1:
+            scale = total_charge / (total_discharge * 1.1 + 1e-6)
+            day_commitments[day_commitments > 0] *= scale
+
+        commitments[day_mask] = day_commitments[:n_steps]
+        n_active_days += 1
+
+    commitments = np.clip(commitments, -max_power_mw, max_power_mw)
+    n_active = np.sum(np.abs(commitments) > 0.1)
+    n_charge = np.sum(commitments < -0.1)
+    n_discharge = np.sum(commitments > 0.1)
+    print(f"    DAM commitments (D+1 forecaster): {n_active} active steps "
+          f"({n_charge} charge, {n_discharge} discharge) across {n_active_days} days")
+
+    return commitments
 
 
 def _generate_dam_commitments_from_forecasts(
@@ -1205,12 +1799,39 @@ def main():
         choices=['1h', '15min'],
         help='Time resolution: 1h (default) or 15min (native ADMIE)'
     )
+    parser.add_argument(
+        '--v2', action='store_true',
+        help='Create v2 dataset with real ISP1/2/3 + Serbia DAM + forecast columns'
+    )
+    parser.add_argument(
+        '--output', type=str, default=None,
+        help='Custom output path'
+    )
+    parser.add_argument(
+        '--forecaster', type=str, default=None,
+        help='Path to trained MarketForecaster for pre-computing forecasts'
+    )
+    parser.add_argument(
+        '--use_day_ahead_forecaster', type=str, default=None,
+        help='Path to trained DAMDayAheadForecaster for commitment generation'
+    )
     args = parser.parse_args()
 
     data_dir = Path(__file__).parent
     dam_path = data_dir / "dam_prices_2021_2026.csv"
 
-    if args.resolution == '15min':
+    if args.v2:
+        # I use the v2 pipeline (real ISP1/2/3 + Serbia DAM + forecasts)
+        print("Creating V2 dataset (real ISP1/2/3 + forecasts)")
+        kwargs = {}
+        if args.output:
+            kwargs['output_path'] = args.output
+        if args.forecaster:
+            kwargs['forecaster_path'] = args.forecaster
+        if args.use_day_ahead_forecaster:
+            kwargs['use_day_ahead_forecaster'] = args.use_day_ahead_forecaster
+        unified_df = create_unified_dataset_v2(**kwargs)
+    elif args.resolution == '15min':
         # I use the native 15-min pipeline
         print("Resolution: 15-min (native ADMIE)")
         unified_df = create_unified_dataset_from_admie_15min()
