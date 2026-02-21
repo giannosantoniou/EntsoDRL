@@ -20,7 +20,8 @@ Action Space: MultiDiscrete([5, 5, 11, 11]) = 3,025 combinations
 - [2] IntraDay Action: 11 levels (-1.0 to +1.0) × remaining capacity after aFRR
 - [3] mFRR Action: 11 levels (-1.0 to +1.0) × remaining capacity after IntraDay
 
-Observation Space: 63 features (see _build_observation for details)
+Observation Space: 64-100 features (see _build_observation for details)
+  Base: 64 | +forecast: 9 | +market_forecast: 20 | +full_market: 12
 """
 
 import gymnasium as gym
@@ -55,7 +56,10 @@ class BatteryEnvUnified(gym.Env):
     AFRR_PRICE_TIERS = np.array([0.7, 0.85, 1.0, 1.15, 1.3])  # 5 tiers
 
     # I define separate IntraDay and mFRR action levels (~6 MW granularity per level)
-    INTRADAY_LEVELS = np.linspace(-1.0, 1.0, 11)  # 11 levels
+    # I widen the no-trade dead zone: 3 center actions (4,5,6) all map to 0.0
+    # This gives 27% base no-trade probability instead of 9%, helping the agent
+    # learn that IntraDay trades are only profitable when volatility > spread
+    INTRADAY_LEVELS = np.array([-1.0, -0.75, -0.5, -0.25, 0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0])
     MFRR_LEVELS = np.linspace(-1.0, 1.0, 11)  # 11 levels
     N_INTRADAY_ACTIONS = 11
     N_MFRR_ACTIONS = 11
@@ -84,8 +88,10 @@ class BatteryEnvUnified(gym.Env):
         peak_activation_boost: float = 1.3,  # Higher activation during peak hours
         high_imbalance_boost: float = 1.5,  # Higher activation during system stress
 
-        # mFRR direction constraint
+        # mFRR parameters
         mfrr_imbalance_threshold: float = 30.0,  # MW minimum |imbalance| for mFRR
+        mfrr_activation_rate: float = 0.35,  # Probability of mFRR bid acceptance (35%)
+        mfrr_price_cap: float = 500.0,  # EUR/MWh cap on mFRR settlement price
 
         # Cycling limits
         max_daily_cycles: float = 2.0,
@@ -102,12 +108,53 @@ class BatteryEnvUnified(gym.Env):
         random_start: bool = True,
 
         # Full market mode (IDA1/2/3/XBID + Free Bids)
-        enable_full_market: bool = False
+        enable_full_market: bool = False,
+
+        # IntraDay forecast features
+        enable_forecast: bool = False,
+        forecaster_path: str = "models/intraday_forecaster.pkl",
+        forecast_noise: bool = True,
+
+        # Market forecast features (Phase 3: DAM+ID+Imbalance)
+        enable_market_forecast: bool = False,
+        market_forecaster_path: str = "models/market_forecaster.pkl",
+
+        # Endogenous DAM (Phase 4: agent-decided commitments)
+        enable_endogenous_dam: bool = False,
+        dam_bidder_min_spread: float = 30.0,
     ):
         super().__init__()
 
         # I store full market mode flag
         self.enable_full_market = enable_full_market
+
+        # I store forecast configuration
+        self.enable_forecast = enable_forecast
+        self.forecast_noise = forecast_noise
+        self.price_forecaster = None
+        self._res_mean_24h = None
+        if enable_forecast:
+            try:
+                from models.intraday_forecaster import IntraDayForecaster
+                self.price_forecaster = IntraDayForecaster.load(forecaster_path)
+            except Exception as e:
+                print(f"  Warning: Forecaster not loaded: {e}. Using persistence.")
+
+        # I store market forecast configuration (Phase 3)
+        self.enable_market_forecast = enable_market_forecast
+        self.market_forecaster = None
+        if enable_market_forecast:
+            try:
+                from models.market_forecaster import MarketForecaster
+                self.market_forecaster = MarketForecaster.load(market_forecaster_path)
+                print(f"  MarketForecaster loaded from {market_forecaster_path}")
+            except Exception as e:
+                print(f"  Warning: MarketForecaster not loaded: {e}. Using pre-computed columns.")
+
+        # I store endogenous DAM configuration (Phase 4)
+        self.enable_endogenous_dam = enable_endogenous_dam
+        self.dam_bidder_min_spread = dam_bidder_min_spread
+        self.dam_schedule = None  # I store the 24h schedule generated at episode reset
 
         # I store configuration
         self.df = df.copy()
@@ -128,8 +175,10 @@ class BatteryEnvUnified(gym.Env):
         self.peak_activation_boost = peak_activation_boost
         self.high_imbalance_boost = high_imbalance_boost
 
-        # mFRR direction constraint
+        # mFRR parameters
         self.mfrr_imbalance_threshold = mfrr_imbalance_threshold
+        self.mfrr_activation_rate = mfrr_activation_rate
+        self.mfrr_price_cap = mfrr_price_cap
 
         # Cycling
         self.max_daily_cycles = max_daily_cycles
@@ -138,10 +187,10 @@ class BatteryEnvUnified(gym.Env):
         # Reward calculator
         self.reward_config = reward_config or {}
         self.reward_calculator = UnifiedRewardCalculator(
-            degradation_cost_per_mwh=self.reward_config.get('degradation_cost', 15.0),
-            dam_violation_penalty=self.reward_config.get('dam_violation_penalty', 1500.0),
-            afrr_nonresponse_penalty=self.reward_config.get('afrr_nonresponse_penalty', 2000.0),
-            reward_scale=self.reward_config.get('reward_scale', 0.001)
+            degradation_cost_per_mwh=self.reward_config.get('degradation_cost', 5.0),
+            dam_violation_penalty=self.reward_config.get('dam_violation_penalty', 800.0),
+            afrr_nonresponse_penalty=self.reward_config.get('afrr_nonresponse_penalty', 500.0),
+            reward_scale=self.reward_config.get('reward_scale', 0.01)
         )
 
         # Feature configuration
@@ -167,7 +216,13 @@ class BatteryEnvUnified(gym.Env):
         print(f"  Action Space: MultiDiscrete({list(self.action_space.nvec)}) = {np.prod(self.action_space.nvec)} combos")
         print(f"  Observation Space: {self.observation_space.shape[0]} features")
         print(f"  aFRR: selection={selection_probability:.0%}, activation={afrr_activation_rate:.0%}")
-        print(f"  mFRR: imbalance_threshold={mfrr_imbalance_threshold:.0f} MW (direction-constrained)")
+        print(f"  mFRR: threshold={mfrr_imbalance_threshold:.0f} MW, activation={mfrr_activation_rate:.0%}, price_cap={mfrr_price_cap:.0f} EUR/MWh")
+        if enable_forecast:
+            print(f"  Forecast: IntraDay LightGBM ({forecaster_path})")
+        if enable_market_forecast:
+            print(f"  MarketForecast: DAM+ID+Imbalance (+15 obs features)")
+        if enable_endogenous_dam:
+            print(f"  Endogenous DAM: agent-decided commitments (min_spread={dam_bidder_min_spread} EUR)")
         days = len(self.df) * self.time_step_hours / 24
         print(f"  Data: {len(self.df)} steps ({days:.0f} days, {self.time_step_hours*60:.0f}-min resolution)")
 
@@ -212,6 +267,18 @@ class BatteryEnvUnified(gym.Env):
             if col not in df.columns:
                 df[col] = default() if callable(default) else default
 
+        # I reconstruct net_imbalance_mw from activated balancing energy when
+        # the column exists but is all-zero (data pipeline gap before Sep 2025).
+        # net_balancing_energy_mwh is the net activated energy (up - down) published
+        # by ADMIE ex-post; it correlates perfectly with real-time system imbalance
+        # and is available for every ISP in the training period.
+        imb = df['net_imbalance_mw']
+        if imb.abs().max() < 1.0 and 'net_balancing_energy_mwh' in df.columns:
+            df['net_imbalance_mw'] = df['net_balancing_energy_mwh']
+            n_active = (df['net_imbalance_mw'].abs() > self.mfrr_imbalance_threshold).sum()
+            print(f"  Reconstructed net_imbalance_mw from net_balancing_energy_mwh "
+                  f"({n_active}/{len(df)} rows exceed {self.mfrr_imbalance_threshold} MW threshold)")
+
         # I add time features if missing
         if 'hour' not in df.columns:
             df['hour'] = df.index.hour
@@ -250,6 +317,17 @@ class BatteryEnvUnified(gym.Env):
         if 'afrr_cap_percentile' not in df.columns:
             df['afrr_cap_percentile'] = df['afrr_cap_up_price'].rolling(w168, min_periods=w24).rank(pct=True).fillna(0.5)
 
+        # I pre-compute RES 24h rolling mean for forecast deviation feature
+        if self.enable_forecast:
+            w24 = 24 * self._sph
+            if 'res_total_mw' in df.columns:
+                self._res_mean_24h = df['res_total_mw'].rolling(w24, min_periods=1).mean().values
+            elif 'solar' in df.columns and 'wind_onshore' in df.columns:
+                res = df['solar'].fillna(0) + df['wind_onshore'].fillna(0)
+                self._res_mean_24h = res.rolling(w24, min_periods=1).mean().values
+            else:
+                self._res_mean_24h = None
+
         # I fill NaN values
         df = df.fillna(method='ffill').fillna(method='bfill')
         self.df = df
@@ -269,7 +347,6 @@ class BatteryEnvUnified(gym.Env):
                 self.N_MFRR_ACTIONS,            # 11 Balancing qty actions
                 self.N_FREEBID_PRICE_TIERS      # 5 Free Bid price tiers
             ])
-            n_obs = 75
         else:
             # I use legacy 4-dim action space
             self.action_space = spaces.MultiDiscrete([
@@ -278,7 +355,15 @@ class BatteryEnvUnified(gym.Env):
                 self.N_INTRADAY_ACTIONS,    # 11 IntraDay actions
                 self.N_MFRR_ACTIONS         # 11 mFRR actions
             ])
-            n_obs = 63
+
+        # I compute dynamic observation size based on enabled feature groups
+        n_obs = 64  # Base features (Groups 1-9) + cycles_remaining
+        if self.enable_forecast:
+            n_obs += 9   # IntraDay forecast + RES fundamentals
+        if self.enable_market_forecast:
+            n_obs += 20  # DAM+ID+Imbalance forecast + ISP cascade features (Group 10b)
+        if self.enable_full_market:
+            n_obs += 12  # IDA/XBID/FreeBid features
 
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(n_obs,), dtype=np.float32
@@ -292,6 +377,11 @@ class BatteryEnvUnified(gym.Env):
         self.afrr_commitment_level = 0  # Index into AFRR_LEVELS
         self.is_selected_for_afrr = False
         self.steps_since_afrr_activation = 24 * self._sph  # Start with no recent activation
+
+        # I lock aFRR commitment for 4-hour blocks (6 blocks/day) per real market rules.
+        # The agent can only change commitment at block boundaries (00:00, 04:00, 08:00, 12:00, 16:00, 20:00).
+        self._afrr_block_steps = 4 * self._sph  # 4 hours * steps_per_hour
+        self._afrr_steps_remaining = 0  # Steps until next re-commitment allowed
 
         # I track profits by market
         self.total_profit = 0.0
@@ -337,6 +427,10 @@ class BatteryEnvUnified(gym.Env):
         self.episode_start_step = self.current_step
         self.current_day = self._get_current_day()
 
+        # I generate endogenous DAM schedule if enabled (Phase 4)
+        if self.enable_endogenous_dam:
+            self.dam_schedule = self._generate_endogenous_dam_schedule()
+
         obs = self._build_observation()
         info = self._get_info()
 
@@ -364,7 +458,8 @@ class BatteryEnvUnified(gym.Env):
         row = self.df.iloc[self.current_step]
 
         # I get current DAM commitment (consumes capacity)
-        dam_commitment = row.get('dam_commitment', 0.0)
+        # I use endogenous schedule when available (Phase 4)
+        dam_commitment = self._get_dam_commitment(self.current_step)
         dam_commitment = np.clip(dam_commitment, -self.max_power_mw, self.max_power_mw)
 
         # I calculate remaining capacity after DAM
@@ -400,49 +495,101 @@ class BatteryEnvUnified(gym.Env):
                 afrr_mask[i] = False
         afrr_mask[0] = True  # Always allow zero commitment
 
+        # I subtract aFRR commitment to prevent cross-market over-commitment.
+        # Without this, the agent can commit 100% aFRR AND max IntraDay AND max
+        # mFRR simultaneously — all pass masking individually but together exceed
+        # physical limits, draining the battery in 3 hours.
+        remaining_for_trading = max(0, remaining_capacity - self.afrr_commitment_mw)
+        # I also reduce SoC-based limits to reserve energy for aFRR activation
+        afrr_energy_reserve = self.afrr_commitment_mw * self.time_step_hours
+        adjusted_max_discharge = min(
+            remaining_for_trading,
+            max(0, available_discharge_mwh - afrr_energy_reserve / self.eff_sqrt)
+            * self.eff_sqrt / self.time_step_hours
+        )
+        adjusted_max_charge = min(
+            remaining_for_trading,
+            max(0, available_charge_mwh - afrr_energy_reserve * self.eff_sqrt)
+            / self.eff_sqrt / self.time_step_hours
+        )
+
         # Mask 2: aFRR price tiers (5 options)
         # I always allow all price tiers (no physical constraints)
         price_mask = np.ones(len(self.AFRR_PRICE_TIERS), dtype=bool)
 
         # Mask 3: IntraDay actions (11 options)
-        # I mask based on available power after aFRR reservation
+        # I enforce IntraDay gate: open 00:00-22:59, closed 23:00+ and during aFRR
+        # I use adjusted capacity/limits that account for aFRR commitment
         intraday_mask = np.zeros(self.N_INTRADAY_ACTIONS, dtype=bool)
-        for i, level in enumerate(self.INTRADAY_LEVELS):
-            power_mw = level * remaining_capacity
-            if level >= 0:  # Discharge (sell)
-                if power_mw <= max_discharge_mw + 0.01:
-                    intraday_mask[i] = True
-            else:  # Charge (buy)
-                if abs(power_mw) <= max_charge_mw + 0.01:
-                    intraday_mask[i] = True
+
+        intraday_open = self._is_intraday_open(row)
+        if intraday_open:
+            for i, level in enumerate(self.INTRADAY_LEVELS):
+                power_mw = level * remaining_for_trading
+                if level >= 0:  # Discharge (sell)
+                    if power_mw <= adjusted_max_discharge + 0.01:
+                        intraday_mask[i] = True
+                else:  # Charge (buy)
+                    if abs(power_mw) <= adjusted_max_charge + 0.01:
+                        intraday_mask[i] = True
         # I always allow idle (center index = 5)
         intraday_mask[self.N_INTRADAY_ACTIONS // 2] = True
 
-        # Mask 4: mFRR actions (11 options) — constrained by system imbalance direction
-        # I only allow mFRR in the direction the TSO needs based on net_imbalance_mw:
-        #   Deficit (imbalance < -threshold): only discharge (UP regulation)
-        #   Surplus (imbalance > +threshold): only charge (DOWN regulation)
-        #   Balanced (|imbalance| <= threshold): mFRR closed (idle only)
+        # Mask 4: mFRR actions (11 options) — constrained by real activation data
+        # I use historical activation volumes from ADMIE data to determine mFRR
+        # availability. Real data shows 84% UP and 96% DOWN activation rates
+        # (both directions can be active simultaneously).
+        # When activation columns are missing, I fall back to the legacy
+        # imbalance-based heuristic for backward compatibility.
+        # I use adjusted capacity/limits that account for aFRR commitment
         mfrr_mask = np.zeros(self.N_MFRR_ACTIONS, dtype=bool)
-        imbalance = row.get('net_imbalance_mw', 0.0)
-        mfrr_up_price = row.get('mfrr_price_up', 0.0)
-        mfrr_down_price = row.get('mfrr_price_down', 0.0)
 
-        if imbalance < -self.mfrr_imbalance_threshold and mfrr_up_price > 1.0:
-            # Deficit → only discharge (sell/UP) levels
-            for i, level in enumerate(self.MFRR_LEVELS):
-                if level > 0:
-                    power_mw = level * remaining_capacity
-                    if power_mw <= max_discharge_mw + 0.01:
-                        mfrr_mask[i] = True
-        elif imbalance > self.mfrr_imbalance_threshold and mfrr_down_price > 1.0:
-            # Surplus → only charge (buy/DOWN) levels
-            for i, level in enumerate(self.MFRR_LEVELS):
-                if level < 0:
-                    power_mw = abs(level) * remaining_capacity
-                    if power_mw <= max_charge_mw + 0.01:
-                        mfrr_mask[i] = True
-        # else: balanced → mFRR closed (idle only)
+        # I check for real activation data first (preferred)
+        has_activation_data = ('mfrr_activated_up_mwh' in row.index
+                               if hasattr(row, 'index') else
+                               'mfrr_activated_up_mwh' in row)
+        if has_activation_data:
+            mfrr_activated_up = row.get('mfrr_activated_up_mwh', 0.0) > 0
+            mfrr_activated_down = row.get('mfrr_activated_down_mwh', 0.0) > 0
+
+            if mfrr_activated_up:
+                # I allow discharge (sell/UP) levels
+                for i, level in enumerate(self.MFRR_LEVELS):
+                    if level > 0:
+                        power_mw = level * remaining_for_trading
+                        if power_mw <= adjusted_max_discharge + 0.01:
+                            mfrr_mask[i] = True
+
+            if mfrr_activated_down:
+                # I allow charge (buy/DOWN) levels — note: NOT elif, both can be active
+                for i, level in enumerate(self.MFRR_LEVELS):
+                    if level < 0:
+                        power_mw = abs(level) * remaining_for_trading
+                        if power_mw <= adjusted_max_charge + 0.01:
+                            mfrr_mask[i] = True
+        else:
+            # I fall back to legacy imbalance-based heuristic
+            imbalance = row.get('net_imbalance_mw_lag_1h',
+                                row.get('system_deviation_mwh_lag_1h',
+                                        row.get('net_imbalance_mw', 0.0)))
+            mfrr_up_price = row.get('mfrr_price_up_lag_1h',
+                                    row.get('mfrr_price_up', 0.0))
+            mfrr_down_price = row.get('mfrr_price_down_lag_1h',
+                                      row.get('mfrr_price_down', 0.0))
+
+            if imbalance < -self.mfrr_imbalance_threshold and mfrr_up_price > 1.0:
+                for i, level in enumerate(self.MFRR_LEVELS):
+                    if level > 0:
+                        power_mw = level * remaining_for_trading
+                        if power_mw <= adjusted_max_discharge + 0.01:
+                            mfrr_mask[i] = True
+            elif imbalance > self.mfrr_imbalance_threshold and mfrr_down_price > 1.0:
+                for i, level in enumerate(self.MFRR_LEVELS):
+                    if level < 0:
+                        power_mw = abs(level) * remaining_for_trading
+                        if power_mw <= adjusted_max_charge + 0.01:
+                            mfrr_mask[i] = True
+
         mfrr_mask[self.N_MFRR_ACTIONS // 2] = True  # I always allow idle
 
         # I concatenate masks for MultiDiscrete format
@@ -450,9 +597,10 @@ class BatteryEnvUnified(gym.Env):
             # Mask 5: Free Bid price tier (5 options)
             price_tier_mask = np.ones(self.N_FREEBID_PRICE_TIERS, dtype=bool)
 
-            # I only allow price setting during Free Bid window or active mFRR
-            if abs(imbalance) <= self.mfrr_imbalance_threshold:
-                # No balancing need -> force neutral price (index 2 = 1.0x)
+            # I only allow price setting when mFRR is active (any direction)
+            mfrr_has_direction = any(mfrr_mask[i] for i in range(self.N_MFRR_ACTIONS) if i != self.N_MFRR_ACTIONS // 2)
+            if not mfrr_has_direction:
+                # No mFRR available -> force neutral price (index 2 = 1.0x)
                 price_tier_mask = np.zeros(self.N_FREEBID_PRICE_TIERS, dtype=bool)
                 price_tier_mask[2] = True
 
@@ -479,7 +627,8 @@ class BatteryEnvUnified(gym.Env):
 
         # I get current market data
         row = self.df.iloc[self.current_step]
-        dam_commitment = np.clip(row.get('dam_commitment', 0.0),
+        # I use endogenous DAM commitment when available (Phase 4)
+        dam_commitment = np.clip(self._get_dam_commitment(self.current_step),
                                   -self.max_power_mw, self.max_power_mw)
 
         # I calculate remaining capacity after DAM
@@ -487,20 +636,28 @@ class BatteryEnvUnified(gym.Env):
 
         # =====================================================================
         # STAGE 2: aFRR COMMITMENT & SELECTION
+        # I only allow re-commitment at 4-hour block boundaries per real
+        # Greek aFRR procurement rules. During a block, the committed MW
+        # stays locked.
         # =====================================================================
-        new_afrr_level = self.AFRR_LEVELS[afrr_action]
-        self.afrr_commitment_level = afrr_action
-        self.afrr_commitment_mw = new_afrr_level * remaining_capacity
+        if self._afrr_steps_remaining <= 0:
+            # I allow the agent to set a new commitment at block boundary
+            new_afrr_level = self.AFRR_LEVELS[afrr_action]
+            self.afrr_commitment_level = afrr_action
+            self.afrr_commitment_mw = new_afrr_level * remaining_capacity
+            self._afrr_steps_remaining = self._afrr_block_steps
 
-        # I determine if we're selected for aFRR
-        price_tier = self.AFRR_PRICE_TIERS[price_tier_action]
-        adjusted_selection_prob = self.selection_probability * (1.5 - price_tier * 0.5)
-        adjusted_selection_prob = np.clip(adjusted_selection_prob, 0.1, 0.95)
+            # I determine if we're selected for this block
+            price_tier = self.AFRR_PRICE_TIERS[price_tier_action]
+            adjusted_selection_prob = self.selection_probability * (1.5 - price_tier * 0.5)
+            adjusted_selection_prob = np.clip(adjusted_selection_prob, 0.1, 0.95)
 
-        self.is_selected_for_afrr = (
-            self.afrr_commitment_mw > 0.1 and
-            np.random.random() < adjusted_selection_prob
-        )
+            self.is_selected_for_afrr = (
+                self.afrr_commitment_mw > 0.1 and
+                np.random.random() < adjusted_selection_prob
+            )
+        # else: I keep the existing commitment (locked within 4h block)
+        self._afrr_steps_remaining -= 1
 
         # aFRR capacity revenue
         afrr_capacity_revenue = 0.0
@@ -581,6 +738,16 @@ class BatteryEnvUnified(gym.Env):
             available_charge_mwh / self.eff_sqrt / self.time_step_hours
         )
 
+        # I compute the max power actually deliverable for aFRR given post-DAM SoC.
+        # I pass this to the reward calculator so it can distinguish between
+        # agent fault (chose wrong action) and SoC starvation (DAM consumed energy).
+        if afrr_direction == 'up':
+            afrr_max_deliverable_mw = max_discharge
+        elif afrr_direction == 'down':
+            afrr_max_deliverable_mw = max_charge
+        else:
+            afrr_max_deliverable_mw = None
+
         if afrr_activated:
             self.steps_since_afrr_activation = 0
 
@@ -630,10 +797,26 @@ class BatteryEnvUnified(gym.Env):
 
         # =====================================================================
         # STAGE 6: EXECUTE IDA POSITIONS (locked, mandatory like DAM)
+        # I time-gate IDA positions per real market rules:
+        #   IDA1: delivers all ISPs (00:00-24:00), results from D-1 15:00
+        #   IDA2: delivers all ISPs (00:00-24:00), results from D-1 22:00
+        #   IDA3: delivers only 14:00-24:00, results from D+0 10:00
         # =====================================================================
         ida_energy_mw = 0.0
         if self.enable_full_market:
-            net_ida = row.get('net_ida_position', 0.0)
+            ts = self.df.index[self.current_step]
+            hour = ts.hour
+
+            # I compute time-gated IDA position
+            ida1_pos = row.get('ida1_position', 0.0)
+            ida2_pos = row.get('ida2_position', 0.0)
+            ida3_pos = row.get('ida3_position', 0.0)
+
+            # IDA3 only delivers for ISPs >= 14:00
+            if hour < 14:
+                ida3_pos = 0.0
+
+            net_ida = ida1_pos + ida2_pos + ida3_pos
             net_ida = np.clip(net_ida, -remaining_after_afrr, remaining_after_afrr)
 
             if abs(net_ida) > 0.1:
@@ -667,16 +850,39 @@ class BatteryEnvUnified(gym.Env):
                 actual_energy_mw += ida_energy_mw
                 remaining_after_afrr -= abs(ida_energy_mw)
 
+            # I compute IDA revenue from individual auction clearing prices
+            ida_revenue = 0.0
+            if abs(ida1_pos) > 0.01:
+                p1 = row.get('ida1_clearing_price', row.get('price', 100.0))
+                ida_revenue += ida1_pos * p1 * self.time_step_hours
+            if abs(ida2_pos) > 0.01:
+                p2 = row.get('ida2_clearing_price', row.get('price', 100.0))
+                ida_revenue += ida2_pos * p2 * self.time_step_hours
+            if abs(ida3_pos) > 0.01:
+                p3 = row.get('ida3_clearing_price', row.get('price', 100.0))
+                ida_revenue += ida3_pos * p3 * self.time_step_hours
+
+            # I scale proportionally if execution was clipped by SoC/capacity limits
+            if abs(net_ida) > 0.1 and abs(ida_energy_mw) > 0.01:
+                execution_ratio = abs(ida_energy_mw) / abs(net_ida)
+                ida_revenue *= execution_ratio
+
+            self.ida_profit += ida_revenue
+
         remaining_after_ida = remaining_after_afrr
 
         # =====================================================================
-        # STAGE 7: EXECUTE XBID/INTRADAY TRADE (voluntary arbitrage)
+        # STAGE 7: EXECUTE INTRADAY CORRECTION (IDA auctions + XBID continuous)
+        # I route the unified IntraDay action to the appropriate market
+        # based on time-of-day: IDA1/2/3 auctions or XBID continuous.
         # =====================================================================
         intraday_energy_mw = 0.0
         xbid_energy_mw = 0.0
         intraday_revenue = 0.0
 
-        if not afrr_activated:
+        active_market = self._get_intraday_market(row)
+        intraday_open = self._is_intraday_open(row)
+        if not afrr_activated and intraday_open and active_market != 'closed':
             intraday_level = self.INTRADAY_LEVELS[xbid_action]
             requested_intraday = intraday_level * remaining_after_ida
 
@@ -700,31 +906,26 @@ class BatteryEnvUnified(gym.Env):
                     actual_intraday = max(requested_intraday, -max_charge)
 
                 if abs(actual_intraday) > 0.1:
-                    if actual_intraday > 0:  # Sell (discharge) at bid
+                    if actual_intraday > 0:  # Sell (discharge)
                         energy_mwh = actual_intraday * self.time_step_hours
                         soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
                         old_soc = self.soc
                         self.soc = max(self.min_soc, self.soc - soc_delta)
                         actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
 
-                        # I use XBID prices in full market mode, IntraDay in legacy
-                        if self.enable_full_market:
-                            id_price = row.get('xbid_bid', row.get('intraday_bid', 98.0))
-                        else:
-                            id_price = row.get('intraday_bid', row.get('price', 100.0) - 2.0)
+                        # I route to the correct market for pricing
+                        id_price = self._get_intraday_sell_price(active_market, row)
                         intraday_revenue = actual_energy * id_price
 
-                    else:  # Buy (charge) at ask
+                    else:  # Buy (charge)
                         energy_mwh = abs(actual_intraday) * self.time_step_hours
                         soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
                         old_soc = self.soc
                         self.soc = min(self.max_soc, self.soc + soc_delta)
                         actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
 
-                        if self.enable_full_market:
-                            id_price = row.get('xbid_ask', row.get('intraday_ask', 102.0))
-                        else:
-                            id_price = row.get('intraday_ask', row.get('price', 100.0) + 2.0)
+                        # I route to the correct market for pricing
+                        id_price = self._get_intraday_buy_price(active_market, row)
                         intraday_revenue = -actual_energy * id_price
 
                     cycle_fraction = actual_energy / self.capacity_mwh
@@ -755,14 +956,53 @@ class BatteryEnvUnified(gym.Env):
             mfrr_level = self.MFRR_LEVELS[balancing_qty_action]
             requested_mfrr = mfrr_level * remaining_after_intraday
 
-            # I enforce mFRR direction constraint (defense-in-depth for stale masks)
-            imbalance = row.get('net_imbalance_mw', 0.0)
-            if abs(imbalance) <= self.mfrr_imbalance_threshold:
-                requested_mfrr = 0.0  # Balanced -> mFRR closed
-            elif imbalance < -self.mfrr_imbalance_threshold and requested_mfrr < 0:
-                requested_mfrr = 0.0  # Can't charge during deficit
-            elif imbalance > self.mfrr_imbalance_threshold and requested_mfrr > 0:
-                requested_mfrr = 0.0  # Can't discharge during surplus
+            # I determine mFRR activation from real market data (ADMIE volumes).
+            # Real data shows 84% UP and 96% DOWN system-wide activation rates,
+            # but individual BSP selection is much rarer. I apply a probabilistic
+            # gate (mfrr_activation_rate=35%) on top of the system-wide check.
+            # When activation columns are missing, I fall back to the legacy
+            # imbalance-based heuristic.
+            has_activation_data = 'mfrr_activated_up_mwh' in row.index if hasattr(row, 'index') else 'mfrr_activated_up_mwh' in row
+            if has_activation_data:
+                # I check two gates: (1) TSO activated mFRR in this direction,
+                # (2) our BSP was selected. The activation columns are system-wide
+                # volumes (non-zero 84-96% of the time), so I apply probabilistic
+                # BSP selection via mfrr_activation_rate to model realistic access.
+                total_up = row.get('mfrr_activated_up_mwh', 0.0)
+                total_down = row.get('mfrr_activated_down_mwh', 0.0)
+
+                if requested_mfrr > 0:
+                    if total_up <= 0:
+                        requested_mfrr = 0.0  # TSO didn't activate UP this period
+                    elif np.random.random() > self.mfrr_activation_rate:
+                        requested_mfrr = 0.0  # Our BSP not selected
+                elif requested_mfrr < 0:
+                    if total_down <= 0:
+                        requested_mfrr = 0.0  # TSO didn't activate DOWN this period
+                    elif np.random.random() > self.mfrr_activation_rate:
+                        requested_mfrr = 0.0  # Our BSP not selected
+            else:
+                # I fall back to legacy imbalance-based constraint
+                imbalance = row.get('net_imbalance_mw_lag_1h',
+                                    row.get('system_deviation_mwh_lag_1h',
+                                            row.get('net_imbalance_mw', 0.0)))
+                if abs(imbalance) <= self.mfrr_imbalance_threshold:
+                    requested_mfrr = 0.0  # Balanced -> mFRR closed
+                elif imbalance < -self.mfrr_imbalance_threshold and requested_mfrr < 0:
+                    requested_mfrr = 0.0  # Can't charge during deficit
+                elif imbalance > self.mfrr_imbalance_threshold and requested_mfrr > 0:
+                    requested_mfrr = 0.0  # Can't discharge during surplus
+
+                # I apply probabilistic activation only for legacy mode
+                if abs(requested_mfrr) > 0.1:
+                    activation_prob = self.mfrr_activation_rate
+                    abs_imbalance = abs(imbalance)
+                    if abs_imbalance > 500:
+                        activation_prob = min(0.9, activation_prob * 2.0)
+                    elif abs_imbalance > 200:
+                        activation_prob = min(0.8, activation_prob * 1.5)
+                    if np.random.random() > activation_prob:
+                        requested_mfrr = 0.0
 
             if abs(requested_mfrr) > 0.1:
                 # I recalculate limits after XBID/IntraDay
@@ -786,6 +1026,8 @@ class BatteryEnvUnified(gym.Env):
                 if abs(actual_mfrr) > 0.1:
                     if self.enable_full_market:
                         # I use Free Bid: agent sets price, activation is probabilistic
+                        imbalance = row.get('net_imbalance_mw_lag_1h',
+                                            row.get('net_imbalance_mw', 0.0))
                         price_tier = self.FREEBID_PRICE_TIERS[balancing_price_action]
                         ref_price = row.get('free_bid_reference_price',
                                             row.get('mfrr_price_up', 100.0))
@@ -811,10 +1053,17 @@ class BatteryEnvUnified(gym.Env):
                                 # Free Bid: pay-as-bid (agent's price)
                                 mfrr_revenue = actual_energy * agent_bid_price
                             else:
-                                mfrr_price = row.get('mfrr_price_up', 120.0)
+                                # I use LAGGED mFRR price — the settlement price is ex-post,
+                                # so I use the best estimate available at decision time (1h lag).
+                                # This prevents data leakage from future settlement prices.
+                                mfrr_price = min(
+                                    row.get('mfrr_price_up_lag_1h',
+                                            row.get('mfrr_price_up', 120.0)),
+                                    self.mfrr_price_cap
+                                )
                                 mfrr_revenue = actual_energy * mfrr_price
 
-                        else:  # Buy (charge)
+                        else:  # Provide DOWN regulation (charge)
                             energy_mwh = abs(actual_mfrr) * self.time_step_hours
                             soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
                             old_soc = self.soc
@@ -822,10 +1071,19 @@ class BatteryEnvUnified(gym.Env):
                             actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
 
                             if self.enable_full_market:
-                                mfrr_revenue = -actual_energy * agent_bid_price
+                                # I receive payment for providing downward balancing service
+                                mfrr_revenue = actual_energy * agent_bid_price
                             else:
-                                mfrr_price = row.get('mfrr_price_down', 60.0)
-                                mfrr_revenue = -actual_energy * mfrr_price
+                                # I receive the mFRR DOWN activation price for providing
+                                # downward regulation (absorbing surplus energy). This is a
+                                # balancing SERVICE payment, not an energy purchase cost.
+                                # I use LAGGED price to prevent data leakage.
+                                mfrr_price = min(
+                                    row.get('mfrr_price_down_lag_1h',
+                                            row.get('mfrr_price_down', 60.0)),
+                                    self.mfrr_price_cap
+                                )
+                                mfrr_revenue = actual_energy * mfrr_price
 
                         cycle_fraction = actual_energy / self.capacity_mwh
                         self.total_cycles += cycle_fraction
@@ -885,6 +1143,12 @@ class BatteryEnvUnified(gym.Env):
             shortfall_risk=shortfall_risk,
             price_momentum=price_momentum,
             is_selected_for_afrr=self.is_selected_for_afrr,
+            # I pass DAM-only energy so violation check doesn't penalize
+            # IntraDay/aFRR/mFRR trades in the opposite direction
+            dam_executed_mw=dam_executed_mw,
+            # I pass max deliverable power so reward calculator can distinguish
+            # agent fault from SoC starvation on aFRR non-response
+            afrr_max_deliverable_mw=afrr_max_deliverable_mw,
             # Full market mode params
             ida_energy_mw=ida_energy_mw,
             xbid_energy_mw=xbid_energy_mw,
@@ -910,6 +1174,10 @@ class BatteryEnvUnified(gym.Env):
 
         obs = self._build_observation()
         info = self._get_info()
+        # I spread reward components first, then override with authoritative
+        # step-level values (the reward calculator uses simplified pricing
+        # that doesn't know about IDA/XBID routing).
+        info.update(reward_info['components'])
         info.update({
             'afrr_activated': afrr_activated,
             'afrr_direction': afrr_direction,
@@ -925,7 +1193,6 @@ class BatteryEnvUnified(gym.Env):
             'xbid_energy_mw': xbid_energy_mw,
             'free_bid_energy_mw': free_bid_energy_mw,
             'free_bid_activated': free_bid_activated,
-            **reward_info['components']
         })
 
         return obs, reward, terminated, truncated, info
@@ -984,8 +1251,8 @@ class BatteryEnvUnified(gym.Env):
             future_idx = self.current_step + i
             if future_idx >= len(self.df):
                 break
-            future_row = self.df.iloc[future_idx]
-            dam = np.clip(future_row.get('dam_commitment', 0.0),
+            # I use endogenous DAM commitment when available (Phase 4)
+            dam = np.clip(self._get_dam_commitment(future_idx),
                           -self.max_power_mw, self.max_power_mw)
             if dam > 0.1:
                 total_sell_commitment += dam
@@ -1037,8 +1304,8 @@ class BatteryEnvUnified(gym.Env):
             future_idx = self.current_step + i
             if future_idx >= len(self.df):
                 break
-            future_row = self.df.iloc[future_idx]
-            dam = np.clip(future_row.get('dam_commitment', 0.0),
+            # I use endogenous DAM commitment when available (Phase 4)
+            dam = np.clip(self._get_dam_commitment(future_idx),
                           -self.max_power_mw, self.max_power_mw)
             commitments.append((i, dam))
 
@@ -1094,12 +1361,113 @@ class BatteryEnvUnified(gym.Env):
 
         return min_soc_reserve, max_soc_reserve
 
+    def _generate_endogenous_dam_schedule(self) -> np.ndarray:
+        """
+        I generate a DAM commitment schedule based on price forecasts.
+
+        This replaces the CSV-based exogenous DAM commitment with a
+        forecast-powered rule-based bidder. The agent then executes
+        this schedule (DAM is mandatory once committed).
+
+        Strategy:
+        - Buy when forecast < P25(day), sell when forecast > P75(day)
+        - Respect SoC limits and cycle constraints
+        - Minimum spread threshold (default 30 EUR) to avoid low-margin trades
+        """
+        # I get the forecast for the current day
+        ts = self.df.index[self.current_step]
+        current_day = ts.date()
+
+        # I collect DAM prices for today (known if published) or forecast
+        day_mask = self.df.index.date == current_day
+        day_indices = np.where(day_mask)[0]
+
+        if len(day_indices) < 12 * self._sph:
+            # I fall back to CSV commitments for short days
+            return None
+
+        # I get price forecasts (prefer MarketForecaster, fall back to actual)
+        if self.market_forecaster is not None:
+            forecast = self.market_forecaster.dam_forecaster.predict(
+                self.df, self.current_step, 24
+            )
+        else:
+            # I use actual prices as proxy (simulating a "perfect" forecast
+            # with noise to avoid data leakage)
+            hourly_indices = day_indices[::self._sph][:24]
+            forecast = np.array([self.df.iloc[i].get('price', 80.0) for i in hourly_indices])
+
+            # I add forecast noise (MAE ~18 EUR) to avoid oracle effect
+            noise = np.random.normal(0, 18.0, len(forecast))
+            forecast = forecast + noise
+
+        if len(forecast) < 12:
+            return None
+
+        # I compute thresholds
+        p25 = np.percentile(forecast, 25)
+        p75 = np.percentile(forecast, 75)
+        daily_spread = p75 - p25
+
+        # I skip low-spread days (not worth the cycling cost)
+        if daily_spread < self.dam_bidder_min_spread:
+            # I return zero commitments (no DAM trading today)
+            schedule = np.zeros(len(day_indices))
+            return schedule
+
+        # I size commitments based on spread magnitude
+        spread_factor = np.clip(daily_spread / 80.0, 0.4, 1.0)
+        base_power = self.max_power_mw * spread_factor
+
+        # I generate per-hour commitments then expand to sub-hourly
+        hourly_schedule = np.zeros(len(forecast))
+        for h in range(len(forecast)):
+            if forecast[h] <= p25:
+                hourly_schedule[h] = -base_power * np.random.uniform(0.6, 1.0)
+            elif forecast[h] >= p75:
+                hourly_schedule[h] = base_power * np.random.uniform(0.6, 1.0)
+
+        # I ensure energy balance (charge >= discharge / efficiency)
+        total_charge = abs(hourly_schedule[hourly_schedule < 0].sum())
+        total_discharge = hourly_schedule[hourly_schedule > 0].sum()
+        if total_charge < total_discharge * 1.1 and total_discharge > 0:
+            scale = total_charge / (total_discharge * 1.1 + 1e-6)
+            hourly_schedule[hourly_schedule > 0] *= scale
+
+        # I expand hourly schedule to sub-hourly resolution (same value per quarter-hour)
+        schedule = np.repeat(hourly_schedule, self._sph)[:len(day_indices)]
+
+        # I clip to inverter limits
+        schedule = np.clip(schedule, -self.max_power_mw, self.max_power_mw)
+
+        return schedule
+
+    def _get_dam_commitment(self, step_idx: int) -> float:
+        """
+        I return the DAM commitment for a given step, using endogenous
+        schedule if available, otherwise falling back to CSV data.
+        """
+        if self.enable_endogenous_dam and self.dam_schedule is not None:
+            # I compute the offset within the current day
+            ts = self.df.index[step_idx]
+            current_day = ts.date()
+            day_mask = self.df.index.date == current_day
+            day_indices = np.where(day_mask)[0]
+
+            if len(day_indices) > 0 and step_idx in day_indices:
+                local_idx = np.searchsorted(day_indices, step_idx)
+                if local_idx < len(self.dam_schedule):
+                    return float(self.dam_schedule[local_idx])
+
+        # I fall back to CSV data
+        return float(self.df.iloc[step_idx].get('dam_commitment', 0.0))
+
     def _build_observation(self) -> np.ndarray:
         """
-        I build the 63-feature observation vector.
+        I build the observation vector (64-85 features depending on flags).
 
         Feature Groups:
-        1. Battery State (3): soc, max_discharge, max_charge
+        1. Battery State (4): soc, max_discharge, max_charge, cycles_remaining
         2. Market Prices (11): dam, id_bid, id_ask, id_spread, id_volume, mfrr_up, mfrr_down, mfrr_spread, id_dam_spread, mfrr_dam_premium, mfrr_id_spread
         3. Time Encoding (4): hour_sin/cos, dow_sin/cos
         4. DAM Lookahead (13): current + 12h commitments
@@ -1108,6 +1476,9 @@ class BatteryEnvUnified(gym.Env):
         7. Risk/Imbalance (4): dam_discharge_reserve, shortfall_risk, momentum, worthiness
         8. Market Phase (4): ida3_correction, system_stress, res_penetration, mfrr_direction
         9. Timing Signals (4): price_vs_typical, is_peak, is_solar, hours_to_max
+        10. IntraDay Forecast + RES (9, enable_forecast): fc_1h-8h, correction, spread, solar, wind, res_dev
+        10b. Market Forecasts (20, enable_market_forecast): dam_fc_4h, id_fc, imbalance, serbia, confidence, timing, isp_cascade
+        11-12. Full Market (12, enable_full_market): IDA/XBID/FreeBid state
         """
         row = self.df.iloc[self.current_step]
         ts = self.df.index[self.current_step]
@@ -1115,13 +1486,16 @@ class BatteryEnvUnified(gym.Env):
         features = []
 
         # =====================================================================
-        # 1. BATTERY STATE (3 features)
+        # 1. BATTERY STATE (4 features — was 3, added cycles_remaining)
         # =====================================================================
         features.append(self.soc)
 
-        dam_commitment = np.clip(row.get('dam_commitment', 0.0),
+        # I use endogenous DAM commitment when available (Phase 4)
+        dam_commitment = np.clip(self._get_dam_commitment(self.current_step),
                                   -self.max_power_mw, self.max_power_mw)
-        remaining_capacity = self.max_power_mw - abs(dam_commitment)
+        # I subtract aFRR commitment so the agent sees capacity available for
+        # IntraDay/mFRR, not just post-DAM capacity (which was misleading)
+        remaining_capacity = max(0, self.max_power_mw - abs(dam_commitment) - self.afrr_commitment_mw)
 
         available_discharge = (self.soc - self.min_soc) * self.capacity_mwh
         available_charge = (self.max_soc - self.soc) * self.capacity_mwh
@@ -1134,16 +1508,22 @@ class BatteryEnvUnified(gym.Env):
         features.append(max_discharge / self.max_power_mw)
         features.append(max_charge / self.max_power_mw)
 
+        # I add daily cycle budget remaining so the agent can pace its trading
+        cycles_remaining = max(0, self.max_daily_cycles - self.daily_cycles) / self.max_daily_cycles
+        features.append(cycles_remaining)
+
         # =====================================================================
         # 2. MARKET PRICES (11 features — was 6)
         # =====================================================================
         dam_price = row.get('price', 100.0)
         features.append(dam_price / 100.0)  # [3] DAM price
 
-        # IntraDay prices (lagged to avoid lookahead — NO fallback to current-step)
-        id_bid = row.get('intraday_bid_lag_1h', 0.0)
-        id_ask = row.get('intraday_ask_lag_1h', 0.0)
-        id_spread = row.get('intraday_spread_lag_1h', 0.0)
+        # I use XBID lag prices for accurate IntraDay signal (preferred over
+        # ISP1 settlement prices which have balancing-market convention mismatch).
+        # With battery convention fix, intraday_bid = sell/UP price, intraday_ask = buy/DOWN price.
+        id_bid = row.get('xbid_bid_lag_1h', row.get('intraday_bid_lag_1h', 0.0))
+        id_ask = row.get('xbid_ask_lag_1h', row.get('intraday_ask_lag_1h', 0.0))
+        id_spread = abs(id_ask - id_bid) if (id_bid > 0 and id_ask > 0) else row.get('intraday_spread_lag_1h', 0.0)
         id_volume = row.get('intraday_volume_lag_1h', 0.5)
         features.append(id_bid / 100.0)      # [4] IntraDay bid
         features.append(id_ask / 100.0)      # [5] IntraDay ask
@@ -1190,8 +1570,9 @@ class BatteryEnvUnified(gym.Env):
             target = min(self.current_step + i * self._sph, len(self.df) - 1)
             target_ts = self.df.index[target]
             if target_ts.date() == current_day:
-                future_dam = self.df.iloc[target].get('dam_commitment', 0.0)
-                future_dam = np.clip(future_dam, -self.max_power_mw, self.max_power_mw)
+                # I use _get_dam_commitment for endogenous DAM support
+                future_dam = np.clip(self._get_dam_commitment(target),
+                                     -self.max_power_mw, self.max_power_mw)
             else:
                 future_dam = 0.0  # Unknown (not yet submitted)
             features.append(future_dam / self.max_power_mw)
@@ -1303,16 +1684,22 @@ class BatteryEnvUnified(gym.Env):
         res_penetration = np.clip(res_total / max(load_total, 1.0), 0.0, 1.5) / 1.5
         features.append(res_penetration)
 
-        # mFRR direction signal (replaces useless gate_open that was always 1.0)
-        # I encode TSO direction based on system imbalance:
-        #  +1.0 = UP available (deficit), -1.0 = DOWN available (surplus), 0.0 = closed
-        imbalance = row.get('net_imbalance_mw', 0.0)
-        if imbalance < -self.mfrr_imbalance_threshold:
-            mfrr_direction = 1.0   # UP available (discharge/sell)
-        elif imbalance > self.mfrr_imbalance_threshold:
-            mfrr_direction = -1.0  # DOWN available (charge/buy)
+        # mFRR direction signal — I use activation volumes for a richer signal
+        # than the old binary imbalance threshold.
+        # +1.0 = UP only, -1.0 = DOWN only, 0.0 = both active or neither
+        if 'mfrr_activated_up_mwh' in row.index if hasattr(row, 'index') else 'mfrr_activated_up_mwh' in row:
+            mfrr_up_active = 1.0 if row.get('mfrr_activated_up_mwh', 0) > 0 else 0.0
+            mfrr_down_active = 1.0 if row.get('mfrr_activated_down_mwh', 0) > 0 else 0.0
+            mfrr_direction = mfrr_up_active - mfrr_down_active
         else:
-            mfrr_direction = 0.0   # Closed
+            # I fall back to legacy imbalance-based signal
+            imbalance = row.get('net_imbalance_mw', 0.0)
+            if imbalance < -self.mfrr_imbalance_threshold:
+                mfrr_direction = 1.0   # UP available (discharge/sell)
+            elif imbalance > self.mfrr_imbalance_threshold:
+                mfrr_direction = -1.0  # DOWN available (charge/buy)
+            else:
+                mfrr_direction = 0.0   # Closed
         features.append(mfrr_direction)
 
         # =====================================================================
@@ -1340,7 +1727,132 @@ class BatteryEnvUnified(gym.Env):
         features.append(hours_to_peak)
 
         # =====================================================================
-        # 10. FULL MARKET FEATURES (12 features, indices 63-74)
+        # 10. INTRADAY FORECAST & RES FUNDAMENTALS (9 features, enable_forecast)
+        # =====================================================================
+        if self.enable_forecast:
+            # I get 4-horizon IntraDay price forecasts from LightGBM model
+            if self.price_forecaster is not None:
+                all_fc = self.price_forecaster.predict(
+                    self.df, self.current_step, add_noise=self.forecast_noise
+                )
+                # I select horizons 1h, 2h, 4h, 8h from the 12-element forecast
+                fc_1h = all_fc[0]
+                fc_2h = all_fc[1]
+                fc_4h = all_fc[3] if len(all_fc) > 3 else all_fc[-1]
+                fc_8h = all_fc[7] if len(all_fc) > 7 else all_fc[-1]
+            else:
+                # I use persistence fallback (DAM price + optional noise)
+                fc_1h = fc_2h = fc_4h = fc_8h = dam_price
+                if self.forecast_noise:
+                    for i, h in enumerate([1, 2, 4, 8]):
+                        err = 0.08 + 0.12 * (h - 1) / 11
+                        val = max(0.1, dam_price + np.random.normal(0, abs(dam_price) * err))
+                        if i == 0: fc_1h = val
+                        elif i == 1: fc_2h = val
+                        elif i == 2: fc_4h = val
+                        elif i == 3: fc_8h = val
+
+            features.append(fc_1h / 100.0)                              # id_forecast_1h
+            features.append(fc_2h / 100.0)                              # id_forecast_2h
+            features.append(fc_4h / 100.0)                              # id_forecast_4h
+            features.append(fc_8h / 100.0)                              # id_forecast_8h
+            features.append((fc_1h - dam_price) / 100.0)                # forecast_vs_dam (correction signal)
+            fc_list = [fc_1h, fc_2h, fc_4h, fc_8h]
+            features.append((max(fc_list) - min(fc_list)) / 100.0)      # forecast_spread (volatility)
+            features.append(row.get('solar', 0.0) / 3000.0)             # solar_norm
+            features.append(row.get('wind_onshore', 0.0) / 3000.0)      # wind_norm
+            res = row.get('res_total_mw', row.get('solar', 0) + row.get('wind_onshore', 0))
+            res_mean = self._res_mean_24h[self.current_step] if self._res_mean_24h is not None else res
+            features.append((res - res_mean) / 1000.0)                  # res_deviation
+
+        # =====================================================================
+        # 10b. MARKET FORECASTS (15 features, enable_market_forecast)
+        # =====================================================================
+        if self.enable_market_forecast:
+            # I prefer pre-computed columns (faster) over live forecaster calls
+            if 'dam_forecast_next_4h_mean' in self.df.columns:
+                # I read pre-computed forecast columns from the DataFrame
+                features.append(row.get('dam_forecast_next_4h_mean', dam_price) / 100.0)
+                features.append(row.get('dam_forecast_next_4h_max', dam_price) / 100.0)
+                features.append(row.get('dam_forecast_next_4h_min', dam_price) / 100.0)
+                fc_spread = row.get('dam_forecast_spread', 0.0)
+                features.append(fc_spread / 100.0)
+                features.append(row.get('dam_forecast_vs_current', 0.0) / 100.0)
+                features.append(row.get('id_forecast_1h', dam_price) / 100.0)
+                features.append(row.get('id_forecast_4h', dam_price) / 100.0)
+                id_fc_1h = row.get('id_forecast_1h', dam_price)
+                dam_fc_mean = row.get('dam_forecast_next_4h_mean', dam_price)
+                features.append((id_fc_1h - dam_fc_mean) / 100.0)
+                features.append(row.get('imbalance_forecast_dir', 0.0))
+                features.append(row.get('imbalance_forecast_mag', 0.0) / 500.0)
+                features.append(row.get('mfrr_opportunity_score', 0.0))
+                serbia = row.get('serbia_dam_price', np.nan)
+                if not np.isnan(serbia):
+                    features.append((serbia - dam_price) / 100.0)
+                else:
+                    features.append(0.0)
+                features.append(row.get('forecast_confidence', 0.5))
+                features.append(row.get('hours_to_dam_peak', 12.0) / 24.0)
+                features.append(row.get('hours_to_dam_trough', 6.0) / 24.0)
+
+                # I add ISP cascade features (5 features)
+                # ISP2 prices provide intermediate price signal
+                features.append(row.get('isp2_price_up', row.get('isp1_price_up', dam_price)) / 100.0)
+                features.append(row.get('isp2_price_down', row.get('isp1_price_down', dam_price)) / 100.0)
+                # ISP3-ISP1 spread captures real-time premium evolution
+                features.append(row.get('isp_cascade_spread_up', 0.0) / 100.0)
+                # ISP2-ISP3 spread captures last-minute volatility
+                features.append(row.get('isp23_spread_up', 0.0) / 100.0)
+                # ISP cross-session average spread (overall market tension)
+                isp_avg_up = row.get('isp_avg_price_up', dam_price)
+                features.append((isp_avg_up - dam_price) / 100.0)
+
+            elif self.market_forecaster is not None:
+                # I call the live forecaster (slower but works without pre-computed columns)
+                try:
+                    fc = self.market_forecaster.predict_all(self.df, self.current_step)
+                    dam_4h = fc['dam_forecast_24h'][:4]
+                    features.append(np.mean(dam_4h) / 100.0)
+                    features.append(np.max(dam_4h) / 100.0)
+                    features.append(np.min(dam_4h) / 100.0)
+                    features.append((np.max(dam_4h) - np.min(dam_4h)) / 100.0)
+                    features.append((np.mean(dam_4h) - dam_price) / 100.0)
+                    id_fc = fc['id_forecast']
+                    features.append(id_fc.get(1, dam_price) / 100.0)
+                    features.append(id_fc.get(4, dam_price) / 100.0)
+                    features.append((id_fc.get(1, dam_price) - np.mean(dam_4h)) / 100.0)
+                    imb = fc['imbalance']
+                    features.append(imb['direction'])
+                    features.append(imb['magnitude'] / 500.0)
+                    features.append(imb['opportunity_score'])
+                    serbia = row.get('serbia_dam_price', np.nan)
+                    features.append((serbia - dam_price) / 100.0 if not np.isnan(serbia) else 0.0)
+                    avg_std = np.mean(fc['dam_forecast_std'][:4])
+                    features.append(1.0 / (1.0 + avg_std / 20.0))
+                    dam_24h = fc['dam_forecast_24h']
+                    features.append(float(np.argmax(dam_24h) + 1) / 24.0)
+                    features.append(float(np.argmin(dam_24h) + 1) / 24.0)
+
+                    # I add ISP cascade features from pre-computed columns
+                    features.append(row.get('isp2_price_up', row.get('isp1_price_up', dam_price)) / 100.0)
+                    features.append(row.get('isp2_price_down', row.get('isp1_price_down', dam_price)) / 100.0)
+                    features.append(row.get('isp_cascade_spread_up', 0.0) / 100.0)
+                    features.append(row.get('isp23_spread_up', 0.0) / 100.0)
+                    isp_avg_up = row.get('isp_avg_price_up', dam_price)
+                    features.append((isp_avg_up - dam_price) / 100.0)
+                except Exception:
+                    # I fall back to zeros on any forecaster error (15 base + 5 ISP = 20)
+                    features.extend([dam_price / 100.0] * 2 + [dam_price / 100.0] +
+                                    [0.0] * 2 + [dam_price / 100.0] * 2 + [0.0] * 8 +
+                                    [dam_price / 100.0] * 2 + [0.0] * 3)
+            else:
+                # I use zeros as placeholder when no forecaster and no pre-computed columns (20 features)
+                features.extend([dam_price / 100.0] * 3 + [0.0] * 2 +
+                                [dam_price / 100.0] * 2 + [0.0] * 8 +
+                                [dam_price / 100.0] * 2 + [0.0] * 3)
+
+        # =====================================================================
+        # 11. FULL MARKET FEATURES (12 features, enable_full_market)
         # =====================================================================
         if self.enable_full_market:
             imbalance_fm = row.get('net_imbalance_mw', 0.0)
@@ -1352,7 +1864,7 @@ class BatteryEnvUnified(gym.Env):
             features.append(row.get('ida1_clearing_price', 0.0) / 100.0)          # [66]
             features.append(row.get('ida2_clearing_price', 0.0) / 100.0)          # [67]
             features.append(row.get('net_ida_position', 0.0) / self.max_power_mw) # [68]
-            features.append(1.0 if self._is_xbid_gate_open(row) else 0.0)         # [69]
+            features.append(1.0 if self._is_intraday_open(row) else 0.0)          # [69]
 
             # Group 11: Free Bid State (70-72)
             features.append(1.0 if abs(imbalance_fm) > self.mfrr_imbalance_threshold else 0.0)  # [70]
@@ -1368,7 +1880,13 @@ class BatteryEnvUnified(gym.Env):
         # =====================================================================
         obs = np.array(features, dtype=np.float32)
 
-        expected_features = 75 if self.enable_full_market else 63
+        expected_features = 64  # Base features (Groups 1-9) including cycles_remaining
+        if self.enable_forecast:
+            expected_features += 9
+        if self.enable_market_forecast:
+            expected_features += 20
+        if self.enable_full_market:
+            expected_features += 12
         assert len(obs) == expected_features, f"Expected {expected_features} features, got {len(obs)}"
 
         # I replace any NaN/Inf with 0
@@ -1376,21 +1894,111 @@ class BatteryEnvUnified(gym.Env):
 
         return obs
 
+    def _get_intraday_market(self, row):
+        """I determine which IntraDay market is active at the current step.
+
+        I route the unified IntraDay action [2] to the appropriate market:
+        - IDA1 auction at hour 15:00 (gate closure ~15:00, results ~15:30)
+        - IDA2 auction at hour 22:00 (gate closure ~22:00)
+        - IDA3 auction at hour 10:00 for ISPs >= 14:00
+        - XBID continuous trading at all other hours 00:00-22:59
+        - Closed at 23:00-23:59 (no tradeable ISPs remaining)
+        """
+        ts = self.df.index[self.current_step]
+        hour = ts.hour
+        minute = ts.minute
+
+        # I check IDA auction windows (15-min step containing gate closure)
+        if hour == 15 and minute < 15:
+            return 'ida1'
+        elif hour == 22 and minute < 15:
+            return 'ida2'
+        elif hour == 10 and minute < 15:
+            return 'ida3'
+        elif hour < 23:
+            return 'xbid'
+        else:
+            return 'closed'
+
+    def _is_intraday_open(self, row):
+        """I check if any IntraDay market (IDA or XBID) is open for trading.
+
+        I open IntraDay for all hours 00:00-22:59 (covers IDA1/2/3 + XBID).
+        Only blocked during aFRR activation and at 23:00-23:59.
+        """
+        if self.steps_since_afrr_activation <= 0:
+            return False
+
+        ts = self.df.index[self.current_step]
+        if ts.hour >= 23:
+            return False
+
+        return True
+
     def _is_xbid_gate_open(self, row):
-        """I check if XBID is open (closes H-1 before delivery)."""
-        # In training, always open except when aFRR is activated
-        # (can't trade XBID during aFRR activation)
-        return self.steps_since_afrr_activation > 0
+        """I delegate to _is_intraday_open for backward compatibility."""
+        return self._is_intraday_open(row)
 
     def _get_ida_phase(self, row):
-        """I return IDA phase indicator: 0.0 -> 0.33 -> 0.67 -> 1.0."""
+        """
+        I return IDA phase indicator based on real HEnEx gate closure schedule.
+        0.0  = Before any IDA results (hour < 16, IDA1 results ~15:30)
+        0.25 = After IDA1 results (16 <= hour < 23)
+        0.50 = After IDA2 results (hour >= 23 on D-1 or hour < 10 on D+0)
+        0.75 = After IDA3 results (hour >= 10, delivery 14:00-24:00)
+        1.0  = In IDA3 delivery window (hour >= 14)
+        """
         hour = self.df.index[self.current_step].hour
-        if hour < 15:
-            return 0.0    # Before IDA1 results
-        elif hour < 22:
-            return 0.33   # After IDA1, before IDA2
+        if hour >= 14:
+            return 1.0    # In IDA3 delivery window
+        elif hour >= 10:
+            return 0.75   # After IDA3 results, before delivery
+        elif hour >= 0 and hour < 10:
+            return 0.50   # After IDA2 (D-1 22:00), before IDA3
+        elif hour >= 23:
+            return 0.50   # Just after IDA2 results
+        elif hour >= 16:
+            return 0.25   # After IDA1 results (~15:30)
         else:
-            return 0.67   # After IDA2, before IDA3
+            return 0.0    # Before any IDA results
+
+    def _get_intraday_sell_price(self, active_market, row):
+        """I return the sell (discharge) price for the active IntraDay market.
+
+        IDA auctions use a single clearing price for buy AND sell.
+        XBID continuous uses separate bid/ask prices.
+        """
+        if active_market in ('ida1', 'ida2', 'ida3'):
+            # IDA auctions: single clearing price (same for buy/sell)
+            price_col = f'{active_market}_clearing_price'
+            id_price = row.get(price_col, row.get('price', 100.0))
+            # I handle IDA3 delivery restriction: only for ISPs >= 14:00
+            if active_market == 'ida3':
+                ts = self.df.index[self.current_step]
+                if ts.hour < 14:
+                    id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
+            return id_price
+        else:  # xbid
+            # I prefer XBID prices, fall back to intraday_bid (now battery convention)
+            return row.get('xbid_bid', row.get('intraday_bid', row.get('price', 100.0) - 3.0))
+
+    def _get_intraday_buy_price(self, active_market, row):
+        """I return the buy (charge) price for the active IntraDay market.
+
+        IDA auctions use a single clearing price for buy AND sell.
+        XBID continuous uses separate bid/ask prices.
+        """
+        if active_market in ('ida1', 'ida2', 'ida3'):
+            # IDA auctions: single clearing price (same for buy/sell)
+            price_col = f'{active_market}_clearing_price'
+            id_price = row.get(price_col, row.get('price', 100.0))
+            if active_market == 'ida3':
+                ts = self.df.index[self.current_step]
+                if ts.hour < 14:
+                    id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
+            return id_price
+        else:  # xbid
+            return row.get('xbid_ask', row.get('intraday_ask', row.get('price', 100.0) + 3.0))
 
     def _simulate_free_bid_activation(self, bid_price, ref_price, imbalance, row):
         """I simulate merit-order based Free Bid activation."""
@@ -1414,9 +2022,15 @@ class BatteryEnvUnified(gym.Env):
         return np.random.random() < activation_prob
 
     def _get_time_to_delivery(self, row):
-        """I compute approximate hours to delivery for this ISP."""
+        """
+        I compute hours remaining until the end of the current delivery day.
+        For XBID purposes, this indicates how many tradeable ISPs remain.
+        At 23:00 there's 1 hour left, at 14:00 there's 10 hours left.
+        """
         ts = self.df.index[self.current_step]
-        return max(0.5, 24.0 - (ts.hour + ts.minute / 60.0))
+        hours_in_day = ts.hour + ts.minute / 60.0
+        remaining = 24.0 - hours_in_day
+        return max(0.25, remaining)
 
     def _get_info(self) -> Dict:
         """I return step information."""

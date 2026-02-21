@@ -42,6 +42,40 @@ from sb3_contrib import MaskablePPO
 from gym_envs.battery_env_unified import BatteryEnvUnified
 
 
+class EntropyAnnealingCallback(BaseCallback):
+    """
+    I anneal the entropy coefficient from start_ent to end_ent over training.
+
+    SB3 doesn't support ent_coef schedules natively, so I modify the model's
+    ent_coef attribute directly. This allows the agent to explore broadly early
+    in training (high entropy) and converge to a sharp policy later (low entropy).
+    """
+
+    def __init__(
+        self,
+        start_ent: float = 0.03,
+        end_ent: float = 0.005,
+        verbose: int = 0
+    ):
+        super().__init__(verbose)
+        self.start_ent = start_ent
+        self.end_ent = end_ent
+
+    def _on_step(self) -> bool:
+        # I compute progress_remaining (1→0) matching SB3 convention
+        progress_remaining = 1.0 - (self.num_timesteps / self.model._total_timesteps)
+        progress_remaining = max(0.0, progress_remaining)
+
+        # I linearly interpolate: start at start_ent, end at end_ent
+        self.model.ent_coef = self.start_ent * progress_remaining + self.end_ent * (1.0 - progress_remaining)
+
+        # I log the current ent_coef every 10k steps
+        if self.num_timesteps % 10000 == 0:
+            self.logger.record('train/ent_coef_current', self.model.ent_coef)
+
+        return True
+
+
 class DegradationCurriculumCallback(BaseCallback):
     """
     I implement curriculum learning for degradation cost.
@@ -49,6 +83,9 @@ class DegradationCurriculumCallback(BaseCallback):
     The degradation cost starts at 0 and ramps up to the target value
     over the warmup period. This helps the agent learn profitable trading
     before considering battery wear.
+
+    I also monitor explained_variance during the ramp phase — if it drops
+    below 0.7 the curriculum may be ramping too fast.
     """
 
     def __init__(
@@ -61,6 +98,7 @@ class DegradationCurriculumCallback(BaseCallback):
         self.target_degradation = target_degradation
         self.warmup_steps = warmup_steps
         self.current_degradation = 0.0
+        self._warned_ev_drop = False
 
     def _on_step(self) -> bool:
         # I calculate current degradation based on training progress
@@ -72,6 +110,21 @@ class DegradationCurriculumCallback(BaseCallback):
             for env in self.training_env.envs:
                 if hasattr(env, 'reward_calculator'):
                     env.reward_calculator.degradation_cost = self.current_degradation
+
+        # I monitor explained_variance during the ramp phase (250k-750k)
+        if (not self._warned_ev_drop
+                and self.warmup_steps * 0.5 < self.num_timesteps < self.warmup_steps * 1.5):
+            ev = self.logger.name_to_value.get('train/explained_variance', None)
+            if ev is not None and ev < 0.7:
+                print(f"\n[!] WARNING: explained_variance={ev:.3f} dropped below 0.7 "
+                      f"during degradation ramp (step {self.num_timesteps:,}, "
+                      f"degradation={self.current_degradation:.1f} EUR/MWh). "
+                      f"Consider extending warmup_steps.")
+                self._warned_ev_drop = True
+
+        # I log current degradation cost
+        if self.num_timesteps % 10000 == 0:
+            self.logger.record('curriculum/degradation_cost', self.current_degradation)
 
         return True
 
@@ -92,6 +145,11 @@ class TensorboardLoggingCallback(BaseCallback):
         self.afrr_energy_profits = []
         self.mfrr_profits = []
 
+        # I track full-market episode-level profits
+        self.ida_profits = []
+        self.xbid_profits = []
+        self.free_bid_profits = []
+
         # I track participation counts per episode
         self.afrr_bids_per_ep = []
         self.afrr_selections_per_ep = []
@@ -105,6 +163,9 @@ class TensorboardLoggingCallback(BaseCallback):
         self.step_mfrr_trades = 0
         self.step_mfrr_sells = 0
         self.step_mfrr_buys = 0
+        self.step_free_bid_trades = 0
+        self.step_free_bid_sells = 0
+        self.step_free_bid_buys = 0
         self.step_count = 0
 
     def _on_step(self) -> bool:
@@ -129,6 +190,15 @@ class TensorboardLoggingCallback(BaseCallback):
                 else:
                     self.step_mfrr_buys += 1
 
+            # I track Free Bid trades (full-market mode routes mFRR to free_bid_energy_mw)
+            free_bid_mw = info.get('free_bid_energy_mw', 0)
+            if abs(free_bid_mw) > 0.1:
+                self.step_free_bid_trades += 1
+                if free_bid_mw > 0:
+                    self.step_free_bid_sells += 1
+                else:
+                    self.step_free_bid_buys += 1
+
             # I check for episode end (when total_profit is reported)
             if 'total_profit' in info:
                 self.episode_profits.append(info['total_profit'])
@@ -146,6 +216,14 @@ class TensorboardLoggingCallback(BaseCallback):
                 self.afrr_energy_profits.append(info['afrr_energy_profit'])
             if 'mfrr_profit' in info:
                 self.mfrr_profits.append(info['mfrr_profit'])
+
+            # I collect full-market episode profits
+            if 'ida_profit' in info:
+                self.ida_profits.append(info['ida_profit'])
+            if 'xbid_profit' in info:
+                self.xbid_profits.append(info['xbid_profit'])
+            if 'free_bid_profit' in info:
+                self.free_bid_profits.append(info['free_bid_profit'])
 
         # I log periodically
         if self.num_timesteps % 10000 == 0 and len(self.episode_profits) > 0:
@@ -169,17 +247,13 @@ class TensorboardLoggingCallback(BaseCallback):
             if len(self.mfrr_profits) > 0:
                 self.logger.record('markets/mfrr_profit', np.mean(self.mfrr_profits[-100:]))
 
-            # I log full market mode metrics if available
-            infos = self.locals.get('infos', [])
-            if len(infos) > 0 and 'ida_profit' in infos[0]:
-                self.logger.record('markets/ida_profit',
-                                   np.mean([i.get('ida_profit', 0) for i in infos]))
-                self.logger.record('markets/xbid_profit',
-                                   np.mean([i.get('xbid_profit', 0) for i in infos]))
-                self.logger.record('markets/free_bid_profit',
-                                   np.mean([i.get('free_bid_profit', 0) for i in infos]))
-                self.logger.record('markets/free_bid_activation_rate',
-                                   np.mean([i.get('free_bid_activation_rate', 0) for i in infos]))
+            # I log full-market mode metrics from episode-level accumulators
+            if self.ida_profits:
+                self.logger.record('markets/ida_profit', np.mean(self.ida_profits[-100:]))
+            if self.xbid_profits:
+                self.logger.record('markets/xbid_profit', np.mean(self.xbid_profits[-100:]))
+            if self.free_bid_profits:
+                self.logger.record('markets/free_bid_profit', np.mean(self.free_bid_profits[-100:]))
 
             # I log participation rates
             if self.step_count > 0:
@@ -190,6 +264,9 @@ class TensorboardLoggingCallback(BaseCallback):
                 self.logger.record('participation/mfrr_trade_rate', self.step_mfrr_trades / self.step_count)
                 self.logger.record('participation/mfrr_sell_rate', self.step_mfrr_sells / self.step_count)
                 self.logger.record('participation/mfrr_buy_rate', self.step_mfrr_buys / self.step_count)
+                self.logger.record('participation/free_bid_trade_rate', self.step_free_bid_trades / self.step_count)
+                self.logger.record('participation/free_bid_sell_rate', self.step_free_bid_sells / self.step_count)
+                self.logger.record('participation/free_bid_buy_rate', self.step_free_bid_buys / self.step_count)
 
                 # I calculate conditional rates
                 if self.step_afrr_bids > 0:
@@ -207,6 +284,9 @@ class TensorboardLoggingCallback(BaseCallback):
             self.step_mfrr_trades = 0
             self.step_mfrr_sells = 0
             self.step_mfrr_buys = 0
+            self.step_free_bid_trades = 0
+            self.step_free_bid_sells = 0
+            self.step_free_bid_buys = 0
             self.step_count = 0
 
         return True
@@ -245,13 +325,15 @@ def create_training_env(
             'efficiency': 0.94
         }
 
-    # I set default reward config
+    # I set default reward config — penalties reduced to fix the 37:1
+    # penalty/profit asymmetry that destroyed the gradient signal.
+    # reward_scale raised from 0.001 to 0.01 for stronger NN signal.
     if reward_config is None:
         reward_config = {
-            'degradation_cost': 15.0,
-            'dam_violation_penalty': 1500.0,
-            'afrr_nonresponse_penalty': 2000.0,
-            'reward_scale': 0.001
+            'degradation_cost': 5.0,
+            'dam_violation_penalty': 800.0,
+            'afrr_nonresponse_penalty': 500.0,
+            'reward_scale': 0.01
         }
 
     # I convert episode length from hours to steps
@@ -309,7 +391,7 @@ def create_eval_env(
 
 
 def train_unified_model(
-    data_path: str = "data/unified_multimarket_training.csv",
+    data_path: str = "data/unified_multimarket_training_v2.csv",
     output_dir: str = "models/unified",
     total_timesteps: int = 5_000_000,
     n_envs: int = 8,  # I use 8 parallel environments for speedup
@@ -318,14 +400,22 @@ def train_unified_model(
     batch_size: int = 256,
     n_epochs: int = 10,
     gamma: float = 0.99,
-    gae_lambda: float = 0.95,
+    gae_lambda: float = 0.97,  # I raised from 0.95 to extend advantage horizon to ~18h (was ~12h)
     clip_range: float = 0.2,
     ent_coef: float = 0.03,
     seed: int = 42,
     device: str = "auto",
     resume_from: str = None,
     time_step_hours: float = 0.25,  # 15-min resolution default
-    enable_full_market: bool = False
+    enable_full_market: bool = False,
+    enable_forecast: bool = False,
+    forecaster_path: str = "models/intraday_forecaster.pkl",
+    enable_market_forecast: bool = False,
+    market_forecaster_path: str = "models/market_forecaster.pkl",
+    enable_endogenous_dam: bool = False,
+    dam_bidder_min_spread: float = 30.0,
+    mfrr_activation_rate: float = 0.35,
+    mfrr_price_cap: float = 500.0
 ) -> str:
     """
     I train the unified multi-market model.
@@ -364,6 +454,12 @@ def train_unified_model(
     print(f"Time step: {time_step_hours*60:.0f}-min resolution ({1/time_step_hours:.0f} steps/hour)")
     if enable_full_market:
         print(f"Full Market Mode: IDA1/2/3/XBID + Free Bids (75 obs, 5 action dims)")
+    if enable_forecast:
+        print(f"Forecast Mode: IntraDay LightGBM (+9 obs, path={forecaster_path})")
+    if enable_market_forecast:
+        print(f"Market Forecast Mode: DAM+ID+Imbalance (+15 obs, path={market_forecaster_path})")
+    if enable_endogenous_dam:
+        print(f"Endogenous DAM: forecast-powered commitments (min_spread={dam_bidder_min_spread} EUR)")
 
     # I resolve data path
     if not Path(data_path).exists():
@@ -395,7 +491,16 @@ def train_unified_model(
                 time_step_hours=time_step_hours,
                 episode_length=train_episode_steps,
                 random_start=True,
-                enable_full_market=enable_full_market
+                enable_full_market=enable_full_market,
+                enable_forecast=enable_forecast,
+                forecaster_path=forecaster_path,
+                forecast_noise=True,   # Training: noise on
+                enable_market_forecast=enable_market_forecast,
+                market_forecaster_path=market_forecaster_path,
+                enable_endogenous_dam=enable_endogenous_dam,
+                dam_bidder_min_spread=dam_bidder_min_spread,
+                mfrr_activation_rate=mfrr_activation_rate,
+                mfrr_price_cap=mfrr_price_cap,
             )
             # I set unique seed for each environment
             env.reset(seed=seed + env_id if seed else env_id)
@@ -405,13 +510,17 @@ def train_unified_model(
     # I create vectorized environment with multiple parallel envs
     train_env = MaskableVecEnv([make_train_env(i) for i in range(n_envs)])
 
-    # I add VecNormalize for observation normalization
+    # I add VecNormalize for observation normalization only.
+    # I disabled norm_reward because the reward_scale (0.01) in the
+    # calculator already handles scaling, and double normalization
+    # (scale + VecNorm + clip) was creating vanishing gradients and
+    # stale return statistics when the degradation curriculum shifted
+    # the reward distribution mid-training.
     train_env = VecNormalize(
         train_env,
         norm_obs=True,
-        norm_reward=True,
+        norm_reward=False,
         clip_obs=10.0,
-        clip_reward=10.0
     )
 
     # I create evaluation environment on SEPARATE held-out data
@@ -423,7 +532,16 @@ def train_unified_model(
             time_step_hours=time_step_hours,
             episode_length=eval_episode_steps,
             random_start=True,
-            enable_full_market=enable_full_market
+            enable_full_market=enable_full_market,
+            enable_forecast=enable_forecast,
+            forecaster_path=forecaster_path,
+            forecast_noise=False,  # Eval: deterministic forecasts
+            enable_market_forecast=enable_market_forecast,
+            market_forecaster_path=market_forecaster_path,
+            enable_endogenous_dam=enable_endogenous_dam,
+            dam_bidder_min_spread=dam_bidder_min_spread,
+            mfrr_activation_rate=mfrr_activation_rate,
+            mfrr_price_cap=mfrr_price_cap,
         )
 
     eval_env = MaskableVecEnv([make_eval_env])
@@ -454,16 +572,22 @@ def train_unified_model(
     )
 
     curriculum_callback = DegradationCurriculumCallback(
-        target_degradation=15.0,
+        target_degradation=5.0,  # I reduced from 15 to 5 EUR/MWh (realistic Li-ion BESS)
         warmup_steps=min(500_000, total_timesteps // 5)
     )
 
     logging_callback = TensorboardLoggingCallback()
 
+    entropy_callback = EntropyAnnealingCallback(
+        start_ent=ent_coef,   # I start from the user-specified ent_coef (default 0.03)
+        end_ent=0.005         # I decay to 0.005 by end of training
+    )
+
     callbacks = CallbackList([
         eval_callback,
         checkpoint_callback,
         curriculum_callback,
+        entropy_callback,
         logging_callback
     ])
 
@@ -520,7 +644,8 @@ def train_unified_model(
         print(f"  N steps: {n_steps}")
         print(f"  Batch size: {batch_size}")
         print(f"  Gamma: {gamma}")
-        print(f"  Entropy coefficient: {ent_coef}")
+        print(f"  Entropy coefficient: {ent_coef} (annealing to 0.005)")
+        print(f"  Value function coefficient: 0.25 (reduced from 0.5 default)")
 
         model = MaskablePPO(
             "MlpPolicy",
@@ -533,6 +658,7 @@ def train_unified_model(
             gae_lambda=gae_lambda,
             clip_range=clip_range,
             ent_coef=ent_coef,
+            vf_coef=0.25,  # I reduced from 0.5 default — value_loss was 1000x policy_loss
             verbose=1,
             tensorboard_log=str(model_dir / "tensorboard"),
             seed=seed,
@@ -584,6 +710,14 @@ def train_unified_model(
         'data_path': str(data_path),
         'time_step_hours': time_step_hours,
         'enable_full_market': enable_full_market,
+        'enable_forecast': enable_forecast,
+        'forecaster_path': forecaster_path,
+        'enable_market_forecast': enable_market_forecast,
+        'market_forecaster_path': market_forecaster_path,
+        'enable_endogenous_dam': enable_endogenous_dam,
+        'dam_bidder_min_spread': dam_bidder_min_spread,
+        'mfrr_activation_rate': mfrr_activation_rate,
+        'mfrr_price_cap': mfrr_price_cap,
         'timestamp': timestamp
     }
 
@@ -605,61 +739,155 @@ def train_unified_model(
 
 def evaluate_model(
     model_path: str,
-    data_path: str = "data/unified_multimarket_training.csv",
-    n_episodes: int = 10
+    data_path: str = "data/unified_multimarket_training_v2.csv",
+    n_episodes: int = 10,
+    use_eval_split: bool = True
 ) -> Dict:
-    """I evaluate a trained unified model."""
+    """
+    I evaluate a trained unified model.
+
+    I load training_config.json to reconstruct the exact env settings
+    (time_step_hours, enable_full_market, enable_forecast) that were
+    used during training.  I use the held-out eval split (last 20%) by
+    default so the evaluation is on unseen data.
+    """
+    import json
     from sb3_contrib import MaskablePPO
 
     print(f"Evaluating model: {model_path}")
 
-    # I load model
+    model_dir = Path(model_path).parent
+
+    # ----------------------------------------------------------------
+    # 1. I load training config to match env settings exactly
+    # ----------------------------------------------------------------
+    config_path = model_dir / "training_config.json"
+    train_cfg = {}
+    if config_path.exists():
+        with open(config_path) as f:
+            train_cfg = json.load(f)
+        print(f"  Loaded training config from {config_path}")
+
+    time_step_hours = train_cfg.get('time_step_hours', 1.0)
+    enable_full_market = train_cfg.get('enable_full_market', False)
+    enable_forecast = train_cfg.get('enable_forecast', False)
+    forecaster_path = train_cfg.get('forecaster_path', 'models/intraday_forecaster.pkl')
+    enable_market_forecast = train_cfg.get('enable_market_forecast', False)
+    market_forecaster_path = train_cfg.get('market_forecaster_path', 'models/market_forecaster.pkl')
+    enable_endogenous_dam = train_cfg.get('enable_endogenous_dam', False)
+    dam_bidder_min_spread = train_cfg.get('dam_bidder_min_spread', 30.0)
+    mfrr_activation_rate = train_cfg.get('mfrr_activation_rate', 0.35)
+    mfrr_price_cap = train_cfg.get('mfrr_price_cap', 500.0)
+
+    print(f"  time_step_hours={time_step_hours}, "
+          f"full_market={enable_full_market}, "
+          f"forecast={enable_forecast}, "
+          f"market_forecast={enable_market_forecast}")
+    print(f"  endogenous_dam={enable_endogenous_dam}, "
+          f"mfrr: activation_rate={mfrr_activation_rate:.0%}, "
+          f"price_cap={mfrr_price_cap:.0f} EUR/MWh")
+
+    # ----------------------------------------------------------------
+    # 2. I resolve data path and load data
+    # ----------------------------------------------------------------
+    resolved_path = Path(data_path)
+    if not resolved_path.exists():
+        resolved_path = project_root / data_path
+    if not resolved_path.exists():
+        cfg_data = train_cfg.get('data_path', data_path)
+        resolved_path = Path(cfg_data)
+        if not resolved_path.exists():
+            resolved_path = project_root / cfg_data
+
+    df = pd.read_csv(resolved_path, index_col=0, parse_dates=True)
+    print(f"  Loaded data: {len(df)} rows from {resolved_path}")
+
+    # I use the held-out eval split (last 20%) for fair comparison
+    if use_eval_split:
+        split_idx = int(len(df) * 0.80)
+        df_eval = df.iloc[split_idx:].copy()
+        print(f"  Using eval split: {len(df_eval)} rows "
+              f"({df_eval.index[0]} to {df_eval.index[-1]})")
+    else:
+        df_eval = df
+        print(f"  Using full dataset for evaluation")
+
+    # ----------------------------------------------------------------
+    # 3. I load the MaskablePPO model
+    # ----------------------------------------------------------------
     model = MaskablePPO.load(model_path)
 
-    # I try to load VecNormalize
-    vec_path = Path(model_path).parent / "vec_normalize_unified.pkl"
-    vec_normalize = None
+    # ----------------------------------------------------------------
+    # 4. I create evaluation environment with MATCHING settings
+    # ----------------------------------------------------------------
+    eval_episode_steps = int(336 / time_step_hours)  # 2 weeks
+
+    def _make_eval():
+        env = BatteryEnvUnified(
+            df=df_eval,
+            time_step_hours=time_step_hours,
+            episode_length=eval_episode_steps,
+            random_start=True,
+            enable_full_market=enable_full_market,
+            enable_forecast=enable_forecast,
+            forecaster_path=forecaster_path,
+            forecast_noise=False,
+            enable_market_forecast=enable_market_forecast,
+            market_forecaster_path=market_forecaster_path,
+            enable_endogenous_dam=enable_endogenous_dam,
+            dam_bidder_min_spread=dam_bidder_min_spread,
+            mfrr_activation_rate=mfrr_activation_rate,
+            mfrr_price_cap=mfrr_price_cap,
+        )
+        return Monitor(env)
+
+    eval_vec = MaskableVecEnv([_make_eval])
+
+    # ----------------------------------------------------------------
+    # 5. I load VecNormalize stats and wrap the eval env
+    # ----------------------------------------------------------------
+    vec_path = model_dir / "vec_normalize_unified.pkl"
     if vec_path.exists():
-        vec_normalize = VecNormalize.load(str(vec_path), DummyVecEnv([lambda: create_eval_env(data_path)]))
-        vec_normalize.training = False
-        vec_normalize.norm_reward = False
+        eval_vec = VecNormalize.load(str(vec_path), eval_vec)
+        eval_vec.training = False
+        eval_vec.norm_reward = False
+        print(f"  VecNormalize loaded from {vec_path} "
+              f"(obs_rms mean[:3]={eval_vec.obs_rms.mean[:3].round(3)})")
+    else:
+        print(f"  WARNING: No VecNormalize found at {vec_path} "
+              f"-- model will receive un-normalized observations!")
 
-    # I create evaluation environment
-    if not Path(data_path).exists():
-        data_path = project_root / data_path
-
-    eval_env = create_eval_env(data_path)
-    eval_env = DummyVecEnv([lambda: eval_env])
-
-    if vec_normalize is not None:
-        eval_env = vec_normalize
-
-    # I run evaluation
+    # ----------------------------------------------------------------
+    # 6. I run evaluation episodes
+    # ----------------------------------------------------------------
     results = {
         'episode_profits': [],
         'episode_cycles': [],
         'episode_lengths': [],
         'afrr_activations': [],
-        'dam_violations': []
+        'dam_violations': [],
+        'per_market': []
     }
 
     for episode in range(n_episodes):
-        obs = eval_env.reset()
+        obs = eval_vec.reset()
         done = False
         episode_profit = 0.0
         episode_cycles = 0.0
         episode_length = 0
         afrr_activations = 0
         dam_violations = 0
+        last_info = {}
 
         while not done:
-            action_masks = eval_env.env_method("action_masks")[0]
-            action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
-            obs, reward, done, info = eval_env.step(action)
+            action_masks = eval_vec.env_method("action_masks")[0]
+            action, _ = model.predict(obs, deterministic=True,
+                                      action_masks=action_masks)
+            obs, reward, done, info = eval_vec.step(action)
 
             info = info[0]
+            last_info = info
             episode_profit += info.get('net_profit', 0)
-            episode_cycles += info.get('cycle_fraction', 0)
             episode_length += 1
 
             if info.get('afrr_activated', False):
@@ -667,30 +895,63 @@ def evaluate_model(
             if info.get('dam_shortfall_mw', 0) > 0.1:
                 dam_violations += 1
 
+        # I use the env's own cumulative cycle counter (accurate)
+        episode_cycles = last_info.get('total_cycles', 0)
+
         results['episode_profits'].append(episode_profit)
         results['episode_cycles'].append(episode_cycles)
         results['episode_lengths'].append(episode_length)
         results['afrr_activations'].append(afrr_activations)
         results['dam_violations'].append(dam_violations)
 
-        print(f"Episode {episode + 1}: Profit={episode_profit:,.0f} EUR, Cycles={episode_cycles:.2f}")
+        # I log per-market breakdown from the final info
+        market_summary = {
+            'dam': last_info.get('dam_profit', 0),
+            'intraday': last_info.get('intraday_profit', 0),
+            'afrr_cap': last_info.get('afrr_capacity_profit', 0),
+            'afrr_energy': last_info.get('afrr_energy_profit', 0),
+            'mfrr': last_info.get('mfrr_profit', 0),
+        }
+        results['per_market'].append(market_summary)
 
-    # I calculate summary statistics
+        print(f"Episode {episode + 1}: Profit={episode_profit:,.0f} EUR, "
+              f"Cycles={episode_cycles:.2f}, "
+              f"DAM={market_summary['dam']:,.0f}, "
+              f"aFRR_cap={market_summary['afrr_cap']:,.0f}, "
+              f"ID={market_summary['intraday']:,.0f}")
+
+    # ----------------------------------------------------------------
+    # 7. I calculate summary statistics
+    # ----------------------------------------------------------------
     results['mean_profit'] = np.mean(results['episode_profits'])
     results['std_profit'] = np.std(results['episode_profits'])
     results['mean_cycles'] = np.mean(results['episode_cycles'])
-    results['profit_per_cycle'] = results['mean_profit'] / max(0.01, results['mean_cycles'])
-    results['dam_violation_rate'] = np.sum(results['dam_violations']) / np.sum(results['episode_lengths'])
-    results['afrr_activation_rate'] = np.sum(results['afrr_activations']) / np.sum(results['episode_lengths'])
+    results['profit_per_cycle'] = (
+        results['mean_profit'] / max(0.01, results['mean_cycles'])
+    )
+    total_steps = max(1, np.sum(results['episode_lengths']))
+    results['dam_violation_rate'] = np.sum(results['dam_violations']) / total_steps
+    results['afrr_activation_rate'] = np.sum(results['afrr_activations']) / total_steps
 
-    print("\n" + "=" * 40)
+    # I aggregate per-market means
+    market_keys = ['dam', 'intraday', 'afrr_cap', 'afrr_energy', 'mfrr']
+    results['mean_per_market'] = {
+        k: np.mean([m[k] for m in results['per_market']]) for k in market_keys
+    }
+
+    print("\n" + "=" * 50)
     print("EVALUATION SUMMARY")
-    print("=" * 40)
-    print(f"Mean Profit: {results['mean_profit']:,.0f} EUR (±{results['std_profit']:,.0f})")
-    print(f"Mean Cycles: {results['mean_cycles']:.2f}")
-    print(f"Profit per Cycle: {results['profit_per_cycle']:,.0f} EUR")
-    print(f"DAM Violation Rate: {results['dam_violation_rate']:.2%}")
-    print(f"aFRR Activation Rate: {results['afrr_activation_rate']:.2%}")
+    print("=" * 50)
+    print(f"Episodes:       {n_episodes}")
+    print(f"Mean Profit:    {results['mean_profit']:,.0f} EUR "
+          f"(+/-{results['std_profit']:,.0f})")
+    print(f"Mean Cycles:    {results['mean_cycles']:.2f}")
+    print(f"Profit/Cycle:   {results['profit_per_cycle']:,.0f} EUR")
+    print(f"DAM Violations: {results['dam_violation_rate']:.2%}")
+    print(f"aFRR Activations: {results['afrr_activation_rate']:.2%}")
+    print(f"\nPer-Market Breakdown (mean):")
+    for k, v in results['mean_per_market'].items():
+        print(f"  {k:>12s}: {v:>+10,.0f} EUR")
 
     return results
 
@@ -699,7 +960,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Train Unified Multi-Market Model")
-    parser.add_argument("--data", type=str, default="data/unified_multimarket_training.csv",
+    parser.add_argument("--data", type=str, default="data/unified_multimarket_training_v2.csv",
                         help="Path to training data")
     parser.add_argument("--output", type=str, default="models/unified",
                         help="Output directory")
@@ -723,12 +984,30 @@ if __name__ == "__main__":
                         help="Path to model for evaluation (skip training)")
     parser.add_argument("--full-market", action='store_true',
                         help="Enable IDA1/2/3/XBID + Free Bids (75 obs, 5 action dims)")
+    parser.add_argument("--enable-forecast", action='store_true',
+                        help="Enable IntraDay price forecast features (+9 obs)")
+    parser.add_argument("--forecaster-path", type=str,
+                        default="models/intraday_forecaster.pkl",
+                        help="Path to trained IntraDayForecaster pickle")
+    parser.add_argument("--enable-market-forecast", action='store_true',
+                        help="Enable DAM+ID+Imbalance forecast features (+15 obs)")
+    parser.add_argument("--market-forecaster-path", type=str,
+                        default="models/market_forecaster.pkl",
+                        help="Path to trained MarketForecaster pickle")
+    parser.add_argument("--enable-endogenous-dam", action='store_true',
+                        help="Enable forecast-powered DAM commitment generation")
+    parser.add_argument("--dam-bidder-min-spread", type=float, default=30.0,
+                        help="Minimum DAM spread (EUR) to trigger trading (default: 30)")
+    parser.add_argument("--mfrr-activation-rate", type=float, default=0.35,
+                        help="mFRR bid activation probability (default: 0.35)")
+    parser.add_argument("--mfrr-price-cap", type=float, default=500.0,
+                        help="mFRR settlement price cap EUR/MWh (default: 500)")
 
     args = parser.parse_args()
 
     if args.eval:
-        # I run evaluation only
-        results = evaluate_model(args.eval, args.data)
+        # I run evaluation only (config auto-loaded from training_config.json)
+        results = evaluate_model(args.eval, args.data, use_eval_split=True)
     else:
         # I run training
         model_path = train_unified_model(
@@ -742,7 +1021,15 @@ if __name__ == "__main__":
             device=args.device,
             resume_from=args.resume,
             time_step_hours=args.time_step,
-            enable_full_market=args.full_market
+            enable_full_market=args.full_market,
+            enable_forecast=args.enable_forecast,
+            forecaster_path=args.forecaster_path,
+            enable_market_forecast=args.enable_market_forecast,
+            market_forecaster_path=args.market_forecaster_path,
+            enable_endogenous_dam=args.enable_endogenous_dam,
+            dam_bidder_min_spread=args.dam_bidder_min_spread,
+            mfrr_activation_rate=args.mfrr_activation_rate,
+            mfrr_price_cap=args.mfrr_price_cap
         )
 
         # I run evaluation on trained model

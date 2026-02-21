@@ -249,3 +249,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
     def action_masks(self):
         """I expose inner env's action masks for logging/analysis."""
         return self._inner.action_masks()
+
+    def set_degradation_cost(self, cost: float):
+        """I set degradation cost for curriculum learning (SubprocVecEnv compatible)."""
+        self._inner.reward_calculator.degradation_cost = cost
