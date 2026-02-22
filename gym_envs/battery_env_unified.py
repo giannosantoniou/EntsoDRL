@@ -956,53 +956,58 @@ class BatteryEnvUnified(gym.Env):
             mfrr_level = self.MFRR_LEVELS[balancing_qty_action]
             requested_mfrr = mfrr_level * remaining_after_intraday
 
-            # I determine mFRR activation from real market data (ADMIE volumes).
-            # Real data shows 84% UP and 96% DOWN system-wide activation rates,
-            # but individual BSP selection is much rarer. I apply a probabilistic
-            # gate (mfrr_activation_rate=35%) on top of the system-wide check.
-            # When activation columns are missing, I fall back to the legacy
-            # imbalance-based heuristic.
-            has_activation_data = 'mfrr_activated_up_mwh' in row.index if hasattr(row, 'index') else 'mfrr_activated_up_mwh' in row
-            if has_activation_data:
-                # I check two gates: (1) TSO activated mFRR in this direction,
-                # (2) our BSP was selected. The activation columns are system-wide
-                # volumes (non-zero 84-96% of the time), so I apply probabilistic
-                # BSP selection via mfrr_activation_rate to model realistic access.
-                total_up = row.get('mfrr_activated_up_mwh', 0.0)
-                total_down = row.get('mfrr_activated_down_mwh', 0.0)
+            # I skip the TSO activation gate in full-market mode because Free Bids
+            # are submitted to the balancing market auction — activation is decided
+            # by the merit order (Gate 2 in _simulate_free_bid_activation), not by
+            # the TSO selecting our BSP upfront.
+            if not self.enable_full_market:
+                # I determine mFRR activation from real market data (ADMIE volumes).
+                # Real data shows 84% UP and 96% DOWN system-wide activation rates,
+                # but individual BSP selection is much rarer. I apply a probabilistic
+                # gate (mfrr_activation_rate=35%) on top of the system-wide check.
+                # When activation columns are missing, I fall back to the legacy
+                # imbalance-based heuristic.
+                has_activation_data = 'mfrr_activated_up_mwh' in row.index if hasattr(row, 'index') else 'mfrr_activated_up_mwh' in row
+                if has_activation_data:
+                    # I check two gates: (1) TSO activated mFRR in this direction,
+                    # (2) our BSP was selected. The activation columns are system-wide
+                    # volumes (non-zero 84-96% of the time), so I apply probabilistic
+                    # BSP selection via mfrr_activation_rate to model realistic access.
+                    total_up = row.get('mfrr_activated_up_mwh', 0.0)
+                    total_down = row.get('mfrr_activated_down_mwh', 0.0)
 
-                if requested_mfrr > 0:
-                    if total_up <= 0:
-                        requested_mfrr = 0.0  # TSO didn't activate UP this period
-                    elif np.random.random() > self.mfrr_activation_rate:
-                        requested_mfrr = 0.0  # Our BSP not selected
-                elif requested_mfrr < 0:
-                    if total_down <= 0:
-                        requested_mfrr = 0.0  # TSO didn't activate DOWN this period
-                    elif np.random.random() > self.mfrr_activation_rate:
-                        requested_mfrr = 0.0  # Our BSP not selected
-            else:
-                # I fall back to legacy imbalance-based constraint
-                imbalance = row.get('net_imbalance_mw_lag_1h',
-                                    row.get('system_deviation_mwh_lag_1h',
-                                            row.get('net_imbalance_mw', 0.0)))
-                if abs(imbalance) <= self.mfrr_imbalance_threshold:
-                    requested_mfrr = 0.0  # Balanced -> mFRR closed
-                elif imbalance < -self.mfrr_imbalance_threshold and requested_mfrr < 0:
-                    requested_mfrr = 0.0  # Can't charge during deficit
-                elif imbalance > self.mfrr_imbalance_threshold and requested_mfrr > 0:
-                    requested_mfrr = 0.0  # Can't discharge during surplus
+                    if requested_mfrr > 0:
+                        if total_up <= 0:
+                            requested_mfrr = 0.0  # TSO didn't activate UP this period
+                        elif np.random.random() > self.mfrr_activation_rate:
+                            requested_mfrr = 0.0  # Our BSP not selected
+                    elif requested_mfrr < 0:
+                        if total_down <= 0:
+                            requested_mfrr = 0.0  # TSO didn't activate DOWN this period
+                        elif np.random.random() > self.mfrr_activation_rate:
+                            requested_mfrr = 0.0  # Our BSP not selected
+                else:
+                    # I fall back to legacy imbalance-based constraint
+                    imbalance = row.get('net_imbalance_mw_lag_1h',
+                                        row.get('system_deviation_mwh_lag_1h',
+                                                row.get('net_imbalance_mw', 0.0)))
+                    if abs(imbalance) <= self.mfrr_imbalance_threshold:
+                        requested_mfrr = 0.0  # Balanced -> mFRR closed
+                    elif imbalance < -self.mfrr_imbalance_threshold and requested_mfrr < 0:
+                        requested_mfrr = 0.0  # Can't charge during deficit
+                    elif imbalance > self.mfrr_imbalance_threshold and requested_mfrr > 0:
+                        requested_mfrr = 0.0  # Can't discharge during surplus
 
-                # I apply probabilistic activation only for legacy mode
-                if abs(requested_mfrr) > 0.1:
-                    activation_prob = self.mfrr_activation_rate
-                    abs_imbalance = abs(imbalance)
-                    if abs_imbalance > 500:
-                        activation_prob = min(0.9, activation_prob * 2.0)
-                    elif abs_imbalance > 200:
-                        activation_prob = min(0.8, activation_prob * 1.5)
-                    if np.random.random() > activation_prob:
-                        requested_mfrr = 0.0
+                    # I apply probabilistic activation only for legacy mode
+                    if abs(requested_mfrr) > 0.1:
+                        activation_prob = self.mfrr_activation_rate
+                        abs_imbalance = abs(imbalance)
+                        if abs_imbalance > 500:
+                            activation_prob = min(0.9, activation_prob * 2.0)
+                        elif abs_imbalance > 200:
+                            activation_prob = min(0.8, activation_prob * 1.5)
+                        if np.random.random() > activation_prob:
+                            requested_mfrr = 0.0
 
             if abs(requested_mfrr) > 0.1:
                 # I recalculate limits after XBID/IntraDay
