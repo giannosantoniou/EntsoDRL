@@ -14,11 +14,14 @@ Key Design Decisions:
 4. aFRR activation simulation with MANDATORY response requirement
 5. HEnEx-compliant gate closure awareness
 
-Action Space: MultiDiscrete([5, 5, 11, 11]) = 3,025 combinations
+Action Space: MultiDiscrete([5, 5, 11, 11]) = 3,025 combinations (legacy)
+             MultiDiscrete([5, 5, 11, 11, 11, 5]) = 166,375 (full market)
 - [0] aFRR Commitment: 0%, 25%, 50%, 75%, 100% of remaining capacity
 - [1] aFRR Price Tier: 5 levels from aggressive to conservative bidding
 - [2] IntraDay Action: 11 levels (-1.0 to +1.0) × remaining capacity after aFRR
-- [3] mFRR Action: 11 levels (-1.0 to +1.0) × remaining capacity after IntraDay
+- [3] mFRR Qty: 11 levels — TSO-activated, pay-as-cleared, mandatory
+- [4] Free Bid Qty: 11 levels — agent-submitted, pay-as-bid (full market only)
+- [5] Free Bid Price Tier: 5 levels (full market only)
 
 Observation Space: 64-100 features (see _build_observation for details)
   Base: 64 | +forecast: 9 | +market_forecast: 20 | +full_market: 12
@@ -64,6 +67,10 @@ class BatteryEnvUnified(gym.Env):
     N_INTRADAY_ACTIONS = 11
     N_MFRR_ACTIONS = 11
 
+    # I define Free Bid quantity levels (full market mode, same granularity as mFRR)
+    FREEBID_QTY_LEVELS = np.linspace(-1.0, 1.0, 11)  # 11 levels
+    N_FREEBID_QTY_ACTIONS = 11
+
     # I define Free Bid price tier multipliers (full market mode)
     FREEBID_PRICE_TIERS = np.array([0.8, 0.9, 1.0, 1.1, 1.2])  # 5 tiers
     N_FREEBID_PRICE_TIERS = 5
@@ -89,7 +96,7 @@ class BatteryEnvUnified(gym.Env):
         high_imbalance_boost: float = 1.5,  # Higher activation during system stress
 
         # mFRR parameters
-        mfrr_imbalance_threshold: float = 30.0,  # MW minimum |imbalance| for mFRR
+        mfrr_imbalance_threshold: float = 10.0,  # MW minimum |imbalance| for mFRR
         mfrr_activation_rate: float = 0.35,  # Probability of mFRR bid acceptance (35%)
         mfrr_price_cap: float = 500.0,  # EUR/MWh cap on mFRR settlement price
 
@@ -339,12 +346,15 @@ class BatteryEnvUnified(gym.Env):
     def _setup_spaces(self):
         """I define action and observation spaces."""
         if self.enable_full_market:
-            # I use 5-dim action space with Free Bid price tier
+            # I use 6-dim action space: mFRR and Free Bids are independent markets
+            # mFRR = TSO-activated, pay-as-cleared, mandatory response
+            # Free Bids = agent-submitted to balancing auction, pay-as-bid, merit-order
             self.action_space = spaces.MultiDiscrete([
                 len(self.AFRR_LEVELS),          # 5 aFRR commitment levels
                 len(self.AFRR_PRICE_TIERS),     # 5 aFRR price tiers
                 self.N_INTRADAY_ACTIONS,        # 11 XBID actions
-                self.N_MFRR_ACTIONS,            # 11 Balancing qty actions
+                self.N_MFRR_ACTIONS,            # 11 mFRR qty (TSO-activated)
+                self.N_FREEBID_QTY_ACTIONS,     # 11 Free Bid qty (agent-submitted)
                 self.N_FREEBID_PRICE_TIERS      # 5 Free Bid price tiers
             ])
         else:
@@ -453,7 +463,8 @@ class BatteryEnvUnified(gym.Env):
         I return hierarchical action masks for the MultiDiscrete space.
 
         Returns a flattened mask for sb3_contrib.MaskablePPO compatibility.
-        Total length = 5 + 5 + 11 + 11 = 32
+        Legacy: 5 + 5 + 11 + 11 = 32
+        Full market: 5 + 5 + 11 + 11 + 11 + 5 = 48
         """
         row = self.df.iloc[self.current_step]
 
@@ -544,6 +555,10 @@ class BatteryEnvUnified(gym.Env):
         # I use adjusted capacity/limits that account for aFRR commitment
         mfrr_mask = np.zeros(self.N_MFRR_ACTIONS, dtype=bool)
 
+        # I pre-define fallback variables so they're available for Free Bid mask too
+        mfrr_activated_up = False
+        mfrr_activated_down = False
+
         # I check for real activation data first (preferred)
         has_activation_data = ('mfrr_activated_up_mwh' in row.index
                                if hasattr(row, 'index') else
@@ -594,18 +609,58 @@ class BatteryEnvUnified(gym.Env):
 
         # I concatenate masks for MultiDiscrete format
         if self.enable_full_market:
-            # Mask 5: Free Bid price tier (5 options)
+            # Mask 5: Free Bid qty (11 options) — independent from mFRR
+            # I use the same capacity pool and direction logic as mFRR but they're
+            # separate markets: mFRR is TSO-activated, Free Bids are agent-submitted.
+            freebid_qty_mask = np.zeros(self.N_FREEBID_QTY_ACTIONS, dtype=bool)
+
+            if has_activation_data:
+                # I allow Free Bid directions based on TSO activation data
+                if mfrr_activated_up:
+                    for i, level in enumerate(self.FREEBID_QTY_LEVELS):
+                        if level > 0:
+                            power_mw = level * remaining_for_trading
+                            if power_mw <= adjusted_max_discharge + 0.01:
+                                freebid_qty_mask[i] = True
+                if mfrr_activated_down:
+                    for i, level in enumerate(self.FREEBID_QTY_LEVELS):
+                        if level < 0:
+                            power_mw = abs(level) * remaining_for_trading
+                            if power_mw <= adjusted_max_charge + 0.01:
+                                freebid_qty_mask[i] = True
+            else:
+                # I fall back to legacy imbalance-based heuristic for Free Bids
+                if imbalance < -self.mfrr_imbalance_threshold and mfrr_up_price > 1.0:
+                    for i, level in enumerate(self.FREEBID_QTY_LEVELS):
+                        if level > 0:
+                            power_mw = level * remaining_for_trading
+                            if power_mw <= adjusted_max_discharge + 0.01:
+                                freebid_qty_mask[i] = True
+                elif imbalance > self.mfrr_imbalance_threshold and mfrr_down_price > 1.0:
+                    for i, level in enumerate(self.FREEBID_QTY_LEVELS):
+                        if level < 0:
+                            power_mw = abs(level) * remaining_for_trading
+                            if power_mw <= adjusted_max_charge + 0.01:
+                                freebid_qty_mask[i] = True
+
+            freebid_qty_mask[self.N_FREEBID_QTY_ACTIONS // 2] = True  # I always allow idle
+
+            # Mask 6: Free Bid price tier (5 options)
             price_tier_mask = np.ones(self.N_FREEBID_PRICE_TIERS, dtype=bool)
 
-            # I only allow price setting when mFRR is active (any direction)
-            mfrr_has_direction = any(mfrr_mask[i] for i in range(self.N_MFRR_ACTIONS) if i != self.N_MFRR_ACTIONS // 2)
-            if not mfrr_has_direction:
-                # No mFRR available -> force neutral price (index 2 = 1.0x)
+            # I only allow price setting when Free Bid qty has a non-idle direction
+            freebid_has_direction = any(
+                freebid_qty_mask[i] for i in range(self.N_FREEBID_QTY_ACTIONS)
+                if i != self.N_FREEBID_QTY_ACTIONS // 2
+            )
+            if not freebid_has_direction:
+                # No Free Bid available -> force neutral price (index 2 = 1.0x)
                 price_tier_mask = np.zeros(self.N_FREEBID_PRICE_TIERS, dtype=bool)
                 price_tier_mask[2] = True
 
             full_mask = np.concatenate([
-                afrr_mask, price_mask, intraday_mask, mfrr_mask, price_tier_mask
+                afrr_mask, price_mask, intraday_mask, mfrr_mask,
+                freebid_qty_mask, price_tier_mask
             ])
         else:
             full_mask = np.concatenate([afrr_mask, price_mask, intraday_mask, mfrr_mask])
@@ -622,8 +677,9 @@ class BatteryEnvUnified(gym.Env):
         afrr_action = action[0]
         price_tier_action = action[1]
         xbid_action = action[2]                    # Renamed from intraday_action
-        balancing_qty_action = action[3]            # Renamed from mfrr_action
-        balancing_price_action = action[4] if self.enable_full_market else 2  # Default neutral
+        mfrr_qty_action = action[3]                # mFRR qty (TSO-activated)
+        freebid_qty_action = action[4] if self.enable_full_market else 5  # FreeBid qty (idle=5)
+        freebid_price_action = action[5] if self.enable_full_market else 2  # FreeBid price (neutral=2)
 
         # I get current market data
         row = self.df.iloc[self.current_step]
@@ -944,70 +1000,63 @@ class BatteryEnvUnified(gym.Env):
         remaining_after_intraday = remaining_after_ida - abs(intraday_energy_mw)
 
         # =====================================================================
-        # STAGE 8: EXECUTE BALANCING (Free Bid / mFRR)
+        # STAGE 8A: EXECUTE mFRR (TSO-activated, pay-as-cleared, mandatory)
+        # I always apply the TSO activation gate for mFRR — in both legacy and
+        # full-market modes. mFRR is a TSO-directed service; the agent cannot
+        # submit mFRR bids voluntarily.
         # =====================================================================
         mfrr_energy_mw = 0.0
-        free_bid_energy_mw = 0.0
         mfrr_revenue = 0.0
-        free_bid_activated = False
-        agent_bid_price = 0.0
 
         if not afrr_activated:
-            mfrr_level = self.MFRR_LEVELS[balancing_qty_action]
+            mfrr_level = self.MFRR_LEVELS[mfrr_qty_action]
             requested_mfrr = mfrr_level * remaining_after_intraday
 
-            # I skip the TSO activation gate in full-market mode because Free Bids
-            # are submitted to the balancing market auction — activation is decided
-            # by the merit order (Gate 2 in _simulate_free_bid_activation), not by
-            # the TSO selecting our BSP upfront.
-            if not self.enable_full_market:
-                # I determine mFRR activation from real market data (ADMIE volumes).
-                # Real data shows 84% UP and 96% DOWN system-wide activation rates,
-                # but individual BSP selection is much rarer. I apply a probabilistic
-                # gate (mfrr_activation_rate=35%) on top of the system-wide check.
-                # When activation columns are missing, I fall back to the legacy
-                # imbalance-based heuristic.
-                has_activation_data = 'mfrr_activated_up_mwh' in row.index if hasattr(row, 'index') else 'mfrr_activated_up_mwh' in row
-                if has_activation_data:
-                    # I check two gates: (1) TSO activated mFRR in this direction,
-                    # (2) our BSP was selected. The activation columns are system-wide
-                    # volumes (non-zero 84-96% of the time), so I apply probabilistic
-                    # BSP selection via mfrr_activation_rate to model realistic access.
-                    total_up = row.get('mfrr_activated_up_mwh', 0.0)
-                    total_down = row.get('mfrr_activated_down_mwh', 0.0)
+            # I determine mFRR activation from real market data (ADMIE volumes).
+            # Real data shows 84% UP and 96% DOWN system-wide activation rates,
+            # but individual BSP selection is much rarer. I apply a probabilistic
+            # gate (mfrr_activation_rate=35%) on top of the system-wide check.
+            # When activation columns are missing, I fall back to the legacy
+            # imbalance-based heuristic.
+            has_activation_data_exec = 'mfrr_activated_up_mwh' in row.index if hasattr(row, 'index') else 'mfrr_activated_up_mwh' in row
+            if has_activation_data_exec:
+                # I check two gates: (1) TSO activated mFRR in this direction,
+                # (2) our BSP was selected.
+                total_up = row.get('mfrr_activated_up_mwh', 0.0)
+                total_down = row.get('mfrr_activated_down_mwh', 0.0)
 
-                    if requested_mfrr > 0:
-                        if total_up <= 0:
-                            requested_mfrr = 0.0  # TSO didn't activate UP this period
-                        elif np.random.random() > self.mfrr_activation_rate:
-                            requested_mfrr = 0.0  # Our BSP not selected
-                    elif requested_mfrr < 0:
-                        if total_down <= 0:
-                            requested_mfrr = 0.0  # TSO didn't activate DOWN this period
-                        elif np.random.random() > self.mfrr_activation_rate:
-                            requested_mfrr = 0.0  # Our BSP not selected
-                else:
-                    # I fall back to legacy imbalance-based constraint
-                    imbalance = row.get('net_imbalance_mw_lag_1h',
-                                        row.get('system_deviation_mwh_lag_1h',
-                                                row.get('net_imbalance_mw', 0.0)))
-                    if abs(imbalance) <= self.mfrr_imbalance_threshold:
-                        requested_mfrr = 0.0  # Balanced -> mFRR closed
-                    elif imbalance < -self.mfrr_imbalance_threshold and requested_mfrr < 0:
-                        requested_mfrr = 0.0  # Can't charge during deficit
-                    elif imbalance > self.mfrr_imbalance_threshold and requested_mfrr > 0:
-                        requested_mfrr = 0.0  # Can't discharge during surplus
+                if requested_mfrr > 0:
+                    if total_up <= 0:
+                        requested_mfrr = 0.0  # TSO didn't activate UP this period
+                    elif np.random.random() > self.mfrr_activation_rate:
+                        requested_mfrr = 0.0  # Our BSP not selected
+                elif requested_mfrr < 0:
+                    if total_down <= 0:
+                        requested_mfrr = 0.0  # TSO didn't activate DOWN this period
+                    elif np.random.random() > self.mfrr_activation_rate:
+                        requested_mfrr = 0.0  # Our BSP not selected
+            else:
+                # I fall back to legacy imbalance-based constraint
+                imbalance = row.get('net_imbalance_mw_lag_1h',
+                                    row.get('system_deviation_mwh_lag_1h',
+                                            row.get('net_imbalance_mw', 0.0)))
+                if abs(imbalance) <= self.mfrr_imbalance_threshold:
+                    requested_mfrr = 0.0  # Balanced -> mFRR closed
+                elif imbalance < -self.mfrr_imbalance_threshold and requested_mfrr < 0:
+                    requested_mfrr = 0.0  # Can't charge during deficit
+                elif imbalance > self.mfrr_imbalance_threshold and requested_mfrr > 0:
+                    requested_mfrr = 0.0  # Can't discharge during surplus
 
-                    # I apply probabilistic activation only for legacy mode
-                    if abs(requested_mfrr) > 0.1:
-                        activation_prob = self.mfrr_activation_rate
-                        abs_imbalance = abs(imbalance)
-                        if abs_imbalance > 500:
-                            activation_prob = min(0.9, activation_prob * 2.0)
-                        elif abs_imbalance > 200:
-                            activation_prob = min(0.8, activation_prob * 1.5)
-                        if np.random.random() > activation_prob:
-                            requested_mfrr = 0.0
+                # I apply probabilistic activation
+                if abs(requested_mfrr) > 0.1:
+                    activation_prob = self.mfrr_activation_rate
+                    abs_imbalance = abs(imbalance)
+                    if abs_imbalance > 500:
+                        activation_prob = min(0.9, activation_prob * 2.0)
+                    elif abs_imbalance > 200:
+                        activation_prob = min(0.8, activation_prob * 1.5)
+                    if np.random.random() > activation_prob:
+                        requested_mfrr = 0.0
 
             if abs(requested_mfrr) > 0.1:
                 # I recalculate limits after XBID/IntraDay
@@ -1029,79 +1078,122 @@ class BatteryEnvUnified(gym.Env):
                     actual_mfrr = max(requested_mfrr, -max_charge)
 
                 if abs(actual_mfrr) > 0.1:
-                    if self.enable_full_market:
-                        # I use Free Bid: agent sets price, activation is probabilistic
-                        imbalance = row.get('net_imbalance_mw_lag_1h',
-                                            row.get('net_imbalance_mw', 0.0))
-                        price_tier = self.FREEBID_PRICE_TIERS[balancing_price_action]
-                        ref_price = row.get('free_bid_reference_price',
-                                            row.get('mfrr_price_up', 100.0))
-                        agent_bid_price = ref_price * price_tier
-                        self.free_bid_submissions += 1
+                    if actual_mfrr > 0:  # Sell (discharge) — pay-as-cleared
+                        energy_mwh = actual_mfrr * self.time_step_hours
+                        soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
+                        old_soc = self.soc
+                        self.soc = max(self.min_soc, self.soc - soc_delta)
+                        actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
 
-                        free_bid_activated = self._simulate_free_bid_activation(
-                            agent_bid_price, ref_price, imbalance, row
+                        # I use LAGGED mFRR price — the settlement price is ex-post,
+                        # so I use the best estimate available at decision time (1h lag).
+                        mfrr_price = min(
+                            row.get('mfrr_price_up_lag_1h',
+                                    row.get('mfrr_price_up', 120.0)),
+                            self.mfrr_price_cap
                         )
+                        mfrr_revenue = actual_energy * mfrr_price
 
-                        if not free_bid_activated:
-                            actual_mfrr = 0.0  # I don't execute if not activated
+                    else:  # Provide DOWN regulation (charge) — pay-as-cleared
+                        energy_mwh = abs(actual_mfrr) * self.time_step_hours
+                        soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
+                        old_soc = self.soc
+                        self.soc = min(self.max_soc, self.soc + soc_delta)
+                        actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
 
-                    if abs(actual_mfrr) > 0.1:
-                        if actual_mfrr > 0:  # Sell (discharge)
-                            energy_mwh = actual_mfrr * self.time_step_hours
+                        mfrr_price = min(
+                            row.get('mfrr_price_down_lag_1h',
+                                    row.get('mfrr_price_down', 60.0)),
+                            self.mfrr_price_cap
+                        )
+                        mfrr_revenue = actual_energy * mfrr_price
+
+                    cycle_fraction = actual_energy / self.capacity_mwh
+                    self.total_cycles += cycle_fraction
+                    self.daily_cycles += cycle_fraction
+
+                    mfrr_energy_mw = actual_mfrr
+                    self.mfrr_profit += mfrr_revenue
+                    actual_energy_mw += actual_mfrr
+
+        # I calculate remaining capacity after mFRR for Free Bids
+        remaining_after_mfrr = remaining_after_intraday - abs(mfrr_energy_mw)
+
+        # =====================================================================
+        # STAGE 8B: EXECUTE FREE BID (agent-submitted, pay-as-bid, merit-order)
+        # I only execute Free Bids in full-market mode. The agent sets both
+        # quantity and price; activation depends on merit-order simulation.
+        # =====================================================================
+        free_bid_energy_mw = 0.0
+        free_bid_revenue = 0.0
+        free_bid_activated = False
+        agent_bid_price = 0.0
+
+        if self.enable_full_market and not afrr_activated:
+            freebid_level = self.FREEBID_QTY_LEVELS[freebid_qty_action]
+            requested_freebid = freebid_level * remaining_after_mfrr
+
+            if abs(requested_freebid) > 0.1:
+                # I recalculate limits after mFRR (SoC may have changed)
+                available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
+                available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
+
+                max_discharge = min(
+                    remaining_after_mfrr,
+                    available_discharge_mwh * self.eff_sqrt / self.time_step_hours
+                )
+                max_charge = min(
+                    remaining_after_mfrr,
+                    available_charge_mwh / self.eff_sqrt / self.time_step_hours
+                )
+
+                if requested_freebid > 0:
+                    actual_freebid = min(requested_freebid, max_discharge)
+                else:
+                    actual_freebid = max(requested_freebid, -max_charge)
+
+                if abs(actual_freebid) > 0.1:
+                    # I set the agent's bid price using the selected price tier
+                    imbalance_fb = row.get('net_imbalance_mw_lag_1h',
+                                           row.get('net_imbalance_mw', 0.0))
+                    price_tier = self.FREEBID_PRICE_TIERS[freebid_price_action]
+                    ref_price = row.get('free_bid_reference_price',
+                                        row.get('mfrr_price_up', 100.0))
+                    agent_bid_price = ref_price * price_tier
+                    self.free_bid_submissions += 1
+
+                    # I simulate merit-order activation
+                    free_bid_activated = self._simulate_free_bid_activation(
+                        agent_bid_price, ref_price, imbalance_fb, row
+                    )
+
+                    if free_bid_activated:
+                        if actual_freebid > 0:  # Sell (discharge) — pay-as-bid
+                            energy_mwh = actual_freebid * self.time_step_hours
                             soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
                             old_soc = self.soc
                             self.soc = max(self.min_soc, self.soc - soc_delta)
                             actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
 
-                            if self.enable_full_market:
-                                # Free Bid: pay-as-bid (agent's price)
-                                mfrr_revenue = actual_energy * agent_bid_price
-                            else:
-                                # I use LAGGED mFRR price — the settlement price is ex-post,
-                                # so I use the best estimate available at decision time (1h lag).
-                                # This prevents data leakage from future settlement prices.
-                                mfrr_price = min(
-                                    row.get('mfrr_price_up_lag_1h',
-                                            row.get('mfrr_price_up', 120.0)),
-                                    self.mfrr_price_cap
-                                )
-                                mfrr_revenue = actual_energy * mfrr_price
+                            free_bid_revenue = actual_energy * agent_bid_price
 
-                        else:  # Provide DOWN regulation (charge)
-                            energy_mwh = abs(actual_mfrr) * self.time_step_hours
+                        else:  # Buy (charge) — pay-as-bid
+                            energy_mwh = abs(actual_freebid) * self.time_step_hours
                             soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
                             old_soc = self.soc
                             self.soc = min(self.max_soc, self.soc + soc_delta)
                             actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
 
-                            if self.enable_full_market:
-                                # I receive payment for providing downward balancing service
-                                mfrr_revenue = actual_energy * agent_bid_price
-                            else:
-                                # I receive the mFRR DOWN activation price for providing
-                                # downward regulation (absorbing surplus energy). This is a
-                                # balancing SERVICE payment, not an energy purchase cost.
-                                # I use LAGGED price to prevent data leakage.
-                                mfrr_price = min(
-                                    row.get('mfrr_price_down_lag_1h',
-                                            row.get('mfrr_price_down', 60.0)),
-                                    self.mfrr_price_cap
-                                )
-                                mfrr_revenue = actual_energy * mfrr_price
+                            free_bid_revenue = actual_energy * agent_bid_price
 
                         cycle_fraction = actual_energy / self.capacity_mwh
                         self.total_cycles += cycle_fraction
                         self.daily_cycles += cycle_fraction
 
-                        if self.enable_full_market:
-                            free_bid_energy_mw = actual_mfrr
-                            self.free_bid_profit += mfrr_revenue
-                            self.free_bid_activations += 1
-                        else:
-                            mfrr_energy_mw = actual_mfrr
-                            self.mfrr_profit += mfrr_revenue
-                        actual_energy_mw += actual_mfrr
+                        free_bid_energy_mw = actual_freebid
+                        self.free_bid_profit += free_bid_revenue
+                        self.free_bid_activations += 1
+                        actual_energy_mw += actual_freebid
 
         # =====================================================================
         # STAGE 9: CALCULATE REWARD
@@ -2007,7 +2099,15 @@ class BatteryEnvUnified(gym.Env):
 
     def _simulate_free_bid_activation(self, bid_price, ref_price, imbalance, row):
         """I simulate merit-order based Free Bid activation."""
-        if abs(imbalance) < 30.0:
+        # I check activation using real ADMIE data when available, because
+        # net_imbalance_mw is often ~0 even when TSO activates mFRR volumes
+        mfrr_up = row.get('mfrr_activated_up_mwh', 0.0)
+        mfrr_down = row.get('mfrr_activated_down_mwh', 0.0)
+        if mfrr_up > 0 or mfrr_down > 0:
+            # I use activation data — TSO did activate mFRR this period
+            pass
+        elif abs(imbalance) < 10.0:
+            # I fall back to imbalance check only when activation data unavailable
             return False
 
         base_prob = row.get('free_bid_activation_base', 0.3)

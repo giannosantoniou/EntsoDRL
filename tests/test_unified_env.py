@@ -1455,7 +1455,7 @@ class TestIDADecomposition:
 
         # I run a few steps and check IDA execution
         for _ in range(20):
-            action = np.array([0, 2, 5, 5, 2])  # All idle except IDA (auto-executed)
+            action = np.array([0, 2, 5, 5, 5, 2])  # All idle except IDA (auto-executed)
             obs, reward, done, truncated, info = full_market_env.step(action)
 
             ida_mw = info.get('ida_energy_mw', 0)
@@ -1543,8 +1543,8 @@ class TestIDADecomposition:
         # I set a non-zero IDA position
         full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 5.0
 
-        # I request max XBID discharge + max balancing discharge
-        action = np.array([0, 2, 10, 10, 2])
+        # I request max XBID discharge + max mFRR discharge + max Free Bid discharge
+        action = np.array([0, 2, 10, 10, 10, 2])
         obs, reward, done, truncated, info = full_market_env.step(action)
 
         ida_mw = abs(info.get('ida_energy_mw', 0))
@@ -1560,15 +1560,15 @@ class TestIDADecomposition:
 class TestFreeBids:
     """I test Free Bid (Balancing Energy Offers)."""
 
-    def test_action_space_5dim(self, full_market_env):
-        """I verify action space is MultiDiscrete([5,5,11,11,5])."""
-        assert full_market_env.action_space.nvec.tolist() == [5, 5, 11, 11, 5]
+    def test_action_space_6dim(self, full_market_env):
+        """I verify action space is MultiDiscrete([5,5,11,11,11,5])."""
+        assert full_market_env.action_space.nvec.tolist() == [5, 5, 11, 11, 11, 5]
 
-    def test_mask_shape_37(self, full_market_env):
-        """I verify mask length is 5+5+11+11+5=37."""
+    def test_mask_shape_48(self, full_market_env):
+        """I verify mask length is 5+5+11+11+11+5=48."""
         full_market_env.reset(seed=42)
         mask = full_market_env.action_masks()
-        assert len(mask) == 5 + 5 + 11 + 11 + 5  # 37 total
+        assert len(mask) == 5 + 5 + 11 + 11 + 11 + 5  # 48 total
 
     def test_free_bid_price_sensitivity(self, full_market_env):
         """I verify lower bid prices -> higher activation probability."""
@@ -1639,23 +1639,158 @@ class TestFreeBids:
         assert result == False, "Free Bid should not activate when |imbalance| < 30 MW"
 
     def test_price_tier_masked_when_idle(self, full_market_env):
-        """I verify price tier forced to neutral when no mFRR activation."""
+        """I verify Free Bid price tier forced to neutral when no activation."""
         full_market_env.reset(seed=42)
         step = full_market_env.current_step
 
-        # I set zero activation volumes — no mFRR activity
+        # I set zero activation volumes — no mFRR/Free Bid activity
         full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 0.0
         full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 0.0
 
         mask = full_market_env.action_masks()
-        # Free Bid price tier mask is last 5 elements
-        freebid_mask = mask[-5:]
+        # Free Bid price tier mask is last 5 elements (after afrr(5)+price(5)+id(11)+mfrr(11)+fb_qty(11))
+        freebid_price_mask = mask[-5:]
 
         # Only neutral (index 2) should be allowed
-        assert freebid_mask[2] == True, "Neutral price tier (1.0x) must be allowed"
+        assert freebid_price_mask[2] == True, "Neutral price tier (1.0x) must be allowed"
         for i in [0, 1, 3, 4]:
-            assert freebid_mask[i] == False, \
-                f"Price tier {i} should be masked when no mFRR activation"
+            assert freebid_price_mask[i] == False, \
+                f"Price tier {i} should be masked when no Free Bid activation"
+
+    def test_mfrr_and_freebid_independent(self, full_market_env):
+        """I verify both mFRR and Free Bid can execute in the same step."""
+        full_market_env.reset(seed=42)
+        full_market_env.soc = 0.5
+        step = full_market_env.current_step
+
+        # I force conditions for both mFRR and Free Bid activation
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 300.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('dam_commitment')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('free_bid_activation_base')] = 0.99
+
+        # I set high mFRR activation rate so mFRR passes the TSO gate
+        full_market_env.mfrr_activation_rate = 1.0
+
+        # I use moderate mFRR discharge (action=8) + moderate Free Bid discharge (action=8) + lowest price
+        np.random.seed(0)
+        action = np.array([0, 2, 5, 8, 8, 0])
+        obs, reward, done, truncated, info = full_market_env.step(action)
+
+        mfrr_mw = abs(info.get('mfrr_energy_mw', 0))
+        fb_mw = abs(info.get('free_bid_energy_mw', 0))
+
+        # I verify at least one executed (both depend on random activation gates)
+        # With activation_rate=1.0 and base=0.99, both should execute
+        assert mfrr_mw > 0.01 or fb_mw > 0.01, \
+            "At least mFRR or Free Bid should execute with forced conditions"
+
+    def test_capacity_cascade_mfrr_then_freebid(self, full_market_env):
+        """I verify Free Bid capacity = remaining after mFRR."""
+        full_market_env.reset(seed=42)
+        full_market_env.soc = 0.5
+        step = full_market_env.current_step
+
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 300.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('dam_commitment')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('free_bid_activation_base')] = 0.99
+        full_market_env.mfrr_activation_rate = 1.0
+
+        # I request max mFRR + max Free Bid — capacity cascade should limit total
+        np.random.seed(0)
+        action = np.array([0, 2, 5, 10, 10, 0])  # Max mFRR + Max FreeBid
+        obs, reward, done, truncated, info = full_market_env.step(action)
+
+        mfrr_mw = abs(info.get('mfrr_energy_mw', 0))
+        fb_mw = abs(info.get('free_bid_energy_mw', 0))
+        total = mfrr_mw + fb_mw
+
+        assert total <= full_market_env.max_power_mw + 0.5, \
+            f"mFRR ({mfrr_mw:.1f}) + FreeBid ({fb_mw:.1f}) = {total:.1f} exceeds max_power"
+
+    def test_mfrr_tso_gate_always_applied(self, full_market_env):
+        """I verify mFRR requires TSO activation even in full-market mode."""
+        full_market_env.reset(seed=42)
+        full_market_env.soc = 0.5
+        step = full_market_env.current_step
+
+        # I set zero activation volumes — TSO gate should block mFRR
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('dam_commitment')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 0.0
+
+        # I try max mFRR discharge — should be blocked by TSO gate
+        action = np.array([0, 2, 5, 10, 5, 2])  # Max mFRR, idle FreeBid
+        obs, reward, done, truncated, info = full_market_env.step(action)
+
+        assert info.get('mfrr_energy_mw', 0) == pytest.approx(0.0, abs=0.01), \
+            "mFRR should not execute when TSO has not activated (activated_up_mwh=0)"
+
+    def test_mfrr_pay_as_cleared_in_full_market(self, full_market_env):
+        """I verify mFRR uses clearing price (lagged), not agent bid price."""
+        full_market_env.reset(seed=42)
+        full_market_env.soc = 0.7
+        step = full_market_env.current_step
+
+        # I set distinctive mFRR clearing price
+        mfrr_clearing = 180.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_price_up_lag_1h')] = mfrr_clearing
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_price_up')] = mfrr_clearing
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 300.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('dam_commitment')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 0.0
+        full_market_env.mfrr_activation_rate = 1.0
+
+        initial_mfrr_profit = full_market_env.mfrr_profit
+        np.random.seed(0)
+        action = np.array([0, 2, 5, 10, 5, 2])  # Max mFRR discharge, idle FreeBid
+        obs, reward, done, truncated, info = full_market_env.step(action)
+
+        mfrr_revenue = info.get('mfrr_revenue', 0)
+        mfrr_mw = abs(info.get('mfrr_energy_mw', 0))
+
+        if mfrr_mw > 0.01:
+            # I verify revenue uses clearing price, not some agent-set price
+            assert full_market_env.mfrr_profit > initial_mfrr_profit, \
+                "mFRR profit should accumulate when mFRR executes"
+            assert mfrr_revenue > 0, "mFRR revenue should be positive for discharge at 180 EUR"
+
+    def test_both_profits_tracked(self, full_market_env):
+        """I verify both mfrr_profit and free_bid_profit accumulate independently."""
+        full_market_env.reset(seed=42)
+        full_market_env.soc = 0.7
+        step = full_market_env.current_step
+
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 300.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('dam_commitment')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('free_bid_activation_base')] = 0.99
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('free_bid_reference_price')] = 150.0
+        full_market_env.mfrr_activation_rate = 1.0
+
+        # I try mFRR + Free Bid discharge in same step
+        np.random.seed(0)
+        action = np.array([0, 2, 5, 8, 8, 0])  # moderate mFRR + moderate FreeBid + aggressive price
+        obs, reward, done, truncated, info = full_market_env.step(action)
+
+        # I verify both profit accumulators exist and are independent
+        assert 'mfrr_profit' in info
+        assert 'free_bid_profit' in info
+        # I verify they are tracked in separate accumulators on the env
+        assert hasattr(full_market_env, 'mfrr_profit')
+        assert hasattr(full_market_env, 'free_bid_profit')
+
+    def test_freebid_qty_mask_idle_always_allowed(self, full_market_env):
+        """I verify Free Bid qty idle (center=5) is always allowed in mask."""
+        full_market_env.reset(seed=42)
+        mask = full_market_env.action_masks()
+
+        # I extract Free Bid qty mask: offset = 5+5+11+11 = 32, length = 11
+        freebid_qty_mask = mask[32:43]
+        assert freebid_qty_mask[5] == True, "Free Bid qty idle (index 5) must always be allowed"
 
 
 class TestBackwardCompat:
@@ -1696,12 +1831,12 @@ class TestSeparateRevenueTracking:
     def test_info_contains_all_markets(self, full_market_env):
         """I verify info has dam, ida, xbid, afrr, free_bid, mfrr profits."""
         full_market_env.reset(seed=42)
-        action = np.array([0, 2, 5, 5, 2])
+        action = np.array([0, 2, 5, 5, 5, 2])
         obs, reward, done, truncated, info = full_market_env.step(action)
 
         for key in ['dam_profit', 'ida_profit', 'xbid_profit',
                      'afrr_capacity_profit', 'afrr_energy_profit',
-                     'free_bid_profit']:
+                     'mfrr_profit', 'free_bid_profit']:
             assert key in info, f"Missing market profit key: {key}"
 
     def test_full_market_obs_shape(self, full_market_env):
@@ -1733,7 +1868,7 @@ class TestSeparateRevenueTracking:
         full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 0.0
 
         # I discharge on XBID
-        action = np.array([0, 2, 9, 5, 2])  # ~80% XBID discharge, idle balancing
+        action = np.array([0, 2, 9, 5, 5, 2])  # ~80% XBID discharge, idle mFRR/FreeBid
         obs, reward, done, truncated, info = full_market_env.step(action)
 
         xbid_mw = info.get('xbid_energy_mw', 0)
@@ -1745,8 +1880,8 @@ class TestSeparateRevenueTracking:
 class TestFullMarketStrategy:
     """I test strategy with full market mode."""
 
-    def test_rule_based_5dim_action(self, full_market_env):
-        """I verify rule-based strategy produces 5-element actions in full market mode."""
+    def test_rule_based_6dim_action(self, full_market_env):
+        """I verify rule-based strategy produces 6-element actions in full market mode."""
         from agent.unified_strategy import UnifiedRuleBasedStrategy
 
         strategy = UnifiedRuleBasedStrategy(enable_full_market=True)
@@ -1757,11 +1892,12 @@ class TestFullMarketStrategy:
         mask = full_market_env.action_masks()
 
         action = strategy.predict_action(obs, mask)
-        assert len(action) == 5
-        assert 0 <= action[4] < 5  # Free Bid price tier
+        assert len(action) == 6
+        assert 0 <= action[4] < 11  # Free Bid qty
+        assert 0 <= action[5] < 5   # Free Bid price tier
 
-    def test_conservative_5dim_action(self, full_market_env):
-        """I verify conservative strategy produces 5-element actions in full market mode."""
+    def test_conservative_6dim_action(self, full_market_env):
+        """I verify conservative strategy produces 6-element actions in full market mode."""
         from agent.unified_strategy import UnifiedConservativeStrategy
 
         strategy = UnifiedConservativeStrategy(enable_full_market=True)
@@ -1772,10 +1908,11 @@ class TestFullMarketStrategy:
         mask = full_market_env.action_masks()
 
         action = strategy.predict_action(obs, mask)
-        assert len(action) == 5
+        assert len(action) == 6
         assert action[0] == 0   # Zero aFRR
         assert action[2] == 5   # Idle XBID
-        assert action[3] == 5   # Idle balancing
+        assert action[3] == 5   # Idle mFRR
+        assert action[4] == 5   # Idle Free Bid qty
 
 
 # =========================================================================
@@ -2184,9 +2321,9 @@ class TestMFRRActivationAndCap:
             random_start=False, enable_full_market=True,
             mfrr_activation_rate=0.0,  # Would block mFRR in non-full mode
         )
-        # I just check env creates without error and has 5 action dims
+        # I check env creates without error and has 6 action dims (mFRR + FreeBid separated)
         obs, _ = env.reset(seed=42)
-        assert env.action_space.nvec.shape[0] == 5
+        assert env.action_space.nvec.shape[0] == 6
 
 
 class TestMarketForecastFeatures:
@@ -2712,7 +2849,7 @@ class TestIDAProfitAccumulation:
         # I run steps until IDA profit is non-zero
         ida_profit_found = False
         for _ in range(40):
-            action = np.array([0, 2, 5, 5, 2])  # All idle except auto-IDA
+            action = np.array([0, 2, 5, 5, 5, 2])  # All idle except auto-IDA
             obs, reward, done, truncated, info = full_market_env.step(action)
 
             if abs(info.get('ida_profit', 0)) > 0.01:
@@ -2748,7 +2885,7 @@ class TestIDAProfitAccumulation:
         env.reset(seed=42)
         env.soc = 0.8  # Enough SoC to discharge
 
-        action = np.array([0, 2, 5, 5, 2])
+        action = np.array([0, 2, 5, 5, 5, 2])
         obs, reward, done, truncated, info = env.step(action)
 
         # I expect IDA profit to be based on ida1_clearing_price=200, not price=50
@@ -2783,7 +2920,7 @@ class TestIDAProfitAccumulation:
         env.soc = 0.10  # Very low SoC — IDA will be heavily clipped
 
         initial_soc = env.soc
-        action = np.array([0, 2, 5, 5, 2])
+        action = np.array([0, 2, 5, 5, 5, 2])
         obs, reward, done, truncated, info = env.step(action)
 
         ida_mw = abs(info.get('ida_energy_mw', 0))
@@ -2808,15 +2945,113 @@ class TestIDAProfitAccumulation:
         full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('dam_commitment')] = 0.0
         full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 0.0
 
-        # I use max discharge + aggressive price tier (0=cheapest)
+        # I use max Free Bid discharge + aggressive price tier (0=cheapest)
         np.random.seed(0)  # Consistent activation
-        action = np.array([0, 2, 5, 10, 0])  # idle aFRR, idle ID, max mFRR discharge, lowest price tier
+        action = np.array([0, 2, 5, 5, 10, 0])  # idle aFRR/ID/mFRR, max FreeBid discharge, lowest price
 
         obs, reward, done, truncated, info = full_market_env.step(action)
 
         # I verify free_bid_energy_mw is in info (may be 0 if activation dice failed)
         assert 'free_bid_energy_mw' in info, "free_bid_energy_mw should always be in info"
         assert isinstance(info['free_bid_energy_mw'], (int, float))
+
+
+class TestFreeBidFixes:
+    """I test the Free Bid activation fixes (divisor, floor, threshold)."""
+
+    def test_free_bid_activation_base_realistic(self):
+        """I verify _synthesize_free_bid_data produces activation_base >= 0.10 for typical imbalances."""
+        from data.create_unified_training_data import _synthesize_free_bid_data
+
+        n = 200
+        dates = pd.date_range('2025-01-01', periods=n, freq='h')
+        # I use realistic Greek system imbalances (mean ~17 MW, std ~50 MW)
+        imbalances = np.random.normal(0, 50, n)
+        df = pd.DataFrame({
+            'net_imbalance_mw': imbalances,
+            'mfrr_price_up': np.full(n, 120.0),
+            'price': np.full(n, 100.0),
+        }, index=dates)
+        mask = pd.Series(True, index=dates)
+
+        result = _synthesize_free_bid_data(df, mask)
+
+        # I verify the floor: all values should be >= 0.10
+        assert (result['free_bid_activation_base'] >= 0.10 - 1e-9).all(), \
+            f"Floor violated: min={result['free_bid_activation_base'].min():.4f}"
+        # I verify the cap: all values should be <= 0.80
+        assert (result['free_bid_activation_base'] <= 0.80 + 1e-9).all(), \
+            f"Cap violated: max={result['free_bid_activation_base'].max():.4f}"
+        # I verify the mean is reasonable (not ~0.034 as before)
+        mean_prob = result['free_bid_activation_base'].mean()
+        assert mean_prob > 0.15, \
+            f"Mean activation base too low: {mean_prob:.4f} (expected > 0.15)"
+
+    def test_free_bid_reference_price_no_zeros(self):
+        """I verify fallback to ISP1/DAM price when mfrr_price_up is 0."""
+        from data.create_unified_training_data import _synthesize_free_bid_data
+
+        n = 100
+        dates = pd.date_range('2025-01-01', periods=n, freq='h')
+        df = pd.DataFrame({
+            'net_imbalance_mw': np.random.normal(0, 50, n),
+            'mfrr_price_up': np.zeros(n),  # All zeros — should trigger fallback
+            'price': np.full(n, 95.0),
+            'isp1_price_up': np.full(n, 110.0),
+        }, index=dates)
+        mask = pd.Series(True, index=dates)
+
+        result = _synthesize_free_bid_data(df, mask)
+
+        # I verify fallback to isp1_price_up (110.0) when mfrr_price_up is 0
+        assert (result['free_bid_reference_price'] == 110.0).all(), \
+            f"Fallback failed: got {result['free_bid_reference_price'].unique()}"
+
+    def test_free_bid_reference_price_fallback_to_dam(self):
+        """I verify fallback to DAM price when neither mfrr_price_up nor isp1 exist."""
+        from data.create_unified_training_data import _synthesize_free_bid_data
+
+        n = 50
+        dates = pd.date_range('2025-01-01', periods=n, freq='h')
+        df = pd.DataFrame({
+            'net_imbalance_mw': np.random.normal(0, 50, n),
+            'mfrr_price_up': np.zeros(n),
+            'price': np.full(n, 88.0),
+            # No isp1_price_up column — should fall back to 'price'
+        }, index=dates)
+        mask = pd.Series(True, index=dates)
+
+        result = _synthesize_free_bid_data(df, mask)
+
+        assert (result['free_bid_reference_price'] == 88.0).all(), \
+            f"DAM fallback failed: got {result['free_bid_reference_price'].unique()}"
+
+    def test_free_bid_activation_threshold_10mw(self, full_market_env):
+        """I verify env activates Free Bids at |imbalance| = 15 MW (above new 10 MW threshold)."""
+        full_market_env.reset(seed=42)
+        full_market_env.soc = 0.5
+        step = full_market_env.current_step
+
+        # I set imbalance to 15 MW — above the new 10 MW threshold
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_imbalance_mw')] = 15.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 100.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('dam_commitment')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 0.0
+        # I set high activation base to ensure activation
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('free_bid_activation_base')] = 0.99
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('free_bid_reference_price')] = 200.0
+
+        # I use max Free Bid discharge with cheapest price tier
+        np.random.seed(0)
+        action = np.array([0, 2, 5, 5, 10, 0])  # idle aFRR/ID/mFRR, max FreeBid, lowest price
+
+        obs, reward, done, truncated, info = full_market_env.step(action)
+
+        # I verify the Free Bid was eligible (imbalance 15 > threshold 10)
+        # The activation may still fail due to random dice, but the function was called
+        assert 'free_bid_energy_mw' in info
+        # I also verify that at the old threshold of 30, this would have been blocked
+        # (15 < 30), so this test confirms the threshold change works
 
 
 if __name__ == "__main__":

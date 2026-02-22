@@ -6,8 +6,8 @@ This wraps the trained MaskablePPO model and provides the IDecisionStrategy
 interface for integration with the production system.
 
 Key Features:
-1. Handles MultiDiscrete action space [5, 5, 11, 11]
-2. Applies action masking for capacity cascading: DAM -> aFRR -> IntraDay -> mFRR
+1. Handles MultiDiscrete action space [5, 5, 11, 11] (legacy) or [5, 5, 11, 11, 11, 5] (full market)
+2. Applies action masking for capacity cascading: DAM -> aFRR -> IntraDay -> mFRR -> Free Bid
 3. Provides unified action interpretation
 4. Supports VecNormalize for observation normalization
 5. Resolution-independent: works with both 15-min and 1-hour timesteps.
@@ -35,7 +35,8 @@ class UnifiedStrategy(IDecisionStrategy):
     N_AFRR_LEVELS = 5       # 0%, 25%, 50%, 75%, 100%
     N_PRICE_TIERS = 5       # Aggressive to conservative
     N_INTRADAY_ACTIONS = 11  # -1.0 to +1.0 (XBID/IntraDay)
-    N_MFRR_ACTIONS = 11     # -1.0 to +1.0 (Balancing/mFRR)
+    N_MFRR_ACTIONS = 11     # -1.0 to +1.0 (mFRR, TSO-activated)
+    N_FREEBID_QTY_ACTIONS = 11  # -1.0 to +1.0 (Free Bid, agent-submitted)
     N_FREEBID_PRICE_TIERS = 5  # Free Bid price tiers
 
     # I define action interpretation
@@ -43,19 +44,28 @@ class UnifiedStrategy(IDecisionStrategy):
     PRICE_TIERS = np.array([0.7, 0.85, 1.0, 1.15, 1.3])
     INTRADAY_LEVELS = np.linspace(-1.0, 1.0, N_INTRADAY_ACTIONS)
     MFRR_LEVELS = np.linspace(-1.0, 1.0, N_MFRR_ACTIONS)
+    FREEBID_QTY_LEVELS = np.linspace(-1.0, 1.0, N_FREEBID_QTY_ACTIONS)
     FREEBID_PRICE_TIERS = np.array([0.8, 0.9, 1.0, 1.1, 1.2])
 
     def __init__(
         self,
         max_power_mw: float = 30.0,
         n_obs_features: int = 63,
-        enable_full_market: bool = False
+        enable_full_market: bool = False,
+        enable_forecast: bool = False
     ):
         self.model = None
         self.vec_normalize = None
         self.max_power_mw = max_power_mw
         self.enable_full_market = enable_full_market
-        self.n_obs_features = 75 if enable_full_market else n_obs_features
+        self.enable_forecast = enable_forecast
+        # I compute dynamic observation size
+        base = 63
+        if enable_forecast:
+            base += 9
+        if enable_full_market:
+            base += 12
+        self.n_obs_features = base
         self._name = "UnifiedMultiMarket"
 
     @property
@@ -96,11 +106,11 @@ class UnifiedStrategy(IDecisionStrategy):
         I predict the unified action given observation and mask.
 
         Args:
-            observation: 63-feature observation vector
-            action_mask: Flattened boolean mask (32 elements = 5 + 5 + 11 + 11)
+            observation: Observation vector (64-76 features)
+            action_mask: Flattened boolean mask (32 legacy, 48 full-market)
 
         Returns:
-            Action array [afrr_level, price_tier, intraday_action, mfrr_action]
+            Action array [afrr, price, id, mfrr, (fb_qty, fb_price)]
         """
         if self.model is None:
             raise RuntimeError("Model not loaded! Call load() first.")
@@ -121,8 +131,10 @@ class UnifiedStrategy(IDecisionStrategy):
         mfrr_mask = action_mask[offset:offset + self.N_MFRR_ACTIONS]; offset += self.N_MFRR_ACTIONS
 
         if self.enable_full_market and offset < len(action_mask):
-            freebid_mask = action_mask[offset:offset + self.N_FREEBID_PRICE_TIERS]
-            combined_mask = np.concatenate([afrr_mask, price_mask, intraday_mask, mfrr_mask, freebid_mask])
+            freebid_qty_mask = action_mask[offset:offset + self.N_FREEBID_QTY_ACTIONS]; offset += self.N_FREEBID_QTY_ACTIONS
+            freebid_price_mask = action_mask[offset:offset + self.N_FREEBID_PRICE_TIERS]
+            combined_mask = np.concatenate([afrr_mask, price_mask, intraday_mask, mfrr_mask,
+                                            freebid_qty_mask, freebid_price_mask])
         else:
             combined_mask = np.concatenate([afrr_mask, price_mask, intraday_mask, mfrr_mask])
 
@@ -194,9 +206,14 @@ class UnifiedStrategy(IDecisionStrategy):
         }
 
         if self.enable_full_market and len(action) > 4:
-            freebid_action = int(action[4])
-            result['freebid_action'] = freebid_action
-            result['balancing_price_tier'] = self.FREEBID_PRICE_TIERS[freebid_action]
+            freebid_qty_action = int(action[4])
+            freebid_price_action = int(action[5])
+            freebid_qty_level = self.FREEBID_QTY_LEVELS[freebid_qty_action]
+            result['freebid_qty_action'] = freebid_qty_action
+            result['freebid_qty_level'] = freebid_qty_level
+            result['freebid_power_mw'] = freebid_qty_level * remaining_capacity_mw
+            result['freebid_price_action'] = freebid_price_action
+            result['freebid_price_tier'] = self.FREEBID_PRICE_TIERS[freebid_price_action]
 
         return result
 
@@ -215,12 +232,14 @@ class UnifiedRuleBasedStrategy(IDecisionStrategy):
     N_PRICE_TIERS = 5
     N_INTRADAY_ACTIONS = 11
     N_MFRR_ACTIONS = 11
+    N_FREEBID_QTY_ACTIONS = 11
     N_FREEBID_PRICE_TIERS = 5
 
     AFRR_LEVELS = np.array([0.0, 0.25, 0.50, 0.75, 1.0])
     PRICE_TIERS = np.array([0.7, 0.85, 1.0, 1.15, 1.3])
     INTRADAY_LEVELS = np.linspace(-1.0, 1.0, N_INTRADAY_ACTIONS)
     MFRR_LEVELS = np.linspace(-1.0, 1.0, N_MFRR_ACTIONS)
+    FREEBID_QTY_LEVELS = np.linspace(-1.0, 1.0, N_FREEBID_QTY_ACTIONS)
     FREEBID_PRICE_TIERS = np.array([0.8, 0.9, 1.0, 1.1, 1.2])
 
     def __init__(
@@ -229,13 +248,15 @@ class UnifiedRuleBasedStrategy(IDecisionStrategy):
         high_price_threshold: float = 150.0,
         low_price_threshold: float = 50.0,
         high_cap_percentile: float = 0.7,
-        enable_full_market: bool = False
+        enable_full_market: bool = False,
+        enable_forecast: bool = False
     ):
         self.max_power_mw = max_power_mw
         self.high_price_threshold = high_price_threshold
         self.low_price_threshold = low_price_threshold
         self.high_cap_percentile = high_cap_percentile
         self.enable_full_market = enable_full_market
+        self.enable_forecast = enable_forecast
         self._name = "UnifiedRuleBased"
 
     @property
@@ -254,7 +275,7 @@ class UnifiedRuleBasedStrategy(IDecisionStrategy):
         """
         I decide based on rules extracted from observation features.
 
-        Observation structure (key features for 63-feature obs):
+        Observation structure (key features for 63/72-feature obs):
         [0] soc
         [3] dam_price / 100
         [4] intraday_bid / 100
@@ -267,6 +288,11 @@ class UnifiedRuleBasedStrategy(IDecisionStrategy):
         [58] mfrr_direction (+1 UP, -1 DOWN, 0 closed)
         [60] is_peak
         [61] is_solar
+        -- Forecast features (enable_forecast=True, +9 at [63-71]):
+        [63] id_forecast_1h / 100
+        [67] forecast_vs_dam (correction signal)
+        [69] solar_norm
+        [70] wind_norm
         """
         if observation.ndim > 1:
             observation = observation[0]
@@ -321,6 +347,15 @@ class UnifiedRuleBasedStrategy(IDecisionStrategy):
         else:
             id_action = id_idle  # Idle
 
+        # I override IntraDay with forecast-aware logic when available
+        # obs[67] = (forecast_1h - dam_price) / 100 = correction signal
+        if self.enable_forecast and len(observation) > 67:
+            correction = observation[67]  # forecast_vs_dam
+            if correction > 0.05 and soc > 0.3:
+                id_action = 8   # Sell on IntraDay (forecast > DAM)
+            elif correction < -0.05 and soc < 0.7:
+                id_action = 2   # Buy on IntraDay (forecast < DAM)
+
         # I decide mFRR action — constrained by TSO direction signal
         # observation[58] encodes mFRR direction: +1 (UP/discharge), -1 (DOWN/charge), 0 (closed)
         mfrr_idle = self.N_MFRR_ACTIONS // 2  # 5
@@ -348,7 +383,7 @@ class UnifiedRuleBasedStrategy(IDecisionStrategy):
         afrr_mask = action_mask[offset:offset + self.N_AFRR_LEVELS]; offset += self.N_AFRR_LEVELS
         price_mask = action_mask[offset:offset + self.N_PRICE_TIERS]; offset += self.N_PRICE_TIERS
         id_mask = action_mask[offset:offset + self.N_INTRADAY_ACTIONS]; offset += self.N_INTRADAY_ACTIONS
-        mfrr_mask = action_mask[offset:offset + self.N_MFRR_ACTIONS]
+        mfrr_mask = action_mask[offset:offset + self.N_MFRR_ACTIONS]; offset += self.N_MFRR_ACTIONS
 
         # I find valid actions (fallback to valid mid-point)
         if not afrr_mask[afrr_action]:
@@ -368,14 +403,30 @@ class UnifiedRuleBasedStrategy(IDecisionStrategy):
             mfrr_action = int(valid[len(valid) // 2]) if len(valid) > 0 else mfrr_idle
 
         if self.enable_full_market:
+            # I decide Free Bid qty — moderate if mFRR direction allows it
+            freebid_qty_idle = self.N_FREEBID_QTY_ACTIONS // 2
+            if mfrr_direction > 0.5 and soc > 0.35:
+                freebid_qty_action = 7  # Moderate discharge
+            elif mfrr_direction < -0.5 and soc < 0.65:
+                freebid_qty_action = 3  # Moderate charge
+            else:
+                freebid_qty_action = freebid_qty_idle
+
+            # I apply Free Bid qty mask
+            freebid_qty_mask = action_mask[offset:offset + self.N_FREEBID_QTY_ACTIONS]; offset += self.N_FREEBID_QTY_ACTIONS
+            if not freebid_qty_mask[freebid_qty_action]:
+                valid = np.where(freebid_qty_mask)[0]
+                freebid_qty_action = int(valid[len(valid) // 2]) if len(valid) > 0 else freebid_qty_idle
+
             # I default to neutral price tier (1.0x = market price)
-            freebid_action = 2
-            if offset < len(action_mask):
-                freebid_mask = action_mask[offset:offset + self.N_FREEBID_PRICE_TIERS]
-                if not freebid_mask[freebid_action]:
-                    valid = np.where(freebid_mask)[0]
-                    freebid_action = int(valid[len(valid) // 2]) if len(valid) > 0 else 2
-            return np.array([afrr_action, price_action, id_action, mfrr_action, freebid_action])
+            freebid_price_action = 2
+            freebid_price_mask = action_mask[offset:offset + self.N_FREEBID_PRICE_TIERS]
+            if not freebid_price_mask[freebid_price_action]:
+                valid = np.where(freebid_price_mask)[0]
+                freebid_price_action = int(valid[len(valid) // 2]) if len(valid) > 0 else 2
+
+            return np.array([afrr_action, price_action, id_action, mfrr_action,
+                             freebid_qty_action, freebid_price_action])
 
         return np.array([afrr_action, price_action, id_action, mfrr_action])
 
@@ -392,10 +443,12 @@ class UnifiedConservativeStrategy(IDecisionStrategy):
     N_PRICE_TIERS = 5
     N_INTRADAY_ACTIONS = 11
     N_MFRR_ACTIONS = 11
+    N_FREEBID_QTY_ACTIONS = 11
     N_FREEBID_PRICE_TIERS = 5
 
-    def __init__(self, enable_full_market: bool = False):
+    def __init__(self, enable_full_market: bool = False, enable_forecast: bool = False):
         self.enable_full_market = enable_full_market
+        self.enable_forecast = enable_forecast
         self._name = "UnifiedConservative"
 
     @property
@@ -410,7 +463,7 @@ class UnifiedConservativeStrategy(IDecisionStrategy):
         observation: np.ndarray,
         action_mask: np.ndarray
     ) -> np.ndarray:
-        """I return minimal action: [0 aFRR, neutral price, idle IntraDay, idle mFRR, (neutral price)]."""
+        """I return minimal action: [0 aFRR, neutral price, idle ID, idle mFRR, (idle FB, neutral price)]."""
         # I parse masks
         offset = 0
         afrr_mask = action_mask[offset:offset + self.N_AFRR_LEVELS]; offset += self.N_AFRR_LEVELS
@@ -433,14 +486,21 @@ class UnifiedConservativeStrategy(IDecisionStrategy):
         mfrr_action = mfrr_idle if mfrr_mask[mfrr_idle] else int(np.where(mfrr_mask)[0][len(np.where(mfrr_mask)[0]) // 2])
 
         if self.enable_full_market:
+            # I prefer idle for Free Bid qty (center = 5)
+            freebid_qty_idle = self.N_FREEBID_QTY_ACTIONS // 2
+            freebid_qty_mask = action_mask[offset:offset + self.N_FREEBID_QTY_ACTIONS]; offset += self.N_FREEBID_QTY_ACTIONS
+            freebid_qty_action = freebid_qty_idle if freebid_qty_mask[freebid_qty_idle] else int(
+                np.where(freebid_qty_mask)[0][len(np.where(freebid_qty_mask)[0]) // 2])
+
             # I default to neutral Free Bid price tier (1.0x)
-            freebid_action = 2
-            if offset < len(action_mask):
-                freebid_mask = action_mask[offset:offset + self.N_FREEBID_PRICE_TIERS]
-                if not freebid_mask[freebid_action]:
-                    valid = np.where(freebid_mask)[0]
-                    freebid_action = int(valid[len(valid) // 2]) if len(valid) > 0 else 2
-            return np.array([afrr_action, price_action, id_action, mfrr_action, freebid_action])
+            freebid_price_action = 2
+            freebid_price_mask = action_mask[offset:offset + self.N_FREEBID_PRICE_TIERS]
+            if not freebid_price_mask[freebid_price_action]:
+                valid = np.where(freebid_price_mask)[0]
+                freebid_price_action = int(valid[len(valid) // 2]) if len(valid) > 0 else 2
+
+            return np.array([afrr_action, price_action, id_action, mfrr_action,
+                             freebid_qty_action, freebid_price_action])
 
         return np.array([afrr_action, price_action, id_action, mfrr_action])
 
@@ -464,12 +524,14 @@ def create_unified_strategy(
     strategy_type = strategy_type.upper()
 
     enable_full_market = kwargs.get('enable_full_market', False)
+    enable_forecast = kwargs.get('enable_forecast', False)
 
     if strategy_type in ("AI", "UNIFIED", "UNIFIED_AI"):
         strategy = UnifiedStrategy(
             max_power_mw=kwargs.get('max_power_mw', 30.0),
             n_obs_features=kwargs.get('n_obs_features', 63),
-            enable_full_market=enable_full_market
+            enable_full_market=enable_full_market,
+            enable_forecast=enable_forecast
         )
         strategy.load(model_path)
         return strategy
@@ -479,13 +541,17 @@ def create_unified_strategy(
             max_power_mw=kwargs.get('max_power_mw', 30.0),
             high_price_threshold=kwargs.get('high_price_threshold', 150.0),
             low_price_threshold=kwargs.get('low_price_threshold', 50.0),
-            enable_full_market=enable_full_market
+            enable_full_market=enable_full_market,
+            enable_forecast=enable_forecast
         )
         strategy.load()
         return strategy
 
     elif strategy_type in ("CONSERVATIVE", "UNIFIED_CONSERVATIVE"):
-        strategy = UnifiedConservativeStrategy(enable_full_market=enable_full_market)
+        strategy = UnifiedConservativeStrategy(
+            enable_full_market=enable_full_market,
+            enable_forecast=enable_forecast
+        )
         strategy.load()
         return strategy
 
