@@ -9,7 +9,7 @@ I train a single MaskablePPO model that handles ALL markets:
 
 Key Features:
 1. MultiDiscrete action space [5, 5, 11, 11]
-2. Hierarchical action masking with capacity cascading: DAM -> aFRR -> IntraDay -> mFRR
+2. Hierarchical action masking with capacity cascading: DAM -> aFRR -> mFRR -> IntraDay
 3. 63-feature observation space
 4. VecNormalize for observation normalization
 5. Curriculum learning for degradation cost
@@ -330,9 +330,11 @@ def create_training_env(
     # reward_scale raised from 0.001 to 0.01 for stronger NN signal.
     if reward_config is None:
         reward_config = {
-            'degradation_cost': 5.0,
+            'degradation_cost': 25.0,
             'dam_violation_penalty': 800.0,
             'afrr_nonresponse_penalty': 500.0,
+            'cycle_target': 2.0,
+            'cycle_excess_penalty': 3000.0,
             'reward_scale': 0.01
         }
 
@@ -415,7 +417,7 @@ def train_unified_model(
     enable_endogenous_dam: bool = False,
     dam_bidder_min_spread: float = 30.0,
     mfrr_activation_rate: float = 0.35,
-    mfrr_price_cap: float = 500.0
+    mfrr_price_cap: float = 1000.0
 ) -> str:
     """
     I train the unified multi-market model.
@@ -572,7 +574,7 @@ def train_unified_model(
     )
 
     curriculum_callback = DegradationCurriculumCallback(
-        target_degradation=5.0,  # I reduced from 15 to 5 EUR/MWh (realistic Li-ion BESS)
+        target_degradation=25.0,  # I use 25 EUR/MWh to discourage excessive cycling (1.5-2.0/day target)
         warmup_steps=min(500_000, total_timesteps // 5)
     )
 
@@ -718,6 +720,9 @@ def train_unified_model(
         'dam_bidder_min_spread': dam_bidder_min_spread,
         'mfrr_activation_rate': mfrr_activation_rate,
         'mfrr_price_cap': mfrr_price_cap,
+        'degradation_cost': reward_config.get('degradation_cost', 25.0),
+        'cycle_target': reward_config.get('cycle_target', 2.0),
+        'cycle_excess_penalty': reward_config.get('cycle_excess_penalty', 3000.0),
         'timestamp': timestamp
     }
 
@@ -777,7 +782,7 @@ def evaluate_model(
     enable_endogenous_dam = train_cfg.get('enable_endogenous_dam', False)
     dam_bidder_min_spread = train_cfg.get('dam_bidder_min_spread', 30.0)
     mfrr_activation_rate = train_cfg.get('mfrr_activation_rate', 0.35)
-    mfrr_price_cap = train_cfg.get('mfrr_price_cap', 500.0)
+    mfrr_price_cap = train_cfg.get('mfrr_price_cap', 1000.0)
 
     print(f"  time_step_hours={time_step_hours}, "
           f"full_market={enable_full_market}, "
@@ -822,6 +827,18 @@ def evaluate_model(
     # ----------------------------------------------------------------
     eval_episode_steps = int(336 / time_step_hours)  # 2 weeks
 
+    # I load degradation_cost from training config so evaluation uses the same cost
+    eval_degradation = train_cfg.get('degradation_cost', 25.0)
+    eval_reward_config = {
+        'degradation_cost': eval_degradation,
+        'dam_violation_penalty': 800.0,
+        'afrr_nonresponse_penalty': 500.0,
+        'cycle_target': train_cfg.get('cycle_target', 2.0),
+        'cycle_excess_penalty': train_cfg.get('cycle_excess_penalty', 3000.0),
+        'reward_scale': 0.01
+    }
+    print(f"  Eval degradation_cost: {eval_degradation} EUR/MWh")
+
     def _make_eval():
         env = BatteryEnvUnified(
             df=df_eval,
@@ -838,6 +855,7 @@ def evaluate_model(
             dam_bidder_min_spread=dam_bidder_min_spread,
             mfrr_activation_rate=mfrr_activation_rate,
             mfrr_price_cap=mfrr_price_cap,
+            reward_config=eval_reward_config,
         )
         return Monitor(env)
 
@@ -866,7 +884,8 @@ def evaluate_model(
         'episode_lengths': [],
         'afrr_activations': [],
         'dam_violations': [],
-        'per_market': []
+        'per_market': [],
+        'cost_breakdowns': [],
     }
 
     for episode in range(n_episodes):
@@ -879,6 +898,14 @@ def evaluate_model(
         dam_violations = 0
         last_info = {}
 
+        # I track cost components to diagnose where profit goes
+        episode_degradation = 0.0
+        episode_dam_violation = 0.0
+        episode_afrr_nonresponse = 0.0
+        episode_physical_penalty = 0.0
+        episode_cycle_excess = 0.0
+        episode_dam_bonus = 0.0
+
         while not done:
             action_masks = eval_vec.env_method("action_masks")[0]
             action, _ = model.predict(obs, deterministic=True,
@@ -890,6 +917,14 @@ def evaluate_model(
             episode_profit += info.get('net_profit', 0)
             episode_length += 1
 
+            # I accumulate cost components for full accounting
+            episode_degradation += info.get('degradation_cost', 0)
+            episode_dam_violation += info.get('dam_violation_cost', 0)
+            episode_afrr_nonresponse += info.get('afrr_nonresponse_cost', 0)
+            episode_physical_penalty += info.get('physical_penalty', 0)
+            episode_cycle_excess += info.get('cycle_excess_cost', 0)
+            episode_dam_bonus += info.get('dam_bonus', 0)
+
             if info.get('afrr_activated', False):
                 afrr_activations += 1
             if info.get('dam_shortfall_mw', 0) > 0.1:
@@ -898,27 +933,58 @@ def evaluate_model(
         # I use the env's own cumulative cycle counter (accurate)
         episode_cycles = last_info.get('total_cycles', 0)
 
+        # I cross-check: env's total_profit should match my accumulated net_profit
+        env_total_profit = last_info.get('total_profit', 0)
+
         results['episode_profits'].append(episode_profit)
         results['episode_cycles'].append(episode_cycles)
         results['episode_lengths'].append(episode_length)
         results['afrr_activations'].append(afrr_activations)
         results['dam_violations'].append(dam_violations)
 
-        # I log per-market breakdown from the final info
+        cost_breakdown = {
+            'degradation': episode_degradation,
+            'dam_violation': episode_dam_violation,
+            'afrr_nonresponse': episode_afrr_nonresponse,
+            'physical_penalty': episode_physical_penalty,
+            'cycle_excess': episode_cycle_excess,
+            'dam_bonus': episode_dam_bonus,
+        }
+        results['cost_breakdowns'].append(cost_breakdown)
+
+        # I log per-market breakdown from the final info (cumulative gross)
         market_summary = {
             'dam': last_info.get('dam_profit', 0),
-            'intraday': last_info.get('intraday_profit', 0),
             'afrr_cap': last_info.get('afrr_capacity_profit', 0),
             'afrr_energy': last_info.get('afrr_energy_profit', 0),
             'mfrr': last_info.get('mfrr_profit', 0),
+            'intraday': last_info.get('intraday_profit', 0),
+            'ida': last_info.get('ida_profit', 0),
+            'free_bid': last_info.get('free_bid_profit', 0),
         }
         results['per_market'].append(market_summary)
 
+        gross_sum = sum(market_summary.values())
+        total_costs = episode_degradation + episode_dam_violation + episode_afrr_nonresponse + episode_physical_penalty + episode_cycle_excess
+
         print(f"Episode {episode + 1}: Profit={episode_profit:,.0f} EUR, "
               f"Cycles={episode_cycles:.2f}, "
-              f"DAM={market_summary['dam']:,.0f}, "
+              f"Gross={gross_sum:,.0f}")
+        print(f"  Markets: DAM={market_summary['dam']:,.0f}, "
               f"aFRR_cap={market_summary['afrr_cap']:,.0f}, "
-              f"ID={market_summary['intraday']:,.0f}")
+              f"aFRR_e={market_summary['afrr_energy']:,.0f}, "
+              f"mFRR={market_summary['mfrr']:,.0f}, "
+              f"ID={market_summary['intraday']:,.0f}, "
+              f"FreeBid={market_summary['free_bid']:,.0f}")
+        print(f"  Costs: Degrad={episode_degradation:,.0f}, "
+              f"DAM_viol={episode_dam_violation:,.0f}, "
+              f"aFRR_nr={episode_afrr_nonresponse:,.0f}, "
+              f"Phys={episode_physical_penalty:,.0f}, "
+              f"CycleEx={episode_cycle_excess:,.0f}, "
+              f"DAM_bonus=+{episode_dam_bonus:,.0f}")
+        if abs(episode_profit - env_total_profit) > 1.0:
+            print(f"  WARNING: profit mismatch! accumulated={episode_profit:,.0f} "
+                  f"vs env.total_profit={env_total_profit:,.0f}")
 
     # ----------------------------------------------------------------
     # 7. I calculate summary statistics
@@ -934,14 +1000,27 @@ def evaluate_model(
     results['afrr_activation_rate'] = np.sum(results['afrr_activations']) / total_steps
 
     # I aggregate per-market means
-    market_keys = ['dam', 'intraday', 'afrr_cap', 'afrr_energy', 'mfrr']
+    market_keys = ['dam', 'afrr_cap', 'afrr_energy', 'mfrr',
+                    'ida', 'xbid', 'free_bid']
     results['mean_per_market'] = {
         k: np.mean([m[k] for m in results['per_market']]) for k in market_keys
     }
 
-    print("\n" + "=" * 50)
+    # I aggregate cost breakdown means
+    cost_keys = ['degradation', 'dam_violation', 'afrr_nonresponse',
+                 'physical_penalty', 'cycle_excess', 'dam_bonus']
+    results['mean_costs'] = {
+        k: np.mean([c[k] for c in results['cost_breakdowns']]) for k in cost_keys
+    }
+
+    mean_gross = sum(results['mean_per_market'].values())
+    mean_total_costs = sum(results['mean_costs'][k] for k in cost_keys
+                           if k not in ('dam_bonus',))
+    mean_bonuses = results['mean_costs']['dam_bonus']
+
+    print("\n" + "=" * 60)
     print("EVALUATION SUMMARY")
-    print("=" * 50)
+    print("=" * 60)
     print(f"Episodes:       {n_episodes}")
     print(f"Mean Profit:    {results['mean_profit']:,.0f} EUR "
           f"(+/-{results['std_profit']:,.0f})")
@@ -949,9 +1028,21 @@ def evaluate_model(
     print(f"Profit/Cycle:   {results['profit_per_cycle']:,.0f} EUR")
     print(f"DAM Violations: {results['dam_violation_rate']:.2%}")
     print(f"aFRR Activations: {results['afrr_activation_rate']:.2%}")
-    print(f"\nPer-Market Breakdown (mean):")
+    print(f"\nPer-Market Gross Revenue (mean):")
     for k, v in results['mean_per_market'].items():
         print(f"  {k:>12s}: {v:>+10,.0f} EUR")
+    print(f"  {'TOTAL':>12s}: {mean_gross:>+10,.0f} EUR")
+    print(f"\nCost Breakdown (mean):")
+    print(f"  {'degradation':>16s}: {results['mean_costs']['degradation']:>10,.0f} EUR")
+    print(f"  {'dam_violation':>16s}: {results['mean_costs']['dam_violation']:>10,.0f} EUR")
+    print(f"  {'afrr_nonresp':>16s}: {results['mean_costs']['afrr_nonresponse']:>10,.0f} EUR")
+    print(f"  {'physical':>16s}: {results['mean_costs']['physical_penalty']:>10,.0f} EUR")
+    print(f"  {'cycle_excess':>16s}: {results['mean_costs']['cycle_excess']:>10,.0f} EUR")
+    print(f"  {'TOTAL COSTS':>16s}: {mean_total_costs:>10,.0f} EUR")
+    print(f"  {'dam_bonus':>16s}: {mean_bonuses:>+10,.0f} EUR")
+    print(f"\nAccounting: Gross({mean_gross:,.0f}) - Costs({mean_total_costs:,.0f}) "
+          f"+ Bonus({mean_bonuses:,.0f}) = {mean_gross - mean_total_costs + mean_bonuses:,.0f}")
+    print(f"Reported Net:  {results['mean_profit']:,.0f} EUR")
 
     return results
 
@@ -1000,8 +1091,8 @@ if __name__ == "__main__":
                         help="Minimum DAM spread (EUR) to trigger trading (default: 30)")
     parser.add_argument("--mfrr-activation-rate", type=float, default=0.35,
                         help="mFRR bid activation probability (default: 0.35)")
-    parser.add_argument("--mfrr-price-cap", type=float, default=500.0,
-                        help="mFRR settlement price cap EUR/MWh (default: 500)")
+    parser.add_argument("--mfrr-price-cap", type=float, default=1000.0,
+                        help="mFRR settlement price cap EUR/MWh (default: 1000)")
 
     args = parser.parse_args()
 

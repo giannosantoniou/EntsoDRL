@@ -4,7 +4,7 @@ Unit Tests for Unified Multi-Market Battery Environment
 I test the key functionality of the unified environment:
 1. Action space structure (MultiDiscrete [5, 5, 11, 11])
 2. Observation space (64 features)
-3. Action masking (capacity cascading: DAM -> aFRR -> IntraDay -> mFRR)
+3. Action masking (capacity cascading: DAM -> aFRR -> mFRR -> IntraDay)
 4. aFRR activation simulation
 5. Reward calculation
 6. Separate IntraDay/mFRR capacity cascading
@@ -75,9 +75,14 @@ def sample_data():
         'wind_onshore': np.random.uniform(100, 500, n_hours),
         'res_total_mw': np.maximum(0, 500 * np.sin(2 * np.pi * (hours - 6) / 12)) + np.random.uniform(100, 500, n_hours),
         'load_mw': np.random.uniform(3000, 6000, n_hours),
-        # I add XBID prices (typical continuous market: small spread around DAM)
-        'xbid_bid': prices - 3.0 + np.random.normal(0, 1, n_hours),
-        'xbid_ask': prices + 3.0 + np.random.normal(0, 1, n_hours),
+        # I add ISP clearing prices (real ADMIE balancing market data)
+        'isp1_price_up': prices * 1.2 + np.random.normal(0, 5, n_hours),
+        'isp1_price_down': prices * 0.8 + np.random.normal(0, 5, n_hours),
+        'isp2_price_up': prices * 1.25 + np.random.normal(0, 8, n_hours),
+        'isp2_price_down': prices * 0.75 + np.random.normal(0, 8, n_hours),
+        'isp3_price_up': prices * 1.3 + np.random.normal(0, 10, n_hours),
+        'isp3_price_down': prices * 0.7 + np.random.normal(0, 10, n_hours),
+        'isp_cascade_spread_up': np.random.uniform(5, 30, n_hours),
         # I add IDA clearing prices (auction: single clearing price)
         'ida1_clearing_price': prices + np.random.normal(2, 5, n_hours),
         'ida2_clearing_price': prices + np.random.normal(3, 8, n_hours),
@@ -1347,7 +1352,7 @@ class Test15MinResolution:
 
 
 # =========================================================================
-# FULL MARKET MODE TESTS (IDA + XBID + Free Bids)
+# FULL MARKET MODE TESTS (IDA + ISP + Free Bids)
 # =========================================================================
 
 @pytest.fixture
@@ -1399,6 +1404,14 @@ def sample_data_full_market():
         'wind_onshore': np.random.uniform(100, 500, n_hours),
         'res_total_mw': np.maximum(0, 500 * np.sin(2 * np.pi * (hours - 6) / 12)) + np.random.uniform(100, 500, n_hours),
         'load_mw': np.random.uniform(3000, 6000, n_hours),
+        # ISP clearing prices (real ADMIE balancing market data)
+        'isp1_price_up': prices * 1.2 + np.random.normal(0, 5, n_hours),
+        'isp1_price_down': prices * 0.8 + np.random.normal(0, 5, n_hours),
+        'isp2_price_up': prices * 1.25 + np.random.normal(0, 8, n_hours),
+        'isp2_price_down': prices * 0.75 + np.random.normal(0, 8, n_hours),
+        'isp3_price_up': prices * 1.3 + np.random.normal(0, 10, n_hours),
+        'isp3_price_down': prices * 0.7 + np.random.normal(0, 10, n_hours),
+        'isp_cascade_spread_up': np.random.uniform(5, 30, n_hours),
         # IDA columns
         'ida1_clearing_price': prices + np.random.normal(0, 12, n_hours),
         'ida2_clearing_price': prices + np.random.normal(0, 8, n_hours),
@@ -1407,10 +1420,6 @@ def sample_data_full_market():
         'ida2_position': np.clip(np.random.normal(0, 1.5, n_hours), -3, 3),
         'ida3_position': np.where(hours >= 12, np.clip(np.random.normal(0, 1.0, n_hours), -2, 2), 0.0),
         'net_ida_position': np.zeros(n_hours),  # I fill this below
-        # XBID columns
-        'xbid_bid': prices - 3.0 + np.random.normal(0, 1, n_hours),
-        'xbid_ask': prices + 3.0 + np.random.normal(0, 1, n_hours),
-        'xbid_spread': 4.0 + np.random.uniform(0, 4, n_hours),
         # Free Bid columns
         'free_bid_activation_base': np.clip(np.abs(np.random.normal(0, 300, n_hours)) / 500.0, 0, 0.8),
         'free_bid_reference_price': prices * 1.3,
@@ -1534,7 +1543,7 @@ class TestIDADecomposition:
             "IDA3 clearing price should be NaN for hours < 12"
 
     def test_capacity_cascade_with_ida(self, full_market_env):
-        """I verify DAM -> aFRR -> IDA -> XBID -> FreeBid cascade."""
+        """I verify DAM -> aFRR -> IDA -> mFRR -> IntraDay -> FreeBid cascade."""
         full_market_env.reset(seed=42)
         full_market_env.soc = 0.5
         step = full_market_env.current_step
@@ -1543,18 +1552,19 @@ class TestIDADecomposition:
         # I set a non-zero IDA position
         full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 5.0
 
-        # I request max XBID discharge + max mFRR discharge + max Free Bid discharge
+        # I request max IntraDay discharge + max mFRR discharge + max Free Bid discharge
         action = np.array([0, 2, 10, 10, 10, 2])
         obs, reward, done, truncated, info = full_market_env.step(action)
 
         ida_mw = abs(info.get('ida_energy_mw', 0))
-        xbid_mw = abs(info.get('xbid_energy_mw', 0))
+        id_mw = abs(info.get('intraday_energy_mw', 0))
+        mfrr_mw = abs(info.get('mfrr_energy_mw', 0))
         free_bid_mw = abs(info.get('free_bid_energy_mw', 0))
-        total_mw = ida_mw + xbid_mw + free_bid_mw
+        total_mw = ida_mw + id_mw + mfrr_mw + free_bid_mw
 
         # I verify combined power does not exceed max_power_mw
         assert total_mw <= full_market_env.max_power_mw + 0.1, \
-            f"IDA + XBID + FreeBid = {total_mw:.1f} exceeds max_power {full_market_env.max_power_mw}"
+            f"IDA + ID + mFRR + FreeBid = {total_mw:.1f} exceeds max_power {full_market_env.max_power_mw}"
 
 
 class TestFreeBids:
@@ -1624,19 +1634,21 @@ class TestFreeBids:
         assert result['components']['free_bid_revenue'] == pytest.approx(950.0, abs=1.0)
 
     def test_direction_constraint(self, full_market_env):
-        """I verify Free Bid respects imbalance direction."""
+        """I verify Free Bid respects imbalance direction when no activation data."""
         full_market_env.reset(seed=42)
         step = full_market_env.current_step
 
-        # I set balanced imbalance
+        # I set balanced imbalance AND zero activation data
         full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_imbalance_mw')] = 5.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 0.0
+        full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 0.0
 
-        # I test activation with low imbalance — should not activate
+        # I test activation with low imbalance and no activation — should not activate
         row = full_market_env.df.iloc[step]
         result = full_market_env._simulate_free_bid_activation(
             bid_price=90.0, ref_price=100.0, imbalance=5.0, row=row
         )
-        assert result == False, "Free Bid should not activate when |imbalance| < 30 MW"
+        assert result == False, "Free Bid should not activate when |imbalance| < 10 MW and no activation data"
 
     def test_price_tier_masked_when_idle(self, full_market_env):
         """I verify Free Bid price tier forced to neutral when no activation."""
@@ -1829,12 +1841,12 @@ class TestSeparateRevenueTracking:
     """I test per-market revenue tracking."""
 
     def test_info_contains_all_markets(self, full_market_env):
-        """I verify info has dam, ida, xbid, afrr, free_bid, mfrr profits."""
+        """I verify info has dam, ida, intraday, afrr, free_bid, mfrr profits."""
         full_market_env.reset(seed=42)
         action = np.array([0, 2, 5, 5, 5, 2])
         obs, reward, done, truncated, info = full_market_env.step(action)
 
-        for key in ['dam_profit', 'ida_profit', 'xbid_profit',
+        for key in ['dam_profit', 'ida_profit', 'intraday_profit',
                      'afrr_capacity_profit', 'afrr_energy_profit',
                      'mfrr_profit', 'free_bid_profit']:
             assert key in info, f"Missing market profit key: {key}"
@@ -1859,22 +1871,22 @@ class TestSeparateRevenueTracking:
             if done or truncated:
                 break
 
-    def test_xbid_revenue_tracked(self, full_market_env):
-        """I verify XBID revenue is tracked separately from IntraDay."""
+    def test_intraday_revenue_tracked_in_full_market(self, full_market_env):
+        """I verify IntraDay revenue goes to intraday_profit in full market mode."""
         full_market_env.reset(seed=42)
         full_market_env.soc = 0.5
         step = full_market_env.current_step
         full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('dam_commitment')] = 0.0
         full_market_env.df.iloc[step, full_market_env.df.columns.get_loc('net_ida_position')] = 0.0
 
-        # I discharge on XBID
-        action = np.array([0, 2, 9, 5, 5, 2])  # ~80% XBID discharge, idle mFRR/FreeBid
+        # I discharge on IntraDay
+        action = np.array([0, 2, 9, 5, 5, 2])  # ~80% IntraDay discharge, idle mFRR/FreeBid
         obs, reward, done, truncated, info = full_market_env.step(action)
 
-        xbid_mw = info.get('xbid_energy_mw', 0)
-        if abs(xbid_mw) > 0.1:
-            assert full_market_env.xbid_profit != 0, \
-                "XBID profit should be tracked when trading"
+        id_mw = info.get('intraday_energy_mw', 0)
+        if abs(id_mw) > 0.1:
+            assert full_market_env.intraday_profit != 0, \
+                "IntraDay profit should be tracked when trading"
 
 
 class TestFullMarketStrategy:
@@ -2647,8 +2659,8 @@ class TestMarketTimingConstraints:
             market = unified_env._get_intraday_market(row)
             assert market == 'ida1', f"Expected IDA1 at hour 15, got {market}"
 
-    def test_intraday_routes_to_xbid(self, unified_env):
-        """I verify IntraDay routes to XBID at hour 16:00."""
+    def test_intraday_routes_to_isp(self, unified_env):
+        """I verify IntraDay routes to ISP session at hour 16:00 (not XBID)."""
         unified_env.reset(seed=42)
 
         step_16 = unified_env.start_step + 16
@@ -2656,7 +2668,8 @@ class TestMarketTimingConstraints:
             unified_env.current_step = step_16
             row = unified_env.df.iloc[step_16]
             market = unified_env._get_intraday_market(row)
-            assert market == 'xbid', f"Expected XBID at hour 16, got {market}"
+            assert market in ('isp1', 'isp2', 'isp3'), \
+                f"Expected ISP session at hour 16, got {market}"
 
     def test_intraday_routes_to_ida2(self, unified_env):
         """I verify IntraDay routes to IDA2 pricing at hour 22:00."""
@@ -2669,29 +2682,30 @@ class TestMarketTimingConstraints:
             market = unified_env._get_intraday_market(row)
             assert market == 'ida2', f"Expected IDA2 at hour 22, got {market}"
 
-    def test_intraday_sells_at_xbid_bid(self, unified_env):
-        """I verify IntraDay sell trades use xbid_bid price when XBID is active."""
+    def test_intraday_sells_at_isp_price(self, unified_env):
+        """I verify IntraDay sell trades use ISP UP price when ISP session is active."""
         unified_env.reset(seed=42)
         unified_env.soc = 0.7  # Enough to discharge
 
-        step_16 = unified_env.start_step + 16  # Hour 16 -> XBID
+        step_16 = unified_env.start_step + 16  # Hour 16 -> ISP session
         if step_16 < len(unified_env.df):
             unified_env.current_step = step_16
-            # I set distinctive XBID prices to verify routing
-            unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('xbid_bid')] = 150.0
-            unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('intraday_bid')] = 50.0
+            # I set distinctive ISP3 UP price to verify routing
+            unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('isp3_price_up')] = 150.0
+            unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('isp2_price_up')] = 80.0
+            unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('isp1_price_up')] = 50.0
 
             # I execute a sell action (action[2] = 10 = max sell)
             action = np.array([0, 2, 10, 5])
             obs, reward, done, truncated, info = unified_env.step(action)
 
-            # I verify IntraDay trade happened at XBID bid price (150), not intraday_bid (50)
+            # I verify IntraDay trade happened at ISP3 UP price (150)
             if info['intraday_energy_mw'] > 0:
                 assert info['intraday_revenue'] > 0, "Sell revenue should be positive"
-                # I check the revenue corresponds to XBID bid (~150), not intraday_bid (~50)
+                # I check the revenue corresponds to ISP3 price (~150), not ISP1 (~50)
                 expected_min_revenue = info['intraday_energy_mw'] * 100.0 * unified_env.time_step_hours
                 assert info['intraday_revenue'] > expected_min_revenue, \
-                    f"Revenue {info['intraday_revenue']:.2f} too low — should use xbid_bid=150, not intraday_bid=50"
+                    f"Revenue {info['intraday_revenue']:.2f} too low — should use isp3_price_up=150"
 
     def test_ida_single_clearing_price(self, unified_env):
         """I verify IDA auctions use the same clearing price for buy and sell."""
@@ -2704,30 +2718,34 @@ class TestMarketTimingConstraints:
         assert sell_price == buy_price, \
             f"IDA1 should use single clearing price: sell={sell_price}, buy={buy_price}"
 
-    def test_intraday_observation_uses_xbid(self, sample_data):
-        """I verify observation feature [11] (id-dam spread) uses XBID prices, not ISP1."""
+    def test_intraday_uses_real_isp_prices(self, sample_data):
+        """I verify IntraDay sell price uses ISP3 > ISP2 > ISP1 cascade."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        # I set XBID lag prices close to DAM (realistic ~3 EUR spread)
-        df['xbid_bid_lag_1h'] = df['price'] - 3.0
-        df['xbid_ask_lag_1h'] = df['price'] + 3.0
-        # I set intraday lag prices far from DAM (old mismatch scenario)
-        df['intraday_bid_lag_1h'] = 55.0  # ISP1 DOWN
-        df['intraday_ask_lag_1h'] = 211.0  # ISP1 UP
+        # I set distinctive ISP prices to verify cascade
+        df['isp3_price_up'] = 200.0
+        df['isp2_price_up'] = 150.0
+        df['isp1_price_up'] = 100.0
 
         env = BatteryEnvUnified(
             df, capacity_mwh=146.0, max_power_mw=30.0,
             episode_length=72, random_start=False
         )
-        obs, _ = env.reset(seed=42)
+        env.reset(seed=42)
+        row = env.df.iloc[env.current_step]
 
-        # Feature [12] = (id_bid - dam_price) / 100.0
-        # With XBID: (price-3 - price) / 100 = -0.03
-        # With ISP1: (55 - price) / 100 = far negative
-        feature_12 = obs[12]
-        assert abs(feature_12) < 0.2, \
-            f"Feature [12] should be ~-0.03 (XBID spread), got {feature_12:.4f} (likely using ISP1)"
+        # I verify ISP3 price is used (highest priority)
+        sell_price = env._get_intraday_sell_price(None, row)
+        assert sell_price == pytest.approx(200.0), \
+            f"Should use ISP3 price (200), got {sell_price}"
+
+        # I remove ISP3 and verify ISP2 fallback
+        env.df['isp3_price_up'] = np.nan
+        row = env.df.iloc[env.current_step]
+        sell_price = env._get_intraday_sell_price(None, row)
+        assert sell_price == pytest.approx(150.0), \
+            f"Should fall back to ISP2 price (150), got {sell_price}"
 
     def test_xbid_open_after_dam_results(self, unified_env):
         """I verify IntraDay trading opens at 14:00."""
@@ -3052,6 +3070,143 @@ class TestFreeBidFixes:
         assert 'free_bid_energy_mw' in info
         # I also verify that at the old threshold of 30, this would have been blocked
         # (15 < 30), so this test confirms the threshold change works
+
+
+class TestISPPricesAndCascadeOrder:
+    """I test the ISP price integration, mFRR cascade priority, and cycle exemption."""
+
+    def test_intraday_uses_real_isp_sell_price(self, unified_env):
+        """I verify IntraDay sell price uses ISP3 > ISP2 > ISP1 cascade."""
+        unified_env.reset(seed=42)
+        row = unified_env.df.iloc[unified_env.current_step]
+
+        # I verify ISP3 is used when available
+        sell_price = unified_env._get_intraday_sell_price(None, row)
+        isp3 = row.get('isp3_price_up', np.nan)
+        if not np.isnan(isp3) and isp3 > 0:
+            assert sell_price == pytest.approx(isp3, abs=0.01), \
+                f"Should use ISP3 UP ({isp3}), got {sell_price}"
+
+    def test_intraday_uses_real_isp_buy_price(self, unified_env):
+        """I verify IntraDay buy price uses ISP3 > ISP2 > ISP1 cascade."""
+        unified_env.reset(seed=42)
+        row = unified_env.df.iloc[unified_env.current_step]
+
+        buy_price = unified_env._get_intraday_buy_price(None, row)
+        isp3 = row.get('isp3_price_down', np.nan)
+        if not np.isnan(isp3) and isp3 > 0:
+            assert buy_price == pytest.approx(isp3, abs=0.01), \
+                f"Should use ISP3 DOWN ({isp3}), got {buy_price}"
+
+    def test_mfrr_before_intraday_cascade(self, unified_env):
+        """I verify mFRR gets full capacity and IntraDay gets remainder."""
+        unified_env.reset(seed=42)
+        unified_env.soc = 0.5
+        step = unified_env.current_step
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+        # I force mFRR activation by setting rate=1.0 and ensuring UP activation
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 100.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 0.0
+        old_rate = unified_env.mfrr_activation_rate
+        unified_env.mfrr_activation_rate = 1.0
+
+        # I request max mFRR discharge + max IntraDay discharge
+        action = np.array([0, 2, 10, 10])  # Max IntraDay + Max mFRR
+        obs, reward, done, truncated, info = unified_env.step(action)
+
+        unified_env.mfrr_activation_rate = old_rate
+
+        mfrr_mw = abs(info.get('mfrr_energy_mw', 0))
+        id_mw = abs(info.get('intraday_energy_mw', 0))
+        total = mfrr_mw + id_mw
+
+        # I verify combined doesn't exceed max power
+        assert total <= unified_env.max_power_mw + 0.1, \
+            f"mFRR + IntraDay = {total:.1f} exceeds max {unified_env.max_power_mw}"
+
+        # I verify mFRR got capacity (it executes first now)
+        if mfrr_mw > 0.1 and id_mw > 0.1:
+            # IntraDay should have less capacity (after mFRR took its share)
+            assert id_mw < unified_env.max_power_mw, \
+                "IntraDay should have reduced capacity after mFRR"
+
+    def test_mfrr_exempt_from_daily_cycle_penalty(self, unified_env):
+        """I verify mFRR trading doesn't increment daily_cycles."""
+        unified_env.reset(seed=42)
+        unified_env.soc = 0.5
+        initial_daily_cycles = unified_env.daily_cycles
+        step = unified_env.current_step
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+        # I force mFRR activation
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 100.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 0.0
+        old_rate = unified_env.mfrr_activation_rate
+        unified_env.mfrr_activation_rate = 1.0
+
+        # I request mFRR discharge only, IntraDay idle
+        action = np.array([0, 2, 5, 10])  # IntraDay idle, Max mFRR
+        obs, reward, done, truncated, info = unified_env.step(action)
+
+        unified_env.mfrr_activation_rate = old_rate
+
+        mfrr_mw = abs(info.get('mfrr_energy_mw', 0))
+        if mfrr_mw > 0.1:
+            # I verify daily_cycles did NOT increase (mFRR is exempt)
+            assert unified_env.daily_cycles == pytest.approx(initial_daily_cycles, abs=0.001), \
+                f"daily_cycles should NOT change for mFRR: was {initial_daily_cycles}, now {unified_env.daily_cycles}"
+            # I verify total_cycles DID increase (still tracked for reporting)
+            assert unified_env.total_cycles > initial_daily_cycles, \
+                "total_cycles should still increase for mFRR"
+
+    def test_mfrr_price_cap_1000(self, sample_data):
+        """I verify mFRR price cap default is 1000 EUR/MWh."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        env = BatteryEnvUnified(
+            df=sample_data, episode_length=72, random_start=False
+        )
+        assert env.mfrr_price_cap == 1000.0, \
+            f"mFRR price cap should be 1000, got {env.mfrr_price_cap}"
+
+    def test_hours_to_dam_peak_dynamic(self, sample_data):
+        """I verify hours_to_dam_peak is computed dynamically, not constant 12.0."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        # I add pre-computed forecast columns so the dynamic path is used
+        df = sample_data.copy()
+        n = len(df)
+        np.random.seed(42)
+        dam_price = df['price'].values
+        df['dam_forecast_next_4h_mean'] = dam_price + np.random.normal(0, 5, n)
+        df['dam_forecast_next_4h_max'] = dam_price + 20
+        df['dam_forecast_next_4h_min'] = dam_price - 20
+        df['dam_forecast_spread'] = 40.0
+        df['dam_forecast_vs_current'] = 0.0
+        df['id_forecast_1h'] = dam_price + 3
+        df['id_forecast_4h'] = dam_price + 5
+        df['imbalance_forecast_dir'] = 0.0
+        df['imbalance_forecast_mag'] = 0.0
+        df['mfrr_opportunity_score'] = 0.5
+        df['forecast_confidence'] = 0.7
+        # I deliberately DON'T set hours_to_dam_peak / hours_to_dam_trough
+        # so the dynamic computation is used instead of reading from column
+
+        env = BatteryEnvUnified(
+            df=df, episode_length=72, random_start=False,
+            enable_market_forecast=True
+        )
+        env.reset(seed=42)
+
+        # I collect peak values over several steps
+        peak_values = set()
+        for _ in range(10):
+            obs = env._build_observation()
+            # hours_to_dam_peak is feature index 77 (64 base + 13th market forecast feature)
+            peak_values.add(round(obs[77], 4))
+            env.current_step += 1
+
+        assert len(peak_values) > 1, \
+            f"hours_to_dam_peak should vary, but got constant values: {peak_values}"
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ I implement a single unified environment that handles ALL markets:
 Key Design Decisions:
 1. Single model for all markets (learns market interactions)
 2. MultiDiscrete action space: [aFRR_commitment, aFRR_price_tier, intraday_action, mfrr_action]
-3. Hierarchical capacity cascading: DAM -> aFRR -> IntraDay -> mFRR
+3. Hierarchical capacity cascading: DAM -> aFRR -> mFRR -> IntraDay
 4. aFRR activation simulation with MANDATORY response requirement
 5. HEnEx-compliant gate closure awareness
 
@@ -98,7 +98,7 @@ class BatteryEnvUnified(gym.Env):
         # mFRR parameters
         mfrr_imbalance_threshold: float = 10.0,  # MW minimum |imbalance| for mFRR
         mfrr_activation_rate: float = 0.35,  # Probability of mFRR bid acceptance (35%)
-        mfrr_price_cap: float = 500.0,  # EUR/MWh cap on mFRR settlement price
+        mfrr_price_cap: float = 1000.0,  # EUR/MWh cap — real prices reach 1190 EUR
 
         # Cycling limits
         max_daily_cycles: float = 2.0,
@@ -197,6 +197,8 @@ class BatteryEnvUnified(gym.Env):
             degradation_cost_per_mwh=self.reward_config.get('degradation_cost', 5.0),
             dam_violation_penalty=self.reward_config.get('dam_violation_penalty', 800.0),
             afrr_nonresponse_penalty=self.reward_config.get('afrr_nonresponse_penalty', 500.0),
+            cycle_target=self.reward_config.get('cycle_target', 2.0),
+            cycle_excess_penalty=self.reward_config.get('cycle_excess_penalty', 3000.0),
             reward_scale=self.reward_config.get('reward_scale', 0.01)
         )
 
@@ -928,89 +930,16 @@ class BatteryEnvUnified(gym.Env):
         remaining_after_ida = remaining_after_afrr
 
         # =====================================================================
-        # STAGE 7: EXECUTE INTRADAY CORRECTION (IDA auctions + XBID continuous)
-        # I route the unified IntraDay action to the appropriate market
-        # based on time-of-day: IDA1/2/3 auctions or XBID continuous.
-        # =====================================================================
-        intraday_energy_mw = 0.0
-        xbid_energy_mw = 0.0
-        intraday_revenue = 0.0
-
-        active_market = self._get_intraday_market(row)
-        intraday_open = self._is_intraday_open(row)
-        if not afrr_activated and intraday_open and active_market != 'closed':
-            intraday_level = self.INTRADAY_LEVELS[xbid_action]
-            requested_intraday = intraday_level * remaining_after_ida
-
-            if abs(requested_intraday) > 0.1:
-                # I recalculate limits after previous stages
-                available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
-                available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
-
-                max_discharge = min(
-                    remaining_after_ida,
-                    available_discharge_mwh * self.eff_sqrt / self.time_step_hours
-                )
-                max_charge = min(
-                    remaining_after_ida,
-                    available_charge_mwh / self.eff_sqrt / self.time_step_hours
-                )
-
-                if requested_intraday > 0:
-                    actual_intraday = min(requested_intraday, max_discharge)
-                else:
-                    actual_intraday = max(requested_intraday, -max_charge)
-
-                if abs(actual_intraday) > 0.1:
-                    if actual_intraday > 0:  # Sell (discharge)
-                        energy_mwh = actual_intraday * self.time_step_hours
-                        soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
-                        old_soc = self.soc
-                        self.soc = max(self.min_soc, self.soc - soc_delta)
-                        actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
-
-                        # I route to the correct market for pricing
-                        id_price = self._get_intraday_sell_price(active_market, row)
-                        intraday_revenue = actual_energy * id_price
-
-                    else:  # Buy (charge)
-                        energy_mwh = abs(actual_intraday) * self.time_step_hours
-                        soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
-                        old_soc = self.soc
-                        self.soc = min(self.max_soc, self.soc + soc_delta)
-                        actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
-
-                        # I route to the correct market for pricing
-                        id_price = self._get_intraday_buy_price(active_market, row)
-                        intraday_revenue = -actual_energy * id_price
-
-                    cycle_fraction = actual_energy / self.capacity_mwh
-                    self.total_cycles += cycle_fraction
-                    self.daily_cycles += cycle_fraction
-
-                    intraday_energy_mw = actual_intraday
-                    xbid_energy_mw = actual_intraday if self.enable_full_market else 0.0
-                    if self.enable_full_market:
-                        self.xbid_profit += intraday_revenue
-                    else:
-                        self.intraday_profit += intraday_revenue
-                    actual_energy_mw += actual_intraday
-
-        # I calculate remaining after XBID/IntraDay for balancing
-        remaining_after_intraday = remaining_after_ida - abs(intraday_energy_mw)
-
-        # =====================================================================
-        # STAGE 8A: EXECUTE mFRR (TSO-activated, pay-as-cleared, mandatory)
-        # I always apply the TSO activation gate for mFRR — in both legacy and
-        # full-market modes. mFRR is a TSO-directed service; the agent cannot
-        # submit mFRR bids voluntarily.
+        # STAGE 7: EXECUTE mFRR (TSO-activated, pay-as-cleared, mandatory)
+        # I promote mFRR before IntraDay because it's TSO-mandated and should
+        # get priority access to capacity. Cascade: DAM → aFRR → IDA → mFRR → IntraDay → FreeBid
         # =====================================================================
         mfrr_energy_mw = 0.0
         mfrr_revenue = 0.0
 
         if not afrr_activated:
             mfrr_level = self.MFRR_LEVELS[mfrr_qty_action]
-            requested_mfrr = mfrr_level * remaining_after_intraday
+            requested_mfrr = mfrr_level * remaining_after_ida
 
             # I determine mFRR activation from real market data (ADMIE volumes).
             # Real data shows 84% UP and 96% DOWN system-wide activation rates,
@@ -1059,16 +988,16 @@ class BatteryEnvUnified(gym.Env):
                         requested_mfrr = 0.0
 
             if abs(requested_mfrr) > 0.1:
-                # I recalculate limits after XBID/IntraDay
+                # I recalculate limits after IDA
                 available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
                 available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
 
                 max_discharge = min(
-                    remaining_after_intraday,
+                    remaining_after_ida,
                     available_discharge_mwh * self.eff_sqrt / self.time_step_hours
                 )
                 max_charge = min(
-                    remaining_after_intraday,
+                    remaining_after_ida,
                     available_charge_mwh / self.eff_sqrt / self.time_step_hours
                 )
 
@@ -1110,31 +1039,34 @@ class BatteryEnvUnified(gym.Env):
 
                     cycle_fraction = actual_energy / self.capacity_mwh
                     self.total_cycles += cycle_fraction
-                    self.daily_cycles += cycle_fraction
+                    # I do NOT increment daily_cycles for mFRR — it's TSO-mandated,
+                    # the agent can't avoid it, so it shouldn't be penalized.
 
                     mfrr_energy_mw = actual_mfrr
                     self.mfrr_profit += mfrr_revenue
                     actual_energy_mw += actual_mfrr
 
-        # I calculate remaining capacity after mFRR for Free Bids
-        remaining_after_mfrr = remaining_after_intraday - abs(mfrr_energy_mw)
+        # I calculate remaining capacity after mFRR for IntraDay
+        remaining_after_mfrr = remaining_after_ida - abs(mfrr_energy_mw)
 
         # =====================================================================
-        # STAGE 8B: EXECUTE FREE BID (agent-submitted, pay-as-bid, merit-order)
-        # I only execute Free Bids in full-market mode. The agent sets both
-        # quantity and price; activation depends on merit-order simulation.
+        # STAGE 8: EXECUTE INTRADAY CORRECTION (IDA auctions + ISP continuous)
+        # I route the unified IntraDay action to the appropriate market
+        # based on time-of-day: IDA1/2/3 auctions or ISP cascade.
+        # IntraDay now uses remaining capacity AFTER mFRR.
         # =====================================================================
-        free_bid_energy_mw = 0.0
-        free_bid_revenue = 0.0
-        free_bid_activated = False
-        agent_bid_price = 0.0
+        intraday_energy_mw = 0.0
+        xbid_energy_mw = 0.0
+        intraday_revenue = 0.0
 
-        if self.enable_full_market and not afrr_activated:
-            freebid_level = self.FREEBID_QTY_LEVELS[freebid_qty_action]
-            requested_freebid = freebid_level * remaining_after_mfrr
+        active_market = self._get_intraday_market(row)
+        intraday_open = self._is_intraday_open(row)
+        if not afrr_activated and intraday_open and active_market != 'closed':
+            intraday_level = self.INTRADAY_LEVELS[xbid_action]
+            requested_intraday = intraday_level * remaining_after_mfrr
 
-            if abs(requested_freebid) > 0.1:
-                # I recalculate limits after mFRR (SoC may have changed)
+            if abs(requested_intraday) > 0.1:
+                # I recalculate limits after mFRR
                 available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
                 available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
 
@@ -1144,6 +1076,75 @@ class BatteryEnvUnified(gym.Env):
                 )
                 max_charge = min(
                     remaining_after_mfrr,
+                    available_charge_mwh / self.eff_sqrt / self.time_step_hours
+                )
+
+                if requested_intraday > 0:
+                    actual_intraday = min(requested_intraday, max_discharge)
+                else:
+                    actual_intraday = max(requested_intraday, -max_charge)
+
+                if abs(actual_intraday) > 0.1:
+                    if actual_intraday > 0:  # Sell (discharge)
+                        energy_mwh = actual_intraday * self.time_step_hours
+                        soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
+                        old_soc = self.soc
+                        self.soc = max(self.min_soc, self.soc - soc_delta)
+                        actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
+
+                        # I route to the correct market for pricing
+                        id_price = self._get_intraday_sell_price(active_market, row)
+                        intraday_revenue = actual_energy * id_price
+
+                    else:  # Buy (charge)
+                        energy_mwh = abs(actual_intraday) * self.time_step_hours
+                        soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
+                        old_soc = self.soc
+                        self.soc = min(self.max_soc, self.soc + soc_delta)
+                        actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
+
+                        # I route to the correct market for pricing
+                        id_price = self._get_intraday_buy_price(active_market, row)
+                        intraday_revenue = -actual_energy * id_price
+
+                    cycle_fraction = actual_energy / self.capacity_mwh
+                    self.total_cycles += cycle_fraction
+                    self.daily_cycles += cycle_fraction
+
+                    intraday_energy_mw = actual_intraday
+                    xbid_energy_mw = 0.0  # I no longer distinguish XBID
+                    self.intraday_profit += intraday_revenue
+                    actual_energy_mw += actual_intraday
+
+        # I calculate remaining after IntraDay for Free Bids
+        remaining_after_intraday = remaining_after_mfrr - abs(intraday_energy_mw)
+
+        # =====================================================================
+        # STAGE 9: EXECUTE FREE BID (agent-submitted, pay-as-bid, merit-order)
+        # I only execute Free Bids in full-market mode. The agent sets both
+        # quantity and price; activation depends on merit-order simulation.
+        # Free Bids use remaining capacity after IntraDay.
+        # =====================================================================
+        free_bid_energy_mw = 0.0
+        free_bid_revenue = 0.0
+        free_bid_activated = False
+        agent_bid_price = 0.0
+
+        if self.enable_full_market and not afrr_activated:
+            freebid_level = self.FREEBID_QTY_LEVELS[freebid_qty_action]
+            requested_freebid = freebid_level * remaining_after_intraday
+
+            if abs(requested_freebid) > 0.1:
+                # I recalculate limits after IntraDay (SoC may have changed)
+                available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
+                available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
+
+                max_discharge = min(
+                    remaining_after_intraday,
+                    available_discharge_mwh * self.eff_sqrt / self.time_step_hours
+                )
+                max_charge = min(
+                    remaining_after_intraday,
                     available_charge_mwh / self.eff_sqrt / self.time_step_hours
                 )
 
@@ -1196,7 +1197,7 @@ class BatteryEnvUnified(gym.Env):
                         actual_energy_mw += actual_freebid
 
         # =====================================================================
-        # STAGE 9: CALCULATE REWARD
+        # STAGE 10: CALCULATE REWARD
         # =====================================================================
         market_state = UnifiedMarketState(
             dam_price=row.get('price', 100.0),
@@ -1212,13 +1213,13 @@ class BatteryEnvUnified(gym.Env):
             afrr_activation_direction=afrr_direction,
             mfrr_price_up=row.get('mfrr_price_up', 120.0),
             mfrr_price_down=row.get('mfrr_price_down', 60.0),
-            # IDA sub-market fields (full market mode)
+            # IDA sub-market fields (full market mode) — I pass ISP prices
             ida1_clearing_price=row.get('ida1_clearing_price', 0.0),
             ida2_clearing_price=row.get('ida2_clearing_price', 0.0),
             ida3_clearing_price=row.get('ida3_clearing_price', 0.0) if not np.isnan(row.get('ida3_clearing_price', 0.0)) else 0.0,
             net_ida_position=row.get('net_ida_position', 0.0),
-            xbid_bid=row.get('xbid_bid', row.get('intraday_bid', 98.0)),
-            xbid_ask=row.get('xbid_ask', row.get('intraday_ask', 102.0)),
+            xbid_bid=self._get_intraday_sell_price(None, row),
+            xbid_ask=self._get_intraday_buy_price(None, row),
             free_bid_activated=free_bid_activated,
             free_bid_agent_price=agent_bid_price if self.enable_full_market else 0.0,
         )
@@ -1250,6 +1251,8 @@ class BatteryEnvUnified(gym.Env):
             ida_energy_mw=ida_energy_mw,
             xbid_energy_mw=xbid_energy_mw,
             free_bid_energy_mw=free_bid_energy_mw,
+            # I pass daily_cycles for super-linear cycle excess penalty
+            daily_cycles=self.daily_cycles,
         )
 
         reward = reward_info['reward']
@@ -1257,7 +1260,7 @@ class BatteryEnvUnified(gym.Env):
         self.episode_profit += reward_info['components'].get('net_profit', 0)
 
         # =====================================================================
-        # STAGE 10: ADVANCE STEP
+        # STAGE 11: ADVANCE STEP
         # =====================================================================
         self.current_step += 1
 
@@ -1281,7 +1284,6 @@ class BatteryEnvUnified(gym.Env):
             'is_selected': self.is_selected_for_afrr,
             'actual_energy_mw': actual_energy_mw,
             'intraday_energy_mw': intraday_energy_mw,
-            'intraday_profit': intraday_revenue,
             'intraday_revenue': intraday_revenue,
             'mfrr_energy_mw': mfrr_energy_mw,
             'mfrr_revenue': mfrr_revenue,
@@ -1889,8 +1891,16 @@ class BatteryEnvUnified(gym.Env):
                 else:
                     features.append(0.0)
                 features.append(row.get('forecast_confidence', 0.5))
-                features.append(row.get('hours_to_dam_peak', 12.0) / 24.0)
-                features.append(row.get('hours_to_dam_trough', 6.0) / 24.0)
+                # I compute dynamic hours to peak/trough from actual price series
+                lookahead_end = min(self.current_step + 96, len(self.df))
+                price_window = self.df['price'].iloc[self.current_step:lookahead_end].values
+                if len(price_window) > 4:
+                    hours_to_peak = np.argmax(price_window) * self.time_step_hours
+                    hours_to_trough = np.argmin(price_window) * self.time_step_hours
+                else:
+                    hours_to_peak, hours_to_trough = 12.0, 6.0
+                features.append(hours_to_peak / 24.0)
+                features.append(hours_to_trough / 24.0)
 
                 # I add ISP cascade features (5 features)
                 # ISP2 prices provide intermediate price signal
@@ -1958,8 +1968,10 @@ class BatteryEnvUnified(gym.Env):
             features.append(row.get('ida1_position', 0.0) / self.max_power_mw)    # [63]
             features.append(row.get('ida2_position', 0.0) / self.max_power_mw)    # [64]
             features.append(row.get('ida3_position', 0.0) / self.max_power_mw)    # [65]
-            features.append(row.get('ida1_clearing_price', 0.0) / 100.0)          # [66]
-            features.append(row.get('ida2_clearing_price', 0.0) / 100.0)          # [67]
+            # [66]: Best ISP sell price (was: synthetic ida1_clearing_price)
+            features.append(self._get_intraday_sell_price(None, row) / 100.0)     # [66]
+            # [67]: Best ISP buy price (was: synthetic ida2_clearing_price)
+            features.append(self._get_intraday_buy_price(None, row) / 100.0)      # [67]
             features.append(row.get('net_ida_position', 0.0) / self.max_power_mw) # [68]
             features.append(1.0 if self._is_intraday_open(row) else 0.0)          # [69]
 
@@ -1968,8 +1980,9 @@ class BatteryEnvUnified(gym.Env):
             features.append(row.get('free_bid_activation_base', 0.3))              # [71]
             features.append(row.get('free_bid_reference_price', 100.0) / 100.0)   # [72]
 
-            # Group 12: XBID Quality (73-74)
-            features.append(row.get('xbid_spread', 5.0) / 100.0)                  # [73]
+            # Group 12: ISP Cascade Quality (73-74)
+            # [73]: ISP cascade spread (was: synthetic xbid_spread)
+            features.append(row.get('isp_cascade_spread_up', 0.0) / 100.0)        # [73]
             features.append(self._get_time_to_delivery(row) / 24.0)               # [74]
 
         # =====================================================================
@@ -1992,13 +2005,13 @@ class BatteryEnvUnified(gym.Env):
         return obs
 
     def _get_intraday_market(self, row):
-        """I determine which IntraDay market is active at the current step.
+        """I determine which ISP session price to use. No XBID.
 
         I route the unified IntraDay action [2] to the appropriate market:
         - IDA1 auction at hour 15:00 (gate closure ~15:00, results ~15:30)
         - IDA2 auction at hour 22:00 (gate closure ~22:00)
         - IDA3 auction at hour 10:00 for ISPs >= 14:00
-        - XBID continuous trading at all other hours 00:00-22:59
+        - ISP cascade (ISP3>ISP2>ISP1) at all other hours 00:00-22:59
         - Closed at 23:00-23:59 (no tradeable ISPs remaining)
         """
         ts = self.df.index[self.current_step]
@@ -2013,7 +2026,14 @@ class BatteryEnvUnified(gym.Env):
         elif hour == 10 and minute < 15:
             return 'ida3'
         elif hour < 23:
-            return 'xbid'
+            # I use ISP cascade instead of XBID
+            p3 = row.get('isp3_price_up', np.nan)
+            if not np.isnan(p3) and p3 > 0:
+                return 'isp3'
+            p2 = row.get('isp2_price_up', np.nan)
+            if not np.isnan(p2) and p2 > 0:
+                return 'isp2'
+            return 'isp1'
         else:
             return 'closed'
 
@@ -2060,30 +2080,38 @@ class BatteryEnvUnified(gym.Env):
             return 0.0    # Before any IDA results
 
     def _get_intraday_sell_price(self, active_market, row):
-        """I return the sell (discharge) price for the active IntraDay market.
+        """I return the sell (discharge) price using real ISP clearing data.
 
-        IDA auctions use a single clearing price for buy AND sell.
-        XBID continuous uses separate bid/ask prices.
+        I use the most recent ISP session available: ISP3 > ISP2 > ISP1.
+        ISP UP prices = what the battery receives for selling regulation energy.
+        For IDA auctions, I still use the IDA clearing price.
         """
         if active_market in ('ida1', 'ida2', 'ida3'):
             # IDA auctions: single clearing price (same for buy/sell)
             price_col = f'{active_market}_clearing_price'
             id_price = row.get(price_col, row.get('price', 100.0))
-            # I handle IDA3 delivery restriction: only for ISPs >= 14:00
             if active_market == 'ida3':
                 ts = self.df.index[self.current_step]
                 if ts.hour < 14:
                     id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
             return id_price
-        else:  # xbid
-            # I prefer XBID prices, fall back to intraday_bid (now battery convention)
-            return row.get('xbid_bid', row.get('intraday_bid', row.get('price', 100.0) - 3.0))
+        # I use ISP cascade: ISP3 > ISP2 > ISP1 > DAM fallback
+        p3 = row.get('isp3_price_up', np.nan)
+        if not np.isnan(p3) and p3 > 0:
+            return p3
+        p2 = row.get('isp2_price_up', np.nan)
+        if not np.isnan(p2) and p2 > 0:
+            return p2
+        p1 = row.get('isp1_price_up', np.nan)
+        if not np.isnan(p1) and p1 > 0:
+            return p1
+        return row.get('price', 100.0)
 
     def _get_intraday_buy_price(self, active_market, row):
-        """I return the buy (charge) price for the active IntraDay market.
+        """I return the buy (charge) price using real ISP clearing data.
 
-        IDA auctions use a single clearing price for buy AND sell.
-        XBID continuous uses separate bid/ask prices.
+        ISP DOWN prices = what the battery pays for buying regulation energy.
+        For IDA auctions, I still use the IDA clearing price.
         """
         if active_market in ('ida1', 'ida2', 'ida3'):
             # IDA auctions: single clearing price (same for buy/sell)
@@ -2094,8 +2122,17 @@ class BatteryEnvUnified(gym.Env):
                 if ts.hour < 14:
                     id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
             return id_price
-        else:  # xbid
-            return row.get('xbid_ask', row.get('intraday_ask', row.get('price', 100.0) + 3.0))
+        # I use ISP cascade: ISP3 > ISP2 > ISP1 > DAM fallback
+        p3 = row.get('isp3_price_down', np.nan)
+        if not np.isnan(p3) and p3 > 0:
+            return p3
+        p2 = row.get('isp2_price_down', np.nan)
+        if not np.isnan(p2) and p2 > 0:
+            return p2
+        p1 = row.get('isp1_price_down', np.nan)
+        if not np.isnan(p1) and p1 > 0:
+            return p1
+        return row.get('price', 100.0)
 
     def _simulate_free_bid_activation(self, bid_price, ref_price, imbalance, row):
         """I simulate merit-order based Free Bid activation."""
