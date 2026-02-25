@@ -170,7 +170,8 @@ class TensorboardLoggingCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         # I extract info from the environment
-        for info in self.locals.get('infos', []):
+        dones = self.locals.get('dones', [])
+        for i, info in enumerate(self.locals.get('infos', [])):
             self.step_count += 1
 
             # I track step-level participation
@@ -199,31 +200,24 @@ class TensorboardLoggingCallback(BaseCallback):
                 else:
                     self.step_free_bid_buys += 1
 
-            # I check for episode end (when total_profit is reported)
-            if 'total_profit' in info:
-                self.episode_profits.append(info['total_profit'])
-            if 'total_cycles' in info:
-                self.episode_cycles.append(info['total_cycles'])
-
-            # I track per-market profits
-            if 'dam_profit' in info:
-                self.dam_profits.append(info['dam_profit'])
-            if 'intraday_profit' in info:
-                self.intraday_profits.append(info['intraday_profit'])
-            if 'afrr_capacity_profit' in info:
-                self.afrr_capacity_profits.append(info['afrr_capacity_profit'])
-            if 'afrr_energy_profit' in info:
-                self.afrr_energy_profits.append(info['afrr_energy_profit'])
-            if 'mfrr_profit' in info:
-                self.mfrr_profits.append(info['mfrr_profit'])
-
-            # I collect full-market episode profits
-            if 'ida_profit' in info:
-                self.ida_profits.append(info['ida_profit'])
-            if 'xbid_profit' in info:
-                self.xbid_profits.append(info['xbid_profit'])
-            if 'free_bid_profit' in info:
-                self.free_bid_profits.append(info['free_bid_profit'])
+            # I only record cumulative per-market profits at episode end.
+            # These are cumulative counters that grow each step — recording
+            # mid-episode values dilutes the signal toward zero.
+            is_done = dones[i] if i < len(dones) else False
+            if is_done:
+                self.episode_profits.append(info.get('total_profit', 0))
+                self.episode_cycles.append(info.get('total_cycles', 0))
+                self.dam_profits.append(info.get('dam_profit', 0))
+                self.intraday_profits.append(info.get('intraday_profit', 0))
+                self.afrr_capacity_profits.append(info.get('afrr_capacity_profit', 0))
+                self.afrr_energy_profits.append(info.get('afrr_energy_profit', 0))
+                self.mfrr_profits.append(info.get('mfrr_profit', 0))
+                if 'ida_profit' in info:
+                    self.ida_profits.append(info['ida_profit'])
+                if 'xbid_profit' in info:
+                    self.xbid_profits.append(info['xbid_profit'])
+                if 'free_bid_profit' in info:
+                    self.free_bid_profits.append(info['free_bid_profit'])
 
         # I log periodically
         if self.num_timesteps % 10000 == 0 and len(self.episode_profits) > 0:
@@ -335,6 +329,7 @@ def create_training_env(
             'afrr_nonresponse_penalty': 500.0,
             'cycle_target': 2.0,
             'cycle_excess_penalty': 3000.0,
+            'calendar_aging_coefficient': 50.0,
             'reward_scale': 0.01
         }
 
@@ -670,6 +665,44 @@ def train_unified_model(
             }
         )
 
+    # I save training configuration BEFORE training starts, so that
+    # intermediate checkpoints (best_model.zip) can be evaluated while
+    # the training is still running.
+    import json
+    config = {
+        'total_timesteps': total_timesteps,
+        'learning_rate': learning_rate,
+        'n_steps': n_steps,
+        'batch_size': batch_size,
+        'n_epochs': n_epochs,
+        'gamma': gamma,
+        'gae_lambda': gae_lambda,
+        'clip_range': clip_range,
+        'ent_coef': ent_coef,
+        'seed': seed,
+        'data_path': str(data_path),
+        'time_step_hours': time_step_hours,
+        'enable_full_market': enable_full_market,
+        'enable_forecast': enable_forecast,
+        'forecaster_path': forecaster_path,
+        'enable_market_forecast': enable_market_forecast,
+        'market_forecaster_path': market_forecaster_path,
+        'enable_endogenous_dam': enable_endogenous_dam,
+        'dam_bidder_min_spread': dam_bidder_min_spread,
+        'mfrr_activation_rate': mfrr_activation_rate,
+        'mfrr_price_cap': mfrr_price_cap,
+        'degradation_cost': 25.0,
+        'cycle_target': 2.0,
+        'cycle_excess_penalty': 3000.0,
+        'calendar_aging_coefficient': 50.0,
+        'timestamp': timestamp
+    }
+
+    config_path = model_dir / "training_config.json"
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    print(f"Training config saved to {config_path}")
+
     # I train the model
     reset_timesteps = resume_from is None
     print(f"\nStarting training for {total_timesteps:,} timesteps...")
@@ -697,41 +730,6 @@ def train_unified_model(
     train_env.save(str(vec_normalize_path))
     print(f"VecNormalize saved to {vec_normalize_path}")
 
-    # I save training configuration
-    config = {
-        'total_timesteps': total_timesteps,
-        'learning_rate': learning_rate,
-        'n_steps': n_steps,
-        'batch_size': batch_size,
-        'n_epochs': n_epochs,
-        'gamma': gamma,
-        'gae_lambda': gae_lambda,
-        'clip_range': clip_range,
-        'ent_coef': ent_coef,
-        'seed': seed,
-        'data_path': str(data_path),
-        'time_step_hours': time_step_hours,
-        'enable_full_market': enable_full_market,
-        'enable_forecast': enable_forecast,
-        'forecaster_path': forecaster_path,
-        'enable_market_forecast': enable_market_forecast,
-        'market_forecaster_path': market_forecaster_path,
-        'enable_endogenous_dam': enable_endogenous_dam,
-        'dam_bidder_min_spread': dam_bidder_min_spread,
-        'mfrr_activation_rate': mfrr_activation_rate,
-        'mfrr_price_cap': mfrr_price_cap,
-        'degradation_cost': reward_config.get('degradation_cost', 25.0),
-        'cycle_target': reward_config.get('cycle_target', 2.0),
-        'cycle_excess_penalty': reward_config.get('cycle_excess_penalty', 3000.0),
-        'timestamp': timestamp
-    }
-
-    config_path = model_dir / "training_config.json"
-    import json
-    with open(config_path, 'w') as f:
-        json.dump(config, f, indent=2)
-    print(f"Training config saved to {config_path}")
-
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE")
     print("=" * 60)
@@ -746,7 +744,8 @@ def evaluate_model(
     model_path: str,
     data_path: str = "data/unified_multimarket_training_v2.csv",
     n_episodes: int = 10,
-    use_eval_split: bool = True
+    use_eval_split: bool = True,
+    trace_path: Optional[str] = None
 ) -> Dict:
     """
     I evaluate a trained unified model.
@@ -765,13 +764,27 @@ def evaluate_model(
 
     # ----------------------------------------------------------------
     # 1. I load training config to match env settings exactly
+    # I search upward from the model file to find training_config.json,
+    # because best/best_model.zip lives one level below the config.
     # ----------------------------------------------------------------
-    config_path = model_dir / "training_config.json"
     train_cfg = {}
-    if config_path.exists():
+    search_dir = model_dir
+    config_path = None
+    for _ in range(3):  # I search up to 3 levels
+        candidate = search_dir / "training_config.json"
+        if candidate.exists():
+            config_path = candidate
+            break
+        search_dir = search_dir.parent
+
+    if config_path is not None:
         with open(config_path) as f:
             train_cfg = json.load(f)
         print(f"  Loaded training config from {config_path}")
+        # I set model_dir to the directory containing the config (the real model root)
+        model_dir = config_path.parent
+    else:
+        print(f"  WARNING: No training_config.json found near {model_path}")
 
     time_step_hours = train_cfg.get('time_step_hours', 1.0)
     enable_full_market = train_cfg.get('enable_full_market', False)
@@ -835,6 +848,7 @@ def evaluate_model(
         'afrr_nonresponse_penalty': 500.0,
         'cycle_target': train_cfg.get('cycle_target', 2.0),
         'cycle_excess_penalty': train_cfg.get('cycle_excess_penalty', 3000.0),
+        'calendar_aging_coefficient': train_cfg.get('calendar_aging_coefficient', 50.0),
         'reward_scale': 0.01
     }
     print(f"  Eval degradation_cost: {eval_degradation} EUR/MWh")
@@ -888,6 +902,35 @@ def evaluate_model(
         'cost_breakdowns': [],
     }
 
+    # I set up CSV trace writer if requested
+    import csv
+    trace_file = None
+    trace_writer = None
+    trace_columns = [
+        'episode', 'step', 'soc', 'daily_cycles', 'total_cycles',
+        # Actions (raw indices from MultiDiscrete)
+        'action_dam', 'action_afrr', 'action_intraday', 'action_mfrr',
+        # Execution
+        'actual_energy_mw', 'dam_commitment_mw', 'dam_shortfall_mw',
+        'intraday_energy_mw', 'mfrr_energy_mw',
+        'afrr_commitment_mw', 'afrr_selected', 'afrr_activated', 'afrr_direction',
+        # Revenues
+        'dam_revenue', 'intraday_revenue', 'mfrr_revenue',
+        'afrr_capacity_revenue', 'afrr_energy_revenue',
+        # Costs
+        'degradation_cost', 'dam_violation_cost', 'afrr_nonresponse_cost',
+        'physical_penalty', 'cycle_excess_cost', 'calendar_aging_cost', 'dam_bonus',
+        # Net
+        'net_profit', 'reward', 'cumulative_profit',
+        # Full-market (optional, filled with 0 if not active)
+        'ida_energy_mw', 'free_bid_energy_mw', 'free_bid_activated',
+    ]
+    if trace_path:
+        trace_file = open(trace_path, 'w', newline='')
+        trace_writer = csv.DictWriter(trace_file, fieldnames=trace_columns)
+        trace_writer.writeheader()
+        print(f"  Trace output: {trace_path} ({len(trace_columns)} columns)")
+
     for episode in range(n_episodes):
         obs = eval_vec.reset()
         done = False
@@ -904,6 +947,7 @@ def evaluate_model(
         episode_afrr_nonresponse = 0.0
         episode_physical_penalty = 0.0
         episode_cycle_excess = 0.0
+        episode_calendar_aging = 0.0
         episode_dam_bonus = 0.0
 
         while not done:
@@ -914,7 +958,8 @@ def evaluate_model(
 
             info = info[0]
             last_info = info
-            episode_profit += info.get('net_profit', 0)
+            step_net_profit = info.get('net_profit', 0)
+            episode_profit += step_net_profit
             episode_length += 1
 
             # I accumulate cost components for full accounting
@@ -923,12 +968,55 @@ def evaluate_model(
             episode_afrr_nonresponse += info.get('afrr_nonresponse_cost', 0)
             episode_physical_penalty += info.get('physical_penalty', 0)
             episode_cycle_excess += info.get('cycle_excess_cost', 0)
+            episode_calendar_aging += info.get('calendar_aging_cost', 0)
             episode_dam_bonus += info.get('dam_bonus', 0)
 
             if info.get('afrr_activated', False):
                 afrr_activations += 1
             if info.get('dam_shortfall_mw', 0) > 0.1:
                 dam_violations += 1
+
+            # I write per-step trace row if tracing is enabled
+            if trace_writer is not None:
+                act = action.flatten()
+                trace_writer.writerow({
+                    'episode': episode + 1,
+                    'step': episode_length,
+                    'soc': round(info.get('soc', 0), 4),
+                    'daily_cycles': round(info.get('daily_cycles', 0), 4),
+                    'total_cycles': round(info.get('total_cycles', 0), 4),
+                    'action_dam': int(act[0]),
+                    'action_afrr': int(act[1]),
+                    'action_intraday': int(act[2]),
+                    'action_mfrr': int(act[3]),
+                    'actual_energy_mw': round(info.get('actual_energy_mw', 0), 3),
+                    'dam_commitment_mw': round(info.get('dam_commitment_mw', 0), 3),
+                    'dam_shortfall_mw': round(info.get('dam_shortfall_mw', 0), 3),
+                    'intraday_energy_mw': round(info.get('intraday_energy_mw', 0), 3),
+                    'mfrr_energy_mw': round(info.get('mfrr_energy_mw', 0), 3),
+                    'afrr_commitment_mw': round(info.get('afrr_commitment', 0), 3),
+                    'afrr_selected': int(info.get('is_selected', False)),
+                    'afrr_activated': int(info.get('afrr_activated', False)),
+                    'afrr_direction': info.get('afrr_direction', ''),
+                    'dam_revenue': round(info.get('dam_revenue', 0), 2),
+                    'intraday_revenue': round(info.get('intraday_revenue', 0), 2),
+                    'mfrr_revenue': round(info.get('mfrr_revenue', 0), 2),
+                    'afrr_capacity_revenue': round(info.get('afrr_capacity_revenue', 0), 2),
+                    'afrr_energy_revenue': round(info.get('afrr_energy_revenue', 0), 2),
+                    'degradation_cost': round(info.get('degradation_cost', 0), 2),
+                    'dam_violation_cost': round(info.get('dam_violation_cost', 0), 2),
+                    'afrr_nonresponse_cost': round(info.get('afrr_nonresponse_cost', 0), 2),
+                    'physical_penalty': round(info.get('physical_penalty', 0), 2),
+                    'cycle_excess_cost': round(info.get('cycle_excess_cost', 0), 2),
+                    'calendar_aging_cost': round(info.get('calendar_aging_cost', 0), 2),
+                    'dam_bonus': round(info.get('dam_bonus', 0), 2),
+                    'net_profit': round(step_net_profit, 2),
+                    'reward': round(float(reward[0]), 6),
+                    'cumulative_profit': round(info.get('total_profit', 0), 2),
+                    'ida_energy_mw': round(info.get('ida_energy_mw', 0), 3),
+                    'free_bid_energy_mw': round(info.get('free_bid_energy_mw', 0), 3),
+                    'free_bid_activated': int(info.get('free_bid_activated', False)),
+                })
 
         # I use the env's own cumulative cycle counter (accurate)
         episode_cycles = last_info.get('total_cycles', 0)
@@ -948,6 +1036,7 @@ def evaluate_model(
             'afrr_nonresponse': episode_afrr_nonresponse,
             'physical_penalty': episode_physical_penalty,
             'cycle_excess': episode_cycle_excess,
+            'calendar_aging': episode_calendar_aging,
             'dam_bonus': episode_dam_bonus,
         }
         results['cost_breakdowns'].append(cost_breakdown)
@@ -965,7 +1054,7 @@ def evaluate_model(
         results['per_market'].append(market_summary)
 
         gross_sum = sum(market_summary.values())
-        total_costs = episode_degradation + episode_dam_violation + episode_afrr_nonresponse + episode_physical_penalty + episode_cycle_excess
+        total_costs = episode_degradation + episode_dam_violation + episode_afrr_nonresponse + episode_physical_penalty + episode_cycle_excess + episode_calendar_aging
 
         print(f"Episode {episode + 1}: Profit={episode_profit:,.0f} EUR, "
               f"Cycles={episode_cycles:.2f}, "
@@ -981,10 +1070,17 @@ def evaluate_model(
               f"aFRR_nr={episode_afrr_nonresponse:,.0f}, "
               f"Phys={episode_physical_penalty:,.0f}, "
               f"CycleEx={episode_cycle_excess:,.0f}, "
+              f"CalAging={episode_calendar_aging:,.0f}, "
               f"DAM_bonus=+{episode_dam_bonus:,.0f}")
         if abs(episode_profit - env_total_profit) > 1.0:
             print(f"  WARNING: profit mismatch! accumulated={episode_profit:,.0f} "
                   f"vs env.total_profit={env_total_profit:,.0f}")
+
+    # I close the trace file if it was opened
+    if trace_file is not None:
+        trace_file.close()
+        total_trace_rows = sum(results['episode_lengths'])
+        print(f"\n  Trace saved: {trace_path} ({total_trace_rows:,} rows)")
 
     # ----------------------------------------------------------------
     # 7. I calculate summary statistics
@@ -1001,14 +1097,14 @@ def evaluate_model(
 
     # I aggregate per-market means
     market_keys = ['dam', 'afrr_cap', 'afrr_energy', 'mfrr',
-                    'ida', 'xbid', 'free_bid']
+                    'intraday', 'ida', 'free_bid']
     results['mean_per_market'] = {
         k: np.mean([m[k] for m in results['per_market']]) for k in market_keys
     }
 
     # I aggregate cost breakdown means
     cost_keys = ['degradation', 'dam_violation', 'afrr_nonresponse',
-                 'physical_penalty', 'cycle_excess', 'dam_bonus']
+                 'physical_penalty', 'cycle_excess', 'calendar_aging', 'dam_bonus']
     results['mean_costs'] = {
         k: np.mean([c[k] for c in results['cost_breakdowns']]) for k in cost_keys
     }
@@ -1038,6 +1134,7 @@ def evaluate_model(
     print(f"  {'afrr_nonresp':>16s}: {results['mean_costs']['afrr_nonresponse']:>10,.0f} EUR")
     print(f"  {'physical':>16s}: {results['mean_costs']['physical_penalty']:>10,.0f} EUR")
     print(f"  {'cycle_excess':>16s}: {results['mean_costs']['cycle_excess']:>10,.0f} EUR")
+    print(f"  {'calendar_aging':>16s}: {results['mean_costs']['calendar_aging']:>10,.0f} EUR")
     print(f"  {'TOTAL COSTS':>16s}: {mean_total_costs:>10,.0f} EUR")
     print(f"  {'dam_bonus':>16s}: {mean_bonuses:>+10,.0f} EUR")
     print(f"\nAccounting: Gross({mean_gross:,.0f}) - Costs({mean_total_costs:,.0f}) "
@@ -1093,12 +1190,22 @@ if __name__ == "__main__":
                         help="mFRR bid activation probability (default: 0.35)")
     parser.add_argument("--mfrr-price-cap", type=float, default=1000.0,
                         help="mFRR settlement price cap EUR/MWh (default: 1000)")
+    parser.add_argument("--trace", type=str, default=None,
+                        help="Path to write per-step CSV trace during evaluation "
+                             "(e.g. eval_trace.csv)")
+    parser.add_argument("--n-eval-episodes", type=int, default=10,
+                        help="Number of evaluation episodes (default: 10)")
 
     args = parser.parse_args()
 
     if args.eval:
         # I run evaluation only (config auto-loaded from training_config.json)
-        results = evaluate_model(args.eval, args.data, use_eval_split=True)
+        results = evaluate_model(
+            args.eval, args.data,
+            n_episodes=args.n_eval_episodes,
+            use_eval_split=True,
+            trace_path=args.trace
+        )
     else:
         # I run training
         model_path = train_unified_model(
