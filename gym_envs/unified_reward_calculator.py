@@ -11,7 +11,7 @@ The reward formula ensures proper incentives for all market activities while
 maintaining strict compliance with HEnEx regulatory requirements.
 
 Total Reward = DAM_Revenue + IntraDay_Revenue + aFRR_Capacity + aFRR_Energy + mFRR_Revenue
-               - Degradation - DAM_Violation_Penalty - aFRR_NonResponse_Penalty
+               - Degradation - Calendar_Aging - DAM_Violation_Penalty - aFRR_NonResponse_Penalty
 """
 
 import numpy as np
@@ -63,34 +63,53 @@ class UnifiedRewardCalculator:
     I calculate rewards for the unified multi-market battery environment.
 
     Key Design Decisions:
-    1. DAM violations have SEVERE penalties (1500 EUR/MWh) - regulatory requirement
-    2. aFRR non-response has EVEN HIGHER penalties (2000 EUR/MWh) - TSO requirement
-    3. Degradation is proportional to energy cycled (15 EUR/MWh default)
+    1. DAM violations checked against DAM-ONLY energy (not net total) to
+       avoid false penalties when IntraDay/aFRR trade in opposite direction
+    2. aFRR non-response penalty = 500 EUR/MWh (reduced from 2000)
+    3. Degradation = 5 EUR/MWh (reduced from 15 — realistic for Li-ion BESS
+       and allows IntraDay profitability with mean spread ~11 EUR/MWh)
     4. aFRR capacity payments are unconditional when selected
     5. All revenues scale with actual delivered energy
+    6. reward_scale = 0.01 (raised from 0.001 for stronger NN signal)
+    7. dam_balancing term removed (was double-counting non-DAM revenue)
     """
 
     def __init__(
         self,
         # Degradation
-        degradation_cost_per_mwh: float = 15.0,
+        degradation_cost_per_mwh: float = 5.0,  # I reduced from 15 to 5 EUR/MWh
+        # (realistic Li-ion BESS cost, enables IntraDay with mean spread ~11 EUR/MWh)
 
-        # Penalty coefficients
-        dam_violation_penalty: float = 1500.0,  # EUR/MWh - HEnEx imbalance penalty
-        afrr_nonresponse_penalty: float = 2000.0,  # EUR/MWh - TSO penalty (CRITICAL)
+        # Penalty coefficients — I reduced these to fix the 37:1 penalty/profit
+        # asymmetry that was destroying the gradient signal. The old values
+        # (1500/2000) caused single-step penalties of 11-15k EUR while typical
+        # profits were ~300 EUR, making SNR ≈ 0.1 (need >0.5 for stable PPO).
+        dam_violation_penalty: float = 800.0,  # EUR/MWh - was 1500, still deterrent
+        afrr_nonresponse_penalty: float = 500.0,  # EUR/MWh - was 2000, still severe
         physical_violation_penalty: float = 100.0,  # EUR for physically impossible actions
 
         # Bonuses
         dam_compliance_bonus: float = 5.0,  # EUR/MWh for perfect DAM compliance
         afrr_response_bonus: float = 10.0,  # EUR/MWh for fast aFRR response
-        optimal_timing_bonus: float = 2.0,  # EUR/MWh for good trade timing
 
-        # Risk penalties
-        shortfall_risk_penalty: float = 200.0,  # Proactive penalty for risky SoC (raised from 50)
-        soc_buffer_bonus: float = 2.0,  # Bonus for maintaining healthy SoC
+        # Cycle management — I penalize daily cycling above target to keep
+        # battery wear at 1.5-2.0 cycles/day. Super-linear scaling means
+        # small overages get mild penalty, large overages get severe penalty.
+        cycle_target: float = 2.0,  # Target daily cycles
+        cycle_excess_penalty: float = 3000.0,  # EUR per excess cycle (super-linear)
 
-        # Scaling
-        reward_scale: float = 0.001  # Scale rewards for NN training
+        # Calendar aging — Li-ion batteries degrade faster at extreme SoC.
+        # I model this as a quadratic cost: (SoC - 0.5)^2 * coefficient per step.
+        # At 50% SoC: 0 EUR. At 5% SoC: 0.2025 * 200 = 40.5 EUR/step.
+        # At 20% SoC: 0.09 * 200 = 18 EUR/step (~30% of trading profit).
+        # I raised from 50 to 200 because the agent was spending 45% of time
+        # below 20% SoC — the old penalty was only 7.5% of per-step profit.
+        calendar_aging_coefficient: float = 200.0,
+
+        # Scaling — I raised from 0.001 to 0.01 so that a typical 300 EUR
+        # trade produces a reward of 3.0 instead of 0.3, giving the NN a
+        # much stronger learning signal without needing VecNormalize reward norm.
+        reward_scale: float = 0.01  # Scale rewards for NN training (was 0.001)
     ):
         self.degradation_cost = degradation_cost_per_mwh
         self.dam_violation_penalty = dam_violation_penalty
@@ -98,16 +117,16 @@ class UnifiedRewardCalculator:
         self.physical_violation_penalty = physical_violation_penalty
         self.dam_compliance_bonus = dam_compliance_bonus
         self.afrr_response_bonus = afrr_response_bonus
-        self.optimal_timing_bonus = optimal_timing_bonus
-        self.shortfall_risk_penalty = shortfall_risk_penalty
-        self.soc_buffer_bonus = soc_buffer_bonus
+        self.cycle_target = cycle_target
+        self.cycle_excess_penalty = cycle_excess_penalty
+        self.calendar_aging_coefficient = calendar_aging_coefficient
         self.reward_scale = reward_scale
 
     def calculate(
         self,
         market: UnifiedMarketState,
         # Actions taken
-        actual_energy_mw: float,  # Actual energy traded (positive = discharge)
+        actual_energy_mw: float,  # Total net energy (DAM+aFRR+ID+mFRR)
         afrr_capacity_committed_mw: float,  # aFRR capacity commitment
         afrr_energy_delivered_mw: float,  # aFRR energy when activated
 
@@ -130,6 +149,22 @@ class UnifiedRewardCalculator:
         ida_energy_mw: float = 0.0,
         xbid_energy_mw: float = 0.0,
         free_bid_energy_mw: float = 0.0,
+
+        # I added dam_executed_mw so DAM compliance is checked against
+        # DAM-only energy, not the net total. Before this fix, IntraDay
+        # or aFRR trades in the opposite direction of DAM triggered
+        # false 800 EUR/MWh violations.
+        dam_executed_mw: float = None,
+
+        # I added afrr_max_deliverable_mw to distinguish between agent fault
+        # (chose wrong action) and SoC starvation (DAM consumed the energy).
+        # When set and < 0.1, I skip the non-response penalty because the
+        # agent physically couldn't respond — not its fault.
+        afrr_max_deliverable_mw: float = None,
+
+        # I pass daily_cycles so the reward calculator can apply super-linear
+        # penalty when cycling exceeds the target (1.5-2.0/day).
+        daily_cycles: float = 0.0,
     ) -> Dict:
         """
         I calculate the total reward for a unified multi-market step.
@@ -140,6 +175,11 @@ class UnifiedRewardCalculator:
         """
         components = {}
 
+        # I use dam_executed_mw for compliance checks (not net total).
+        # If caller doesn't provide it, I fall back to actual_energy_mw
+        # for backward compatibility.
+        dam_delivery_mw = dam_executed_mw if dam_executed_mw is not None else actual_energy_mw
+
         # =====================================================================
         # 1. DAM SETTLEMENT
         # =====================================================================
@@ -148,34 +188,30 @@ class UnifiedRewardCalculator:
         dam_revenue = dam_commitment * market.dam_price * time_step_hours
         components['dam_revenue'] = dam_revenue
 
-        # I calculate DAM imbalance settlement
-        # Imbalance = actual - commitment
-        dam_imbalance_mw = actual_energy_mw - dam_commitment
-        if dam_imbalance_mw > 0:
-            # Delivered MORE than committed - get bid price
-            dam_balancing = dam_imbalance_mw * market.intraday_bid * time_step_hours
-        else:
-            # Delivered LESS than committed - pay ask price
-            dam_balancing = dam_imbalance_mw * market.intraday_ask * time_step_hours
-        components['dam_balancing'] = dam_balancing
+        # I removed the old dam_balancing term because it double-counted
+        # revenue from IntraDay/mFRR/aFRR. The net-flow imbalance was
+        # priced at bid/ask AND each market's revenue was added separately,
+        # inflating total revenue by 2x for non-DAM trades.
+        components['dam_balancing'] = 0.0
 
-        # I apply DAM violation penalty for non-compliance
+        # I check DAM compliance against DAM-ONLY delivered energy, not the
+        # net total. Before this fix, IntraDay buy + DAM sell = false violation.
         dam_shortfall_mw = 0.0
         dam_violation_cost = 0.0
 
-        if dam_commitment > 0 and actual_energy_mw < dam_commitment:
-            # Failed to deliver on SELL commitment
-            dam_shortfall_mw = dam_commitment - actual_energy_mw
+        if dam_commitment > 0 and dam_delivery_mw < dam_commitment - 0.1:
+            # I failed to deliver on SELL commitment
+            dam_shortfall_mw = dam_commitment - dam_delivery_mw
             dam_violation_cost = dam_shortfall_mw * self.dam_violation_penalty * time_step_hours
-        elif dam_commitment < 0 and actual_energy_mw > dam_commitment:
-            # Failed to honor BUY commitment
-            dam_shortfall_mw = actual_energy_mw - dam_commitment
+        elif dam_commitment < 0 and dam_delivery_mw > dam_commitment + 0.1:
+            # I failed to honor BUY commitment (dam_delivery_mw should be negative)
+            dam_shortfall_mw = abs(dam_delivery_mw - dam_commitment)
             dam_violation_cost = dam_shortfall_mw * self.dam_violation_penalty * time_step_hours
 
         components['dam_shortfall_mw'] = dam_shortfall_mw
         components['dam_violation_cost'] = dam_violation_cost
 
-        # I add DAM compliance bonus for perfect execution
+        # I check DAM compliance bonus against DAM-only energy
         dam_bonus = 0.0
         if abs(dam_commitment) > 0.1 and dam_shortfall_mw < 0.1:
             dam_bonus = abs(dam_commitment) * self.dam_compliance_bonus * time_step_hours
@@ -210,8 +246,13 @@ class UnifiedRewardCalculator:
                     if afrr_energy_delivered_mw >= required_power * 0.9:
                         afrr_energy_revenue += required_power * self.afrr_response_bonus * time_step_hours
                 else:
-                    # BAD - I failed to respond (SEVERE penalty)
-                    afrr_nonresponse_cost = required_power * self.afrr_nonresponse_penalty * time_step_hours
+                    # I check if the agent was SoC-starved (DAM consumed the
+                    # energy). If so, I skip the penalty — not the agent's fault.
+                    if afrr_max_deliverable_mw is not None and afrr_max_deliverable_mw < 0.1:
+                        afrr_nonresponse_cost = 0.0
+                    else:
+                        # BAD - I failed to respond (SEVERE penalty)
+                        afrr_nonresponse_cost = required_power * self.afrr_nonresponse_penalty * time_step_hours
 
             elif market.afrr_activation_direction == 'down':
                 # Must charge
@@ -221,8 +262,12 @@ class UnifiedRewardCalculator:
                     if abs(afrr_energy_delivered_mw) >= required_power * 0.9:
                         afrr_energy_revenue += required_power * self.afrr_response_bonus * time_step_hours
                 else:
-                    # BAD - I failed to respond
-                    afrr_nonresponse_cost = required_power * self.afrr_nonresponse_penalty * time_step_hours
+                    # I check if the agent was SoC-starved (no headroom to charge).
+                    if afrr_max_deliverable_mw is not None and afrr_max_deliverable_mw < 0.1:
+                        afrr_nonresponse_cost = 0.0
+                    else:
+                        # BAD - I failed to respond
+                        afrr_nonresponse_cost = required_power * self.afrr_nonresponse_penalty * time_step_hours
 
         components['afrr_energy_revenue'] = afrr_energy_revenue
         components['afrr_nonresponse_cost'] = afrr_nonresponse_cost
@@ -247,8 +292,10 @@ class UnifiedRewardCalculator:
                 # Discharging to mFRR (selling upward regulation)
                 mfrr_revenue = mfrr_energy_mw * market.mfrr_price_up * time_step_hours
             else:
-                # Charging from mFRR (buying downward regulation)
-                mfrr_revenue = mfrr_energy_mw * market.mfrr_price_down * time_step_hours  # Negative * positive = negative cost
+                # Charging from mFRR (providing downward regulation)
+                # I use abs() because down-regulation is a SERVICE — the TSO
+                # pays the BSP to absorb excess energy. Revenue is positive.
+                mfrr_revenue = abs(mfrr_energy_mw) * market.mfrr_price_down * time_step_hours
 
         components['mfrr_revenue'] = mfrr_revenue
 
@@ -302,59 +349,47 @@ class UnifiedRewardCalculator:
         physical_penalty = self.physical_violation_penalty if is_physical_violation else 0.0
         components['physical_penalty'] = physical_penalty
 
-        # =====================================================================
-        # 8. SHORTFALL RISK PENALTY (proactive)
-        # =====================================================================
-        # I penalize risky SoC states before they become violations
-        risk_penalty = 0.0
-        if shortfall_risk > 0.1:
-            risk_factor = (shortfall_risk - 0.1) / 0.9  # Normalize to [0, 1] (threshold lowered from 0.2)
-            risk_penalty = self.shortfall_risk_penalty * (risk_factor ** 1.5)  # Quadratic scaling
-        components['risk_penalty'] = risk_penalty
+        # I removed sections 8 (risk_penalty), 9 (soc_bonus), 10 (timing_bonus)
+        # because they added noise without meaningful signal. The action masking
+        # already handles SoC safety, and the raw trade P&L is a cleaner signal
+        # than small bonuses/penalties that were dwarfed by penalty spikes.
+        # I still report them as zero for backward compatibility with loggers.
+        components['risk_penalty'] = 0.0
+        components['soc_bonus'] = 0.0
+        components['timing_bonus'] = 0.0
 
         # =====================================================================
-        # 9. SoC BUFFER BONUS
+        # 7b. CYCLE EXCESS PENALTY (super-linear)
         # =====================================================================
-        # I reward maintaining healthy SoC levels (flexible for commitments)
-        soc_bonus = 0.0
-        if 0.25 <= current_soc <= 0.75:
-            # Ideal zone - full bonus
-            soc_bonus = self.soc_buffer_bonus
-        elif 0.15 <= current_soc < 0.25 or 0.75 < current_soc <= 0.85:
-            # Acceptable zone - partial bonus
-            soc_bonus = self.soc_buffer_bonus * 0.5
-        else:
-            # Extreme zone - penalty
-            soc_bonus = -self.soc_buffer_bonus
-        components['soc_bonus'] = soc_bonus
+        # I penalize daily cycling above target with super-linear scaling.
+        # At 2.0 target: 2.5 cycles → penalty = 3000 × 0.5^1.5 = 1,060 EUR
+        #                3.0 cycles → penalty = 3000 × 1.0^1.5 = 3,000 EUR
+        #                5.0 cycles → penalty = 3000 × 3.0^1.5 = 15,588 EUR
+        cycle_excess_cost = 0.0
+        if daily_cycles > self.cycle_target:
+            excess = daily_cycles - self.cycle_target
+            cycle_excess_cost = self.cycle_excess_penalty * (excess ** 1.5)
+        components['cycle_excess_cost'] = cycle_excess_cost
 
         # =====================================================================
-        # 10. PRICE TIMING BONUS
+        # 7c. CALENDAR AGING COST
         # =====================================================================
-        # I reward trading with momentum (backward-looking)
-        timing_bonus = 0.0
-        if abs(price_momentum) > 0.05 and abs(actual_energy_mw) > 0.5:
-            power_factor = abs(actual_energy_mw) / 30.0  # Normalize by max power
-
-            if actual_energy_mw > 0 and price_momentum > 0:
-                # Selling when prices rose - good timing
-                timing_bonus = self.optimal_timing_bonus * power_factor * min(price_momentum, 0.3) * 100
-            elif actual_energy_mw < 0 and price_momentum < 0:
-                # Buying when prices fell - good timing
-                timing_bonus = self.optimal_timing_bonus * power_factor * min(abs(price_momentum), 0.3) * 100
-
-        components['timing_bonus'] = timing_bonus
+        # I model calendar aging as a quadratic penalty on SoC distance from 50%.
+        # Li-ion batteries degrade faster at extreme SoC (high voltage stress at
+        # top, copper dissolution at bottom). The cost is per time step.
+        soc_deviation = current_soc - 0.5
+        calendar_aging_cost = (soc_deviation ** 2) * self.calendar_aging_coefficient
+        components['calendar_aging_cost'] = calendar_aging_cost
 
         # =====================================================================
-        # 11. TOTAL REWARD
+        # 8. TOTAL REWARD
         # =====================================================================
         total_revenue = (
-            dam_revenue + dam_balancing + dam_bonus +
+            dam_revenue + dam_bonus +
             afrr_capacity_revenue + afrr_energy_revenue +
             intraday_revenue +
             ida_revenue + xbid_revenue +
-            free_bid_revenue + mfrr_revenue +
-            soc_bonus + timing_bonus
+            free_bid_revenue + mfrr_revenue
         )
 
         total_costs = (
@@ -362,7 +397,8 @@ class UnifiedRewardCalculator:
             dam_violation_cost +
             afrr_nonresponse_cost +
             physical_penalty +
-            risk_penalty
+            cycle_excess_cost +
+            calendar_aging_cost
         )
 
         net_profit = total_revenue - total_costs

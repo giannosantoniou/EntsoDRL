@@ -150,6 +150,10 @@ class TensorboardLoggingCallback(BaseCallback):
         self.xbid_profits = []
         self.free_bid_profits = []
 
+        # I track SoC extremes per episode
+        self.episode_min_socs = []
+        self.episode_max_socs = []
+
         # I track participation counts per episode
         self.afrr_bids_per_ep = []
         self.afrr_selections_per_ep = []
@@ -212,6 +216,8 @@ class TensorboardLoggingCallback(BaseCallback):
                 self.afrr_capacity_profits.append(info.get('afrr_capacity_profit', 0))
                 self.afrr_energy_profits.append(info.get('afrr_energy_profit', 0))
                 self.mfrr_profits.append(info.get('mfrr_profit', 0))
+                self.episode_min_socs.append(info.get('episode_min_soc', 0.5))
+                self.episode_max_socs.append(info.get('episode_max_soc', 0.5))
                 if 'ida_profit' in info:
                     self.ida_profits.append(info['ida_profit'])
                 if 'xbid_profit' in info:
@@ -240,6 +246,13 @@ class TensorboardLoggingCallback(BaseCallback):
                 self.logger.record('markets/afrr_energy_profit', np.mean(self.afrr_energy_profits[-100:]))
             if len(self.mfrr_profits) > 0:
                 self.logger.record('markets/mfrr_profit', np.mean(self.mfrr_profits[-100:]))
+
+            # I log SoC utilization range
+            if len(self.episode_min_socs) > 0:
+                self.logger.record('soc/avg_min_soc', np.mean(self.episode_min_socs[-100:]))
+                self.logger.record('soc/avg_max_soc', np.mean(self.episode_max_socs[-100:]))
+                self.logger.record('soc/worst_min_soc', np.min(self.episode_min_socs[-100:]))
+                self.logger.record('soc/worst_max_soc', np.max(self.episode_max_socs[-100:]))
 
             # I log full-market mode metrics from episode-level accumulators
             if self.ida_profits:
@@ -329,7 +342,7 @@ def create_training_env(
             'afrr_nonresponse_penalty': 500.0,
             'cycle_target': 2.0,
             'cycle_excess_penalty': 3000.0,
-            'calendar_aging_coefficient': 50.0,
+            'calendar_aging_coefficient': 200.0,
             'reward_scale': 0.01
         }
 
@@ -694,7 +707,7 @@ def train_unified_model(
         'degradation_cost': 25.0,
         'cycle_target': 2.0,
         'cycle_excess_penalty': 3000.0,
-        'calendar_aging_coefficient': 50.0,
+        'calendar_aging_coefficient': 200.0,
         'timestamp': timestamp
     }
 

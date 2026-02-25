@@ -421,6 +421,10 @@ class BatteryEnvUnified(gym.Env):
         self.episode_start_step = self.current_step
         self.episode_profit = 0.0
 
+        # I track SoC extremes over the episode
+        self.episode_min_soc = 1.0
+        self.episode_max_soc = 0.0
+
     def reset(self, seed=None, options=None):
         """I reset the environment for a new episode."""
         super().reset(seed=seed)
@@ -1279,6 +1283,10 @@ class BatteryEnvUnified(gym.Env):
             steps_in_episode = self.current_step - self.episode_start_step
             if steps_in_episode >= self.episode_length:
                 truncated = True
+
+        # I track SoC extremes after all market actions have executed
+        self.episode_min_soc = min(self.episode_min_soc, self.soc)
+        self.episode_max_soc = max(self.episode_max_soc, self.soc)
 
         obs = self._build_observation()
         info = self._get_info()
@@ -2212,6 +2220,8 @@ class BatteryEnvUnified(gym.Env):
             'mfrr_profit': self.mfrr_profit,
             'total_cycles': self.total_cycles,
             'daily_cycles': self.daily_cycles,
+            'episode_min_soc': self.episode_min_soc,
+            'episode_max_soc': self.episode_max_soc,
         }
         if self.enable_full_market:
             info.update({
