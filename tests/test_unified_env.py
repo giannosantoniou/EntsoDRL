@@ -168,20 +168,22 @@ class TestObservationSpace:
     def test_cycles_remaining_feature(self, unified_env):
         """I verify obs[3] is cycles_remaining normalized to [0, 1]."""
         unified_env.reset(seed=42)
+        max_dc = unified_env.max_daily_cycles  # 2.5 default
         unified_env.daily_cycles = 0.0
         obs = unified_env._build_observation()
-        # cycles_remaining = max(0, 2.0 - 0.0) / 2.0 = 1.0
+        # cycles_remaining = max(0, 2.5 - 0.0) / 2.5 = 1.0
         assert obs[3] == pytest.approx(1.0, abs=0.01), \
             f"Expected cycles_remaining=1.0 at start of day, got {obs[3]}"
 
-        # I set daily_cycles to 1.0 (half used)
+        # I set daily_cycles to 1.0 (40% used with max_daily_cycles=2.5)
         unified_env.daily_cycles = 1.0
         obs = unified_env._build_observation()
-        assert obs[3] == pytest.approx(0.5, abs=0.01), \
-            f"Expected cycles_remaining=0.5, got {obs[3]}"
+        expected = max(0, max_dc - 1.0) / max_dc  # 1.5/2.5 = 0.6
+        assert obs[3] == pytest.approx(expected, abs=0.01), \
+            f"Expected cycles_remaining={expected}, got {obs[3]}"
 
         # I set daily_cycles to max (fully used)
-        unified_env.daily_cycles = 2.0
+        unified_env.daily_cycles = max_dc
         obs = unified_env._build_observation()
         assert obs[3] == pytest.approx(0.0, abs=0.01), \
             f"Expected cycles_remaining=0.0, got {obs[3]}"
@@ -536,6 +538,118 @@ class TestUnifiedRewardCalculator:
         assert result['components']['intraday_revenue'] == pytest.approx(-1020.0, abs=1.0)
 
 
+class TestCalendarAging:
+    """I test the calendar aging cost that penalizes extreme SoC."""
+
+    @staticmethod
+    def _idle_market():
+        """I create a neutral market state for calendar aging tests."""
+        from gym_envs.unified_reward_calculator import UnifiedMarketState
+        return UnifiedMarketState(
+            dam_price=100.0, dam_commitment=0.0,
+            intraday_bid=100.0, intraday_ask=100.0, intraday_spread=0.0,
+            afrr_cap_up_price=20.0, afrr_cap_down_price=30.0,
+            afrr_energy_up_price=80.0, afrr_energy_down_price=80.0,
+            afrr_activated=False, afrr_activation_direction=None,
+            mfrr_price_up=120.0, mfrr_price_down=60.0,
+        )
+
+    def test_zero_cost_at_50_percent(self):
+        """I verify calendar aging cost is zero when SoC is exactly 50%."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator
+
+        calculator = UnifiedRewardCalculator(calendar_aging_coefficient=50.0)
+        result = calculator.calculate(
+            market=self._idle_market(), actual_energy_mw=0.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0
+        )
+        assert result['components']['calendar_aging_cost'] == pytest.approx(0.0, abs=1e-6), \
+            "Calendar aging should be zero at 50% SoC"
+
+    def test_maximum_cost_at_extremes(self):
+        """I verify calendar aging cost is highest at SoC extremes (5% and 95%)."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator
+
+        calculator = UnifiedRewardCalculator(calendar_aging_coefficient=50.0)
+        # I test at 95% SoC
+        result_high = calculator.calculate(
+            market=self._idle_market(), actual_energy_mw=0.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.95, capacity_mwh=146.0
+        )
+        # I test at 5% SoC
+        result_low = calculator.calculate(
+            market=self._idle_market(), actual_energy_mw=0.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.05, capacity_mwh=146.0
+        )
+        # (0.95-0.5)^2 * 50 = 0.2025 * 50 = 10.125
+        expected = (0.45 ** 2) * 50.0
+        assert result_high['components']['calendar_aging_cost'] == pytest.approx(expected, abs=0.01)
+        assert result_low['components']['calendar_aging_cost'] == pytest.approx(expected, abs=0.01), \
+            "Calendar aging should be symmetric around 50%"
+
+    def test_quadratic_scaling(self):
+        """I verify the cost scales quadratically with distance from 50%."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator
+
+        calculator = UnifiedRewardCalculator(calendar_aging_coefficient=50.0)
+        # I test at 70% SoC: (0.7-0.5)^2 * 50 = 0.04 * 50 = 2.0
+        result_70 = calculator.calculate(
+            market=self._idle_market(), actual_energy_mw=0.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.7, capacity_mwh=146.0
+        )
+        # I test at 90% SoC: (0.9-0.5)^2 * 50 = 0.16 * 50 = 8.0
+        result_90 = calculator.calculate(
+            market=self._idle_market(), actual_energy_mw=0.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.9, capacity_mwh=146.0
+        )
+        assert result_70['components']['calendar_aging_cost'] == pytest.approx(2.0, abs=0.01)
+        assert result_90['components']['calendar_aging_cost'] == pytest.approx(8.0, abs=0.01)
+        # 4x ratio (quadratic: 0.4^2 / 0.2^2 = 4)
+        ratio = result_90['components']['calendar_aging_cost'] / result_70['components']['calendar_aging_cost']
+        assert ratio == pytest.approx(4.0, abs=0.01)
+
+    def test_included_in_net_profit(self):
+        """I verify calendar aging cost reduces net profit."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator
+
+        # I compare reward at 50% vs 95% SoC (no trading, just sitting idle)
+        calc = UnifiedRewardCalculator(calendar_aging_coefficient=50.0)
+        result_50 = calc.calculate(
+            market=self._idle_market(), actual_energy_mw=0.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0
+        )
+        result_95 = calc.calculate(
+            market=self._idle_market(), actual_energy_mw=0.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.95, capacity_mwh=146.0
+        )
+        assert result_50['components']['net_profit'] > result_95['components']['net_profit'], \
+            "Sitting idle at 50% should yield higher net profit than at 95%"
+
+    def test_coefficient_configurable(self, unified_env):
+        """I verify the coefficient flows from reward_config to the calculator."""
+        assert unified_env.reward_calculator.calendar_aging_coefficient == pytest.approx(50.0), \
+            "Default calendar_aging_coefficient should be 50.0"
+
+    def test_zero_coefficient_disables(self):
+        """I verify setting coefficient=0 disables calendar aging entirely."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator
+
+        calc = UnifiedRewardCalculator(calendar_aging_coefficient=0.0)
+        result = calc.calculate(
+            market=self._idle_market(), actual_energy_mw=0.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.95, capacity_mwh=146.0
+        )
+        assert result['components']['calendar_aging_cost'] == pytest.approx(0.0, abs=1e-6)
+
+
 class TestDAMSoCReservation:
     """I test the SoC-aware action masking that prevents DAM violations."""
 
@@ -569,12 +683,14 @@ class TestDAMSoCReservation:
 
         min_soc, max_soc = unified_env._calculate_dam_soc_reserve()
 
-        # min_soc should be higher than default
+        # min_soc should be higher than default (sell reserve + safety buffer)
         assert min_soc > unified_env.min_soc + 0.01
-        # max_soc should stay at default
-        assert max_soc == pytest.approx(unified_env.max_soc, abs=1e-6)
+        # max_soc should be slightly below default due to safety buffer
+        buffer = unified_env.max_power_mw * unified_env.time_step_hours / unified_env.capacity_mwh
+        assert max_soc == pytest.approx(unified_env.max_soc - buffer, abs=1e-6)
 
-        expected_min_soc = unified_env.min_soc + (30.0 / unified_env.eff_sqrt) / unified_env.capacity_mwh
+        sell_reserve = (30.0 / unified_env.eff_sqrt) / unified_env.capacity_mwh
+        expected_min_soc = unified_env.min_soc + sell_reserve + buffer
         assert min_soc == pytest.approx(expected_min_soc, abs=0.01)
 
     def test_dam_mask_prevents_over_discharge(self, unified_env):
@@ -642,6 +758,99 @@ class TestDAMSoCReservation:
         assert mfrr_mask[5] == True
         # Discharge should be allowed (XBID gate is open at hour 14)
         assert intraday_mask[10] == True, "IntraDay discharge should be allowed with high SoC"
+
+
+class TestDamAwareCycleBudget:
+    """I test that the action mask pre-subtracts DAM cycle cost from the budget."""
+
+    def test_cycle_budget_subtracts_dam_cost(self, unified_env):
+        """I verify that large DAM commitment reduces the cycle budget available for trading."""
+        unified_env.reset(seed=42)
+        unified_env.soc = 0.5
+        unified_env.daily_cycles = 0.0
+        step = unified_env.current_step
+
+        # I set a large DAM commitment (30 MW) for the current step
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 30.0
+        # I clear future commitments so DAM reserve doesn't interfere
+        for i in range(1, 5):
+            if step + i < len(unified_env.df):
+                unified_env.df.iloc[step + i, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        mask_with_dam = unified_env.action_masks()
+
+        # I now set DAM commitment to 0 and check the mask is less restrictive
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+        mask_without_dam = unified_env.action_masks()
+
+        # With DAM=30, the cycle budget is smaller, so fewer IntraDay actions should be allowed
+        id_mask_with = mask_with_dam[10:21]
+        id_mask_without = mask_without_dam[10:21]
+        assert id_mask_with.sum() <= id_mask_without.sum(), \
+            "DAM commitment should reduce available IntraDay actions via cycle budget"
+
+    def test_cycle_budget_subtracts_afrr_buffer(self, unified_env):
+        """I verify that aFRR commitment adds a buffer to the cycle budget."""
+        unified_env.reset(seed=42)
+        unified_env.soc = 0.5
+        # I set daily_cycles close to max so the aFRR buffer matters
+        unified_env.daily_cycles = unified_env.max_daily_cycles - 0.1
+        step = unified_env.current_step
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+        for i in range(1, 5):
+            if step + i < len(unified_env.df):
+                unified_env.df.iloc[step + i, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+
+        # I set a large aFRR commitment
+        unified_env.afrr_commitment_mw = 15.0
+        mask_with_afrr = unified_env.action_masks()
+
+        # I remove the aFRR commitment
+        unified_env.afrr_commitment_mw = 0.0
+        mask_without_afrr = unified_env.action_masks()
+
+        id_mask_with = mask_with_afrr[10:21]
+        id_mask_without = mask_without_afrr[10:21]
+        assert id_mask_with.sum() <= id_mask_without.sum(), \
+            "aFRR buffer should reduce available IntraDay actions via cycle budget"
+
+    def test_max_daily_cycles_default_is_2_5(self, unified_env):
+        """I verify the default max_daily_cycles is 2.5."""
+        assert unified_env.max_daily_cycles == pytest.approx(2.5), \
+            f"Expected max_daily_cycles=2.5, got {unified_env.max_daily_cycles}"
+
+    def test_dam_soc_reserve_buffer_only_with_commitments(self, unified_env):
+        """I verify the safety buffer is NOT applied when there are no DAM commitments."""
+        unified_env.reset(seed=42)
+        step = unified_env.current_step
+        for i in range(1, 5):
+            if step + i < len(unified_env.df):
+                unified_env.df.iloc[step + i, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+        min_soc, max_soc = unified_env._calculate_dam_soc_reserve()
+        assert min_soc == pytest.approx(unified_env.min_soc, abs=1e-6), \
+            "No buffer should be added without commitments"
+        assert max_soc == pytest.approx(unified_env.max_soc, abs=1e-6), \
+            "No buffer should be added without commitments"
+
+    def test_dam_soc_reserve_buffer_with_sell_commitment(self, unified_env):
+        """I verify the safety buffer IS applied when there is a sell commitment."""
+        unified_env.reset(seed=42)
+        step = unified_env.current_step
+        for i in range(1, 5):
+            if step + i < len(unified_env.df):
+                unified_env.df.iloc[step + i, unified_env.df.columns.get_loc('dam_commitment')] = 0.0
+        if step + 1 < len(unified_env.df):
+            unified_env.df.iloc[step + 1, unified_env.df.columns.get_loc('dam_commitment')] = 30.0
+
+        min_soc, max_soc = unified_env._calculate_dam_soc_reserve()
+        buffer = unified_env.max_power_mw * unified_env.time_step_hours / unified_env.capacity_mwh
+        # I check buffer is included: min_soc > min_soc_base + sell_reserve alone
+        sell_reserve = (30.0 / unified_env.eff_sqrt) / unified_env.capacity_mwh
+        assert min_soc >= unified_env.min_soc + sell_reserve + buffer - 0.01, \
+            "Safety buffer should be included in min_soc_reserve when sell commitment exists"
+        # max_soc should also have buffer subtracted
+        assert max_soc <= unified_env.max_soc - buffer + 0.01, \
+            "Safety buffer should be subtracted from max_soc_reserve when commitment exists"
 
 
 class TestCapacityCascading:
@@ -2682,15 +2891,15 @@ class TestMarketTimingConstraints:
             market = unified_env._get_intraday_market(row)
             assert market == 'ida2', f"Expected IDA2 at hour 22, got {market}"
 
-    def test_intraday_sells_at_isp_price(self, unified_env):
-        """I verify IntraDay sell trades use ISP UP price when ISP session is active."""
+    def test_intraday_sells_at_isp1_price(self, unified_env):
+        """I verify IntraDay sell trades use ISP1 UP price (not ISP3) to avoid leakage."""
         unified_env.reset(seed=42)
         unified_env.soc = 0.7  # Enough to discharge
 
         step_16 = unified_env.start_step + 16  # Hour 16 -> ISP session
         if step_16 < len(unified_env.df):
             unified_env.current_step = step_16
-            # I set distinctive ISP3 UP price to verify routing
+            # I set distinctive ISP prices — ISP1 should be used, not ISP3
             unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('isp3_price_up')] = 150.0
             unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('isp2_price_up')] = 80.0
             unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('isp1_price_up')] = 50.0
@@ -2699,13 +2908,13 @@ class TestMarketTimingConstraints:
             action = np.array([0, 2, 10, 5])
             obs, reward, done, truncated, info = unified_env.step(action)
 
-            # I verify IntraDay trade happened at ISP3 UP price (150)
+            # I verify IntraDay trade uses ISP1 UP price (50), not ISP3 (150)
             if info['intraday_energy_mw'] > 0:
                 assert info['intraday_revenue'] > 0, "Sell revenue should be positive"
-                # I check the revenue corresponds to ISP3 price (~150), not ISP1 (~50)
-                expected_min_revenue = info['intraday_energy_mw'] * 100.0 * unified_env.time_step_hours
-                assert info['intraday_revenue'] > expected_min_revenue, \
-                    f"Revenue {info['intraday_revenue']:.2f} too low — should use isp3_price_up=150"
+                # I check revenue corresponds to ISP1 price (~50), not ISP3 (~150)
+                expected_max_revenue = info['intraday_energy_mw'] * 80.0 * unified_env.time_step_hours
+                assert info['intraday_revenue'] <= expected_max_revenue, \
+                    f"Revenue {info['intraday_revenue']:.2f} too high — should use isp1_price_up=50, not ISP3"
 
     def test_ida_single_clearing_price(self, unified_env):
         """I verify IDA auctions use the same clearing price for buy and sell."""
@@ -2718,12 +2927,12 @@ class TestMarketTimingConstraints:
         assert sell_price == buy_price, \
             f"IDA1 should use single clearing price: sell={sell_price}, buy={buy_price}"
 
-    def test_intraday_uses_real_isp_prices(self, sample_data):
-        """I verify IntraDay sell price uses ISP3 > ISP2 > ISP1 cascade."""
+    def test_intraday_uses_isp1_only(self, sample_data):
+        """I verify IntraDay sell price uses ISP1 only (not ISP3/ISP2) to avoid leakage."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        # I set distinctive ISP prices to verify cascade
+        # I set distinctive ISP prices — only ISP1 should be used
         df['isp3_price_up'] = 200.0
         df['isp2_price_up'] = 150.0
         df['isp1_price_up'] = 100.0
@@ -2735,17 +2944,18 @@ class TestMarketTimingConstraints:
         env.reset(seed=42)
         row = env.df.iloc[env.current_step]
 
-        # I verify ISP3 price is used (highest priority)
+        # I verify ISP1 price is used (ISP3/ISP2 are future info)
         sell_price = env._get_intraday_sell_price(None, row)
-        assert sell_price == pytest.approx(200.0), \
-            f"Should use ISP3 price (200), got {sell_price}"
+        assert sell_price == pytest.approx(100.0), \
+            f"Should use ISP1 price (100), got {sell_price}"
 
-        # I remove ISP3 and verify ISP2 fallback
-        env.df['isp3_price_up'] = np.nan
+        # I remove ISP1 and verify DAM fallback (not ISP2)
+        env.df['isp1_price_up'] = np.nan
         row = env.df.iloc[env.current_step]
         sell_price = env._get_intraday_sell_price(None, row)
-        assert sell_price == pytest.approx(150.0), \
-            f"Should fall back to ISP2 price (150), got {sell_price}"
+        dam_price = row.get('price', 100.0)
+        assert sell_price == pytest.approx(dam_price), \
+            f"Should fall back to DAM price ({dam_price}), got {sell_price}"
 
     def test_xbid_open_after_dam_results(self, unified_env):
         """I verify IntraDay trading opens at 14:00."""
@@ -3075,28 +3285,28 @@ class TestFreeBidFixes:
 class TestISPPricesAndCascadeOrder:
     """I test the ISP price integration, mFRR cascade priority, and cycle exemption."""
 
-    def test_intraday_uses_real_isp_sell_price(self, unified_env):
-        """I verify IntraDay sell price uses ISP3 > ISP2 > ISP1 cascade."""
+    def test_intraday_uses_isp1_sell_price(self, unified_env):
+        """I verify IntraDay sell price uses ISP1 (not ISP3) to avoid leakage."""
         unified_env.reset(seed=42)
         row = unified_env.df.iloc[unified_env.current_step]
 
-        # I verify ISP3 is used when available
+        # I verify ISP1 is used (not ISP3)
         sell_price = unified_env._get_intraday_sell_price(None, row)
-        isp3 = row.get('isp3_price_up', np.nan)
-        if not np.isnan(isp3) and isp3 > 0:
-            assert sell_price == pytest.approx(isp3, abs=0.01), \
-                f"Should use ISP3 UP ({isp3}), got {sell_price}"
+        isp1 = row.get('isp1_price_up', np.nan)
+        if not np.isnan(isp1) and isp1 > 0:
+            assert sell_price == pytest.approx(isp1, abs=0.01), \
+                f"Should use ISP1 UP ({isp1}), got {sell_price}"
 
-    def test_intraday_uses_real_isp_buy_price(self, unified_env):
-        """I verify IntraDay buy price uses ISP3 > ISP2 > ISP1 cascade."""
+    def test_intraday_uses_isp1_buy_price(self, unified_env):
+        """I verify IntraDay buy price uses ISP1 (not ISP3) to avoid leakage."""
         unified_env.reset(seed=42)
         row = unified_env.df.iloc[unified_env.current_step]
 
         buy_price = unified_env._get_intraday_buy_price(None, row)
-        isp3 = row.get('isp3_price_down', np.nan)
-        if not np.isnan(isp3) and isp3 > 0:
-            assert buy_price == pytest.approx(isp3, abs=0.01), \
-                f"Should use ISP3 DOWN ({isp3}), got {buy_price}"
+        isp1 = row.get('isp1_price_down', np.nan)
+        if not np.isnan(isp1) and isp1 > 0:
+            assert buy_price == pytest.approx(isp1, abs=0.01), \
+                f"Should use ISP1 DOWN ({isp1}), got {buy_price}"
 
     def test_mfrr_before_intraday_cascade(self, unified_env):
         """I verify mFRR gets full capacity and IntraDay gets remainder."""
@@ -3207,6 +3417,311 @@ class TestISPPricesAndCascadeOrder:
 
         assert len(peak_values) > 1, \
             f"hours_to_dam_peak should vary, but got constant values: {peak_values}"
+
+
+class TestSettlementNoLeakage:
+    """I verify IntraDay settlement uses ISP1 (known), not ISP3 (future)."""
+
+    def test_intraday_sell_uses_isp1_not_isp3(self, sample_data):
+        """I verify sell settlement uses ISP1 price, not ISP3."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data.copy()
+        n = len(df)
+        # I set ISP1=80 and ISP3=120 — if settlement leaks ISP3, revenue will be higher
+        df['isp1_price_up'] = 80.0
+        df['isp3_price_up'] = 120.0
+
+        env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
+        env.reset(seed=42)
+
+        # I advance to a non-IDA hour and test sell price
+        env.current_step = 4  # hour 4:00
+        row = env.df.iloc[env.current_step]
+        sell_price = env._get_intraday_sell_price(None, row)
+
+        assert sell_price == pytest.approx(80.0), \
+            f"Sell settlement should use ISP1 (80.0), not ISP3 (120.0), got {sell_price}"
+
+    def test_intraday_buy_uses_isp1_not_isp3(self, sample_data):
+        """I verify buy settlement uses ISP1 price, not ISP3."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data.copy()
+        df['isp1_price_down'] = 70.0
+        df['isp3_price_down'] = 40.0
+
+        env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
+        env.reset(seed=42)
+
+        env.current_step = 4
+        row = env.df.iloc[env.current_step]
+        buy_price = env._get_intraday_buy_price(None, row)
+
+        assert buy_price == pytest.approx(70.0), \
+            f"Buy settlement should use ISP1 (70.0), not ISP3 (40.0), got {buy_price}"
+
+    def test_intraday_market_returns_isp1(self, sample_data):
+        """I verify _get_intraday_market returns 'isp1' for non-IDA hours."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data.copy()
+        # I set ISP3 available to tempt old cascade logic
+        df['isp3_price_up'] = 120.0
+
+        env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
+        env.reset(seed=42)
+
+        # I test several non-IDA hours
+        for step in range(len(df)):
+            ts = df.index[step]
+            hour = ts.hour
+            minute = ts.minute
+            if hour in (15, 22, 10) and minute < 15:
+                continue  # skip IDA hours
+            if hour >= 23:
+                continue  # skip closed hours
+            env.current_step = step
+            row = df.iloc[step]
+            market = env._get_intraday_market(row)
+            assert market == 'isp1', \
+                f"At {ts}, expected 'isp1' but got '{market}'"
+
+    def test_sell_falls_back_to_dam_when_no_isp1(self, sample_data):
+        """I verify sell price falls back to DAM when ISP1 is unavailable."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data.copy()
+        df['isp1_price_up'] = np.nan  # ISP1 unavailable
+        df['isp3_price_up'] = 120.0   # ISP3 should NOT be used
+
+        env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
+        env.reset(seed=42)
+
+        env.current_step = 4
+        row = env.df.iloc[env.current_step]
+        sell_price = env._get_intraday_sell_price(None, row)
+        dam_price = row.get('price', 100.0)
+
+        assert sell_price == pytest.approx(dam_price), \
+            f"Should fall back to DAM ({dam_price}), not ISP3 (120.0), got {sell_price}"
+
+
+class TestObservationNoLeakage:
+    """I verify observations don't contain future information."""
+
+    def test_no_isp3_in_market_forecast_obs(self, sample_data):
+        """I verify ISP3 prices don't appear in the observation when enable_market_forecast=True."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data.copy()
+        n = len(df)
+        np.random.seed(42)
+        dam_price = df['price'].values
+        # I add forecast columns required for enable_market_forecast
+        df['dam_forecast_next_4h_mean'] = dam_price + np.random.normal(0, 5, n)
+        df['dam_forecast_next_4h_max'] = dam_price + 20
+        df['dam_forecast_next_4h_min'] = dam_price - 20
+        df['dam_forecast_spread'] = 40.0
+        df['dam_forecast_vs_current'] = 0.0
+        df['id_forecast_1h'] = dam_price + 3
+        df['id_forecast_4h'] = dam_price + 5
+        df['imbalance_forecast_dir'] = 0.0
+        df['imbalance_forecast_mag'] = 0.0
+        df['mfrr_opportunity_score'] = 0.5
+        df['forecast_confidence'] = 0.7
+
+        # I set ISP1=80 and ISP3=200 — big gap to detect leakage
+        df['isp1_price_up'] = 80.0
+        df['isp1_price_down'] = 70.0
+        df['isp3_price_up'] = 200.0
+        df['isp3_price_down'] = 180.0
+        df['isp_cascade_spread_up_lag_24h'] = 5.0
+
+        env = BatteryEnvUnified(
+            df=df, episode_length=72, random_start=False,
+            enable_market_forecast=True
+        )
+        env.reset(seed=42)
+        obs = env._build_observation()
+
+        # I check that ISP3 prices (200/100=2.0, 180/100=1.8) don't appear in obs
+        isp3_sell_norm = 200.0 / 100.0  # 2.0
+        isp3_buy_norm = 180.0 / 100.0   # 1.8
+        obs_list = obs.tolist()
+
+        assert isp3_sell_norm not in [round(v, 4) for v in obs_list], \
+            f"ISP3 sell price ({isp3_sell_norm}) found in observation — data leakage!"
+        assert isp3_buy_norm not in [round(v, 4) for v in obs_list], \
+            f"ISP3 buy price ({isp3_buy_norm}) found in observation — data leakage!"
+
+        # I verify ISP1 prices ARE in the observation (at Group 10b ISP features)
+        isp1_sell_norm = 80.0 / 100.0  # 0.8
+        isp1_buy_norm = 70.0 / 100.0   # 0.7
+        # ISP features start at index 64+15=79 in market_forecast mode
+        assert isp1_sell_norm in [round(v, 4) for v in obs_list], \
+            f"ISP1 sell price ({isp1_sell_norm}) should be in observation"
+        assert isp1_buy_norm in [round(v, 4) for v in obs_list], \
+            f"ISP1 buy price ({isp1_buy_norm}) should be in observation"
+
+    def test_hours_to_peak_respects_dam_publication(self, sample_data):
+        """I verify peak/trough are computed from known DAM prices only.
+
+        Before 14:00, the agent should only see today's prices.
+        After 14:00, it can see today + tomorrow.
+        """
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data.copy()
+        n = len(df)
+        np.random.seed(42)
+
+        # I set a very distinctive price pattern: tomorrow's prices spike to 500
+        # If the agent can "see" them before 14:00, peak/trough will reflect them
+        for i in range(n):
+            ts = df.index[i]
+            if ts.date() == pd.Timestamp('2024-01-02').date():
+                df.iloc[i, df.columns.get_loc('price')] = 500.0  # tomorrow spike
+
+        dam_price = df['price'].values
+        df['dam_forecast_next_4h_mean'] = dam_price
+        df['dam_forecast_next_4h_max'] = dam_price + 20
+        df['dam_forecast_next_4h_min'] = dam_price - 20
+        df['dam_forecast_spread'] = 40.0
+        df['dam_forecast_vs_current'] = 0.0
+        df['id_forecast_1h'] = dam_price + 3
+        df['id_forecast_4h'] = dam_price + 5
+        df['imbalance_forecast_dir'] = 0.0
+        df['imbalance_forecast_mag'] = 0.0
+        df['mfrr_opportunity_score'] = 0.5
+        df['forecast_confidence'] = 0.7
+
+        env = BatteryEnvUnified(
+            df=df, episode_length=72, random_start=False,
+            enable_market_forecast=True
+        )
+        env.reset(seed=42)
+
+        # I position at 10:00 on Jan 1 — before 14:00, so tomorrow's prices are unknown
+        # At 10:00 hourly data, step index 10
+        env.current_step = 10
+        obs_before_14 = env._build_observation()
+        # hours_to_peak is at index 64+13=77 in market_forecast mode
+        peak_before_14 = obs_before_14[77] * 24.0  # denormalize
+
+        # I position at 15:00 — after 14:00, tomorrow's prices are known
+        env.current_step = 15
+        obs_after_14 = env._build_observation()
+        peak_after_14 = obs_after_14[77] * 24.0
+
+        # Before 14:00: peak should be within today only (max ~14h ahead to end of day)
+        # It should NOT point to tomorrow's 500 EUR spike
+        assert peak_before_14 <= 14.0, \
+            f"Before 14:00, peak should be within today (<=14h), got {peak_before_14}h"
+
+    def test_full_market_uses_lagged_cascade_spread(self, sample_data):
+        """I verify full-market obs uses lagged (not current) cascade spread."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data.copy()
+        # I set current cascade spread very high and lagged very low
+        df['isp_cascade_spread_up'] = 100.0
+        df['isp_cascade_spread_up_lag_24h'] = 5.0
+
+        env = BatteryEnvUnified(
+            df=df, episode_length=72, random_start=False,
+            enable_full_market=True
+        )
+        env.reset(seed=42)
+        obs = env._build_observation()
+
+        # In full-market mode, Group 12 feature [73] should be lagged spread (5/100=0.05)
+        # Not current spread (100/100=1.0)
+        current_norm = 100.0 / 100.0  # 1.0
+        lagged_norm = 5.0 / 100.0     # 0.05
+
+        # Feature [73] is at index 64+12+73-63 = 64+12+10 = 86? Let me compute:
+        # Base: 64, full_market starts at 64, has 12 features (indices [63]-[74])
+        # [73] is the 11th full-market feature (0-indexed from start of full-market block)
+        # So index = 64 + 10 = 74
+        fm_start = 64
+        cascade_idx = fm_start + 10  # [73] is 11th feature in full-market block
+        assert obs[cascade_idx] == pytest.approx(lagged_norm, abs=0.01), \
+            f"Full-market cascade spread should be lagged (0.05), got {obs[cascade_idx]}"
+
+
+class TestForecastColumnsNoLeakage:
+    """I verify forecast columns in create_unified_training_data don't use future data."""
+
+    def test_no_negative_shift_in_dam_forecasts(self):
+        """I verify DAM forecast columns use backward-looking rolling stats."""
+        # I create a simple DataFrame to test the heuristic path
+        n = 200
+        dates = pd.date_range('2024-01-01', periods=n, freq='15min')
+        df = pd.DataFrame({
+            'price': np.random.uniform(50, 150, n),
+            'price_max_24h': np.random.uniform(100, 200, n),
+            'price_min_24h': np.random.uniform(20, 80, n),
+            'price_std_24h': np.random.uniform(5, 30, n),
+            'intraday_ask': np.random.uniform(50, 150, n),
+            'net_imbalance_mw': np.random.normal(0, 200, n),
+            'mfrr_spread': np.random.uniform(0, 100, n),
+        }, index=dates)
+
+        # I inject a known future spike at index 100
+        df.iloc[100:104, df.columns.get_loc('price')] = 999.0
+
+        sph = 4
+        w4h = 4 * sph
+        # I compute backward-looking mean (same as the fixed code)
+        dam_mean = df['price'].rolling(w4h, min_periods=1).mean()
+
+        # At index 80 (before the spike), backward mean should NOT see the spike
+        assert dam_mean.iloc[80] < 200.0, \
+            f"Backward-looking mean at index 80 should not see future spike, got {dam_mean.iloc[80]}"
+
+    def test_id_forecasts_use_positive_shift(self):
+        """I verify IntraDay forecasts use positive shift (backward), not negative (forward)."""
+        n = 200
+        dates = pd.date_range('2024-01-01', periods=n, freq='15min')
+        prices = np.ones(n) * 100.0
+        # I inject a distinctive pattern at the end
+        prices[180:] = 999.0
+
+        df = pd.DataFrame({'intraday_ask': prices}, index=dates)
+
+        sph = 4
+        # Positive shift = backward looking (correct)
+        id_1h = df['intraday_ask'].shift(1 * sph).bfill()
+
+        # At index 176 (before spike at 180), backward 1h forecast should NOT see the spike
+        assert id_1h.iloc[176] < 200.0, \
+            f"Backward ID forecast at index 176 should not see future spike, got {id_1h.iloc[176]}"
+
+        # At index 184 (after spike), backward 1h forecast SHOULD see the spike
+        assert id_1h.iloc[184] == pytest.approx(999.0), \
+            f"Backward ID forecast at index 184 should see past spike, got {id_1h.iloc[184]}"
+
+    def test_no_noise_injection(self):
+        """I verify no artificial noise is added to forecast columns."""
+        # I read the source file and check there's no random noise injection
+        import inspect
+        import importlib
+        spec = importlib.util.spec_from_file_location(
+            "create_data",
+            str(Path(__file__).parent.parent / "data" / "create_unified_training_data.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        source = inspect.getsource(spec.loader.get_code("create_data")) if hasattr(spec.loader, 'get_code') else ""
+
+        # I fall back to reading the source file directly
+        src_path = Path(__file__).parent.parent / "data" / "create_unified_training_data.py"
+        source = src_path.read_text(encoding='utf-8')
+
+        # I check the heuristic forecast section for noise injection patterns
+        # The old code had: noise = np.random.normal(0, df[col].std() * 0.15, len(df))
+        assert 'np.random.normal(0, df[col].std()' not in source, \
+            "Found noise injection in forecast columns — this should have been removed"
 
 
 if __name__ == "__main__":

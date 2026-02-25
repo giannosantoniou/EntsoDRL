@@ -568,6 +568,16 @@ def _merge_all_isp_prices(df: pd.DataFrame, isp_path: Path) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].ffill()
 
+    # I create a lagged cascade spread (yesterday's ISP3-ISP1) for safe observation.
+    # The current cascade spread uses ISP3 which is future info at decision time,
+    # so I lag it by 24h to make it available without data leakage.
+    sph = 4  # 15-min resolution
+    if 'isp_cascade_spread_up' in df.columns:
+        df['isp_cascade_spread_up_lag_24h'] = df['isp_cascade_spread_up'].shift(24 * sph)
+        df['isp_cascade_spread_up_lag_24h'] = df['isp_cascade_spread_up_lag_24h'].bfill().fillna(0.0)
+        lag_valid = df['isp_cascade_spread_up_lag_24h'].notna().sum()
+        print(f"  Lagged cascade spread (24h): {lag_valid:,} rows")
+
     return df
 
 
@@ -672,31 +682,21 @@ def _add_forecast_columns(
         print("  Using heuristic forecasts (no trained MarketForecaster)")
         sph = 4  # 15-min
 
-        # I compute DAM forecast features from rolling statistics
+        # I compute DAM forecast features from backward-looking rolling statistics.
+        # No shift(-N) — these are persistence/historical heuristics, not future data.
         w4h = 4 * sph
-        df['dam_forecast_next_4h_mean'] = df['price'].rolling(w4h, min_periods=1).mean().shift(-w4h)
-        df['dam_forecast_next_4h_max'] = df['price'].rolling(w4h, min_periods=1).max().shift(-w4h)
-        df['dam_forecast_next_4h_min'] = df['price'].rolling(w4h, min_periods=1).min().shift(-w4h)
-
-        # I back-fill the future-looking columns (they'll have NaN at the tail)
-        for col in ['dam_forecast_next_4h_mean', 'dam_forecast_next_4h_max', 'dam_forecast_next_4h_min']:
-            df[col] = df[col].bfill()
+        df['dam_forecast_next_4h_mean'] = df['price'].rolling(w4h, min_periods=1).mean()
+        df['dam_forecast_next_4h_max'] = df['price_max_24h']   # backward rolling max
+        df['dam_forecast_next_4h_min'] = df['price_min_24h']   # backward rolling min
 
         df['dam_forecast_spread'] = df['dam_forecast_next_4h_max'] - df['dam_forecast_next_4h_min']
         df['dam_forecast_vs_current'] = df['dam_forecast_next_4h_mean'] - df['price']
 
-        # I use IntraDay prices shifted as "forecasts"
-        df['id_forecast_1h'] = df['intraday_ask'].shift(-1 * sph).bfill()
-        df['id_forecast_2h'] = df['intraday_ask'].shift(-2 * sph).bfill()
-        df['id_forecast_4h'] = df['intraday_ask'].shift(-4 * sph).bfill()
-        df['id_forecast_8h'] = df['intraday_ask'].shift(-8 * sph).bfill()
-
-        # I add noise to prevent data leakage from perfect future knowledge
-        for col in ['dam_forecast_next_4h_mean', 'dam_forecast_next_4h_max',
-                     'dam_forecast_next_4h_min', 'id_forecast_1h', 'id_forecast_2h',
-                     'id_forecast_4h', 'id_forecast_8h']:
-            noise = np.random.normal(0, df[col].std() * 0.15, len(df))
-            df[col] = df[col] + noise
+        # I use lagged IntraDay prices as persistence forecasts (positive shift = backward)
+        df['id_forecast_1h'] = df['intraday_ask'].shift(1 * sph).bfill()
+        df['id_forecast_2h'] = df['intraday_ask'].shift(2 * sph).bfill()
+        df['id_forecast_4h'] = df['intraday_ask'].shift(4 * sph).bfill()
+        df['id_forecast_8h'] = df['intraday_ask'].shift(8 * sph).bfill()
 
         # I compute imbalance forecast from recent history
         if 'net_imbalance_mw' in df.columns:
@@ -1634,12 +1634,20 @@ def _synthesize_free_bid_data(df, mask):
     """I synthesize Free Bid activation probability and reference price."""
     imbalance = df.loc[mask, 'net_imbalance_mw'].values
 
-    # Activation probability: higher |imbalance| -> more volume needed
-    activation_base = np.clip(np.abs(imbalance) / 500.0, 0.0, 0.8)
+    # I use 150 MW divisor based on ADMIE activated mFRR volumes (mean ~80-150 MW/QH)
+    # with a 0.10 floor so even small imbalances have a chance of Free Bid activation
+    activation_base = np.clip(np.abs(imbalance) / 150.0, 0.10, 0.80)
     df.loc[mask, 'free_bid_activation_base'] = activation_base
 
     # Reference price = mFRR marginal price (agent competes against this)
-    df.loc[mask, 'free_bid_reference_price'] = df.loc[mask, 'mfrr_price_up'].values
+    # I fall back to ISP1 up price or DAM price when mFRR price is missing
+    ref_price = df.loc[mask, 'mfrr_price_up'].values
+    if 'isp1_price_up' in df.columns:
+        fallback = df.loc[mask, 'isp1_price_up'].values
+    else:
+        fallback = df.loc[mask, 'price'].values
+    ref_price = np.where((ref_price == 0) | np.isnan(ref_price), fallback, ref_price)
+    df.loc[mask, 'free_bid_reference_price'] = ref_price
     return df
 
 

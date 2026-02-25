@@ -100,8 +100,9 @@ class BatteryEnvUnified(gym.Env):
         mfrr_activation_rate: float = 0.35,  # Probability of mFRR bid acceptance (35%)
         mfrr_price_cap: float = 1000.0,  # EUR/MWh cap — real prices reach 1190 EUR
 
-        # Cycling limits
-        max_daily_cycles: float = 2.0,
+        # Cycling limits — 2.5 gives breathing room for mandatory DAM + aFRR
+        # while the cycle_target (2.0) still penalizes excess via reward shaping
+        max_daily_cycles: float = 2.5,
         degradation_cost: float = 15.0,
 
         # Reward configuration
@@ -199,6 +200,7 @@ class BatteryEnvUnified(gym.Env):
             afrr_nonresponse_penalty=self.reward_config.get('afrr_nonresponse_penalty', 500.0),
             cycle_target=self.reward_config.get('cycle_target', 2.0),
             cycle_excess_penalty=self.reward_config.get('cycle_excess_penalty', 3000.0),
+            calendar_aging_coefficient=self.reward_config.get('calendar_aging_coefficient', 50.0),
             reward_scale=self.reward_config.get('reward_scale', 0.01)
         )
 
@@ -492,8 +494,14 @@ class BatteryEnvUnified(gym.Env):
             available_charge_mwh / self.eff_sqrt / self.time_step_hours
         )
 
-        # I apply daily cycle limits
-        cycles_remaining = max(0, self.max_daily_cycles - self.daily_cycles)
+        # I apply daily cycle limits, pre-subtracting the current step's mandatory
+        # DAM cycle cost and a buffer for possible aFRR activation. Without this,
+        # the mask underestimates cycle consumption because DAM executes AFTER
+        # masking (Stage 4) and aFRR activation is stochastic (Stage 5).
+        dam_cycle_cost = abs(dam_commitment) * self.time_step_hours / self.capacity_mwh
+        afrr_buffer = self.afrr_commitment_mw * self.time_step_hours / self.capacity_mwh * 0.15
+        cycles_remaining = max(0, self.max_daily_cycles - self.daily_cycles
+                               - dam_cycle_cost - afrr_buffer)
         max_cycle_power = cycles_remaining * self.capacity_mwh / self.time_step_hours
         max_discharge_mw = min(max_discharge_mw, max_cycle_power)
         max_charge_mw = min(max_charge_mw, max_cycle_power)
@@ -1283,6 +1291,7 @@ class BatteryEnvUnified(gym.Env):
             'afrr_direction': afrr_direction,
             'is_selected': self.is_selected_for_afrr,
             'actual_energy_mw': actual_energy_mw,
+            'dam_commitment_mw': dam_commitment,
             'intraday_energy_mw': intraday_energy_mw,
             'intraday_revenue': intraday_revenue,
             'mfrr_energy_mw': mfrr_energy_mw,
@@ -1386,8 +1395,10 @@ class BatteryEnvUnified(gym.Env):
         - max_soc_reserve: lowered below self.max_soc when future BUY commitments exist
           (I must keep enough headroom to charge later)
 
-        I also account for intermediate charge/discharge potential (50% discount)
+        I also account for intermediate charge/discharge potential (25% discount)
         so the reserve is not overly conservative when the agent has time to prepare.
+        The discount is conservative because the agent often trades IntraDay
+        instead of actually charging during idle hours.
         """
         min_soc_reserve = self.min_soc
         max_soc_reserve = self.max_soc
@@ -1435,7 +1446,7 @@ class BatteryEnvUnified(gym.Env):
             else:
                 # I have an idle hour — I can only use it to prepare if it occurs
                 # BEFORE a future commitment (can't prepare after the fact)
-                potential = self.max_power_mw * self.time_step_hours * 0.5
+                potential = self.max_power_mw * self.time_step_hours * 0.25
                 if pos < last_sell_pos:
                     intermediate_charge_potential += potential * self.eff_sqrt
                 if pos < last_buy_pos:
@@ -1449,8 +1460,15 @@ class BatteryEnvUnified(gym.Env):
         sell_soc_reserve = net_sell_energy / self.capacity_mwh
         buy_soc_reserve = net_buy_headroom / self.capacity_mwh
 
-        min_soc_reserve = min(self.max_soc, self.min_soc + sell_soc_reserve)
-        max_soc_reserve = max(self.min_soc, self.max_soc - buy_soc_reserve)
+        # I add a safety buffer of one max-power step to guard against
+        # cross-market SoC drift between mask time and DAM execution.
+        # Only applied when there are actual commitments to protect.
+        buffer = 0.0
+        if sell_soc_reserve > 0 or buy_soc_reserve > 0:
+            buffer = self.max_power_mw * self.time_step_hours / self.capacity_mwh
+
+        min_soc_reserve = min(self.max_soc, self.min_soc + sell_soc_reserve + buffer)
+        max_soc_reserve = max(self.min_soc, self.max_soc - buy_soc_reserve - buffer)
 
         # I ensure min <= max (edge case with very large commitments)
         if min_soc_reserve > max_soc_reserve:
@@ -1891,28 +1909,46 @@ class BatteryEnvUnified(gym.Env):
                 else:
                     features.append(0.0)
                 features.append(row.get('forecast_confidence', 0.5))
-                # I compute dynamic hours to peak/trough from actual price series
-                lookahead_end = min(self.current_step + 96, len(self.df))
-                price_window = self.df['price'].iloc[self.current_step:lookahead_end].values
-                if len(price_window) > 4:
-                    hours_to_peak = np.argmax(price_window) * self.time_step_hours
-                    hours_to_trough = np.argmin(price_window) * self.time_step_hours
+                # I compute dynamic hours to peak/trough respecting DAM publication window.
+                # DAM prices published at 14:00 for next day — same logic as price lookahead (Group 5).
+                # Beyond the publication horizon I use persistence (current price) as fallback.
+                from datetime import timedelta
+                current_hour = ts.hour
+                current_day = ts.date()
+                if current_hour >= 14:
+                    last_known_day = (ts + timedelta(days=1)).date()
+                else:
+                    last_known_day = current_day
+
+                known_prices = []
+                for i in range(96):  # 24h window
+                    target = min(self.current_step + i, len(self.df) - 1)
+                    target_day = self.df.index[target].date()
+                    if target_day <= last_known_day:
+                        known_prices.append(self.df.iloc[target].get('price', dam_price))
+                    else:
+                        known_prices.append(dam_price)  # persistence fallback
+
+                if len(known_prices) > 4:
+                    hours_to_peak = np.argmax(known_prices) * self.time_step_hours
+                    hours_to_trough = np.argmin(known_prices) * self.time_step_hours
                 else:
                     hours_to_peak, hours_to_trough = 12.0, 6.0
                 features.append(hours_to_peak / 24.0)
                 features.append(hours_to_trough / 24.0)
 
-                # I add ISP cascade features (5 features)
-                # ISP2 prices provide intermediate price signal
-                features.append(row.get('isp2_price_up', row.get('isp1_price_up', dam_price)) / 100.0)
-                features.append(row.get('isp2_price_down', row.get('isp1_price_down', dam_price)) / 100.0)
-                # ISP3-ISP1 spread captures real-time premium evolution
-                features.append(row.get('isp_cascade_spread_up', 0.0) / 100.0)
-                # ISP2-ISP3 spread captures last-minute volatility
-                features.append(row.get('isp23_spread_up', 0.0) / 100.0)
-                # ISP cross-session average spread (overall market tension)
-                isp_avg_up = row.get('isp_avg_price_up', dam_price)
-                features.append((isp_avg_up - dam_price) / 100.0)
+                # I add ISP features (5 features) — ISP1 only to avoid data leakage
+                # ISP1 up/down prices (known ~18h before delivery)
+                isp1_up = row.get('isp1_price_up', dam_price)
+                isp1_down = row.get('isp1_price_down', dam_price)
+                features.append(isp1_up / 100.0)
+                features.append(isp1_down / 100.0)
+                # ISP1 vs DAM spread (no future info)
+                features.append((isp1_up - dam_price) / 100.0)
+                # ISP1 bid-ask spread (volatility signal without ISP3)
+                features.append((isp1_up - isp1_down) / 100.0)
+                # Historical cascade spread (lagged — yesterday's ISP3-ISP1)
+                features.append(row.get('isp_cascade_spread_up_lag_24h', 0.0) / 100.0)
 
             elif self.market_forecaster is not None:
                 # I call the live forecaster (slower but works without pre-computed columns)
@@ -1940,13 +1976,14 @@ class BatteryEnvUnified(gym.Env):
                     features.append(float(np.argmax(dam_24h) + 1) / 24.0)
                     features.append(float(np.argmin(dam_24h) + 1) / 24.0)
 
-                    # I add ISP cascade features from pre-computed columns
-                    features.append(row.get('isp2_price_up', row.get('isp1_price_up', dam_price)) / 100.0)
-                    features.append(row.get('isp2_price_down', row.get('isp1_price_down', dam_price)) / 100.0)
-                    features.append(row.get('isp_cascade_spread_up', 0.0) / 100.0)
-                    features.append(row.get('isp23_spread_up', 0.0) / 100.0)
-                    isp_avg_up = row.get('isp_avg_price_up', dam_price)
-                    features.append((isp_avg_up - dam_price) / 100.0)
+                    # I add ISP features — ISP1 only to avoid data leakage
+                    isp1_up = row.get('isp1_price_up', dam_price)
+                    isp1_down = row.get('isp1_price_down', dam_price)
+                    features.append(isp1_up / 100.0)
+                    features.append(isp1_down / 100.0)
+                    features.append((isp1_up - dam_price) / 100.0)
+                    features.append((isp1_up - isp1_down) / 100.0)
+                    features.append(row.get('isp_cascade_spread_up_lag_24h', 0.0) / 100.0)
                 except Exception:
                     # I fall back to zeros on any forecaster error (15 base + 5 ISP = 20)
                     features.extend([dam_price / 100.0] * 2 + [dam_price / 100.0] +
@@ -1968,9 +2005,9 @@ class BatteryEnvUnified(gym.Env):
             features.append(row.get('ida1_position', 0.0) / self.max_power_mw)    # [63]
             features.append(row.get('ida2_position', 0.0) / self.max_power_mw)    # [64]
             features.append(row.get('ida3_position', 0.0) / self.max_power_mw)    # [65]
-            # [66]: Best ISP sell price (was: synthetic ida1_clearing_price)
+            # [66]: ISP1 sell price — no ISP3 leakage (uses fixed _get_intraday_sell_price)
             features.append(self._get_intraday_sell_price(None, row) / 100.0)     # [66]
-            # [67]: Best ISP buy price (was: synthetic ida2_clearing_price)
+            # [67]: ISP1 buy price — no ISP3 leakage (uses fixed _get_intraday_buy_price)
             features.append(self._get_intraday_buy_price(None, row) / 100.0)      # [67]
             features.append(row.get('net_ida_position', 0.0) / self.max_power_mw) # [68]
             features.append(1.0 if self._is_intraday_open(row) else 0.0)          # [69]
@@ -1981,8 +2018,8 @@ class BatteryEnvUnified(gym.Env):
             features.append(row.get('free_bid_reference_price', 100.0) / 100.0)   # [72]
 
             # Group 12: ISP Cascade Quality (73-74)
-            # [73]: ISP cascade spread (was: synthetic xbid_spread)
-            features.append(row.get('isp_cascade_spread_up', 0.0) / 100.0)        # [73]
+            # [73]: Lagged cascade spread (yesterday's ISP3-ISP1) — no future info
+            features.append(row.get('isp_cascade_spread_up_lag_24h', 0.0) / 100.0)  # [73]
             features.append(self._get_time_to_delivery(row) / 24.0)               # [74]
 
         # =====================================================================
@@ -2011,7 +2048,8 @@ class BatteryEnvUnified(gym.Env):
         - IDA1 auction at hour 15:00 (gate closure ~15:00, results ~15:30)
         - IDA2 auction at hour 22:00 (gate closure ~22:00)
         - IDA3 auction at hour 10:00 for ISPs >= 14:00
-        - ISP cascade (ISP3>ISP2>ISP1) at all other hours 00:00-22:59
+        - ISP1 at all other hours 00:00-22:59 (ISP1 is known ~18h before delivery;
+          ISP2/ISP3 are future information at decision time)
         - Closed at 23:00-23:59 (no tradeable ISPs remaining)
         """
         ts = self.df.index[self.current_step]
@@ -2026,13 +2064,7 @@ class BatteryEnvUnified(gym.Env):
         elif hour == 10 and minute < 15:
             return 'ida3'
         elif hour < 23:
-            # I use ISP cascade instead of XBID
-            p3 = row.get('isp3_price_up', np.nan)
-            if not np.isnan(p3) and p3 > 0:
-                return 'isp3'
-            p2 = row.get('isp2_price_up', np.nan)
-            if not np.isnan(p2) and p2 > 0:
-                return 'isp2'
+            # I use ISP1 only — ISP2/ISP3 are future information at decision time
             return 'isp1'
         else:
             return 'closed'
@@ -2082,7 +2114,8 @@ class BatteryEnvUnified(gym.Env):
     def _get_intraday_sell_price(self, active_market, row):
         """I return the sell (discharge) price using real ISP clearing data.
 
-        I use the most recent ISP session available: ISP3 > ISP2 > ISP1.
+        I settle at ISP1 (known ~18h before delivery).
+        ISP2/ISP3 are future information at decision time — using them is data leakage.
         ISP UP prices = what the battery receives for selling regulation energy.
         For IDA auctions, I still use the IDA clearing price.
         """
@@ -2095,13 +2128,7 @@ class BatteryEnvUnified(gym.Env):
                 if ts.hour < 14:
                     id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
             return id_price
-        # I use ISP cascade: ISP3 > ISP2 > ISP1 > DAM fallback
-        p3 = row.get('isp3_price_up', np.nan)
-        if not np.isnan(p3) and p3 > 0:
-            return p3
-        p2 = row.get('isp2_price_up', np.nan)
-        if not np.isnan(p2) and p2 > 0:
-            return p2
+        # I use ISP1 only — ISP2/ISP3 are future information at decision time
         p1 = row.get('isp1_price_up', np.nan)
         if not np.isnan(p1) and p1 > 0:
             return p1
@@ -2110,6 +2137,8 @@ class BatteryEnvUnified(gym.Env):
     def _get_intraday_buy_price(self, active_market, row):
         """I return the buy (charge) price using real ISP clearing data.
 
+        I settle at ISP1 (known ~18h before delivery).
+        ISP2/ISP3 are future information at decision time — using them is data leakage.
         ISP DOWN prices = what the battery pays for buying regulation energy.
         For IDA auctions, I still use the IDA clearing price.
         """
@@ -2122,13 +2151,7 @@ class BatteryEnvUnified(gym.Env):
                 if ts.hour < 14:
                     id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
             return id_price
-        # I use ISP cascade: ISP3 > ISP2 > ISP1 > DAM fallback
-        p3 = row.get('isp3_price_down', np.nan)
-        if not np.isnan(p3) and p3 > 0:
-            return p3
-        p2 = row.get('isp2_price_down', np.nan)
-        if not np.isnan(p2) and p2 > 0:
-            return p2
+        # I use ISP1 only — ISP2/ISP3 are future information at decision time
         p1 = row.get('isp1_price_down', np.nan)
         if not np.isnan(p1) and p1 > 0:
             return p1
