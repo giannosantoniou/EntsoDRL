@@ -1270,8 +1270,10 @@ class BatteryEnvUnified(gym.Env):
         )
 
         reward = reward_info['reward']
-        self.total_profit += reward_info['components'].get('net_profit', 0)
-        self.episode_profit += reward_info['components'].get('net_profit', 0)
+        # I track trading P&L (real economic profit) separately from shaped reward
+        trading_pnl = reward_info['components'].get('trading_pnl', 0)
+        self.total_profit += trading_pnl
+        self.episode_profit += trading_pnl
 
         # =====================================================================
         # STAGE 11: ADVANCE STEP

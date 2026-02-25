@@ -228,8 +228,11 @@ class TensorboardLoggingCallback(BaseCallback):
         # I log periodically
         if self.num_timesteps % 10000 == 0 and len(self.episode_profits) > 0:
             # I log overall metrics
+            # avg_profit = real trading P&L (what we'd earn in production)
+            # ep_rew_mean (logged by SB3) = shaped reward (what the agent optimizes)
             avg_profit = np.mean(self.episode_profits[-100:])
             avg_cycles = np.mean(self.episode_cycles[-100:])
+            self.logger.record('custom/avg_trading_pnl', avg_profit)
             self.logger.record('custom/avg_profit', avg_profit)
             self.logger.record('custom/avg_cycles', avg_cycles)
             if avg_cycles > 0:

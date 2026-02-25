@@ -393,24 +393,34 @@ class UnifiedRewardCalculator:
         # =====================================================================
         # 8. TOTAL REWARD
         # =====================================================================
-        total_revenue = (
-            dam_revenue + dam_bonus +
+        # I separate real economic P&L from shaping signals so we can
+        # track what the battery would actually earn in production vs
+        # what the agent optimizes during training.
+
+        # Trading P&L: real market revenues minus real costs
+        market_revenue = (
+            dam_revenue +
             afrr_capacity_revenue + afrr_energy_revenue +
             intraday_revenue +
             ida_revenue + xbid_revenue +
             free_bid_revenue + mfrr_revenue
         )
-
-        total_costs = (
+        real_costs = (
             degradation_cost +
             dam_violation_cost +
-            afrr_nonresponse_cost +
-            physical_penalty +
-            cycle_excess_cost +
-            calendar_aging_cost
+            afrr_nonresponse_cost
         )
+        trading_pnl = market_revenue - real_costs
+        components['trading_pnl'] = trading_pnl
 
-        net_profit = total_revenue - total_costs
+        # Shaping: bonuses and penalties that exist only during training
+        shaping_bonus = dam_bonus
+        shaping_penalty = physical_penalty + cycle_excess_cost + calendar_aging_cost
+        components['shaping_bonus'] = shaping_bonus
+        components['shaping_penalty'] = shaping_penalty
+
+        # Net profit = trading P&L + shaping (what the agent optimizes)
+        net_profit = trading_pnl + shaping_bonus - shaping_penalty
         components['net_profit'] = net_profit
 
         # I scale the reward for NN training
