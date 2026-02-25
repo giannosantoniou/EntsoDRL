@@ -98,13 +98,20 @@ class UnifiedRewardCalculator:
         cycle_target: float = 2.0,  # Target daily cycles
         cycle_excess_penalty: float = 3000.0,  # EUR per excess cycle (super-linear)
 
-        # Calendar aging — Li-ion batteries degrade faster at extreme SoC.
-        # I model this as a quadratic cost: (SoC - 0.5)^2 * coefficient per step.
-        # At 50% SoC: 0 EUR. At 5% SoC: 0.2025 * 200 = 40.5 EUR/step.
-        # At 20% SoC: 0.09 * 200 = 18 EUR/step (~30% of trading profit).
-        # I raised from 50 to 200 because the agent was spending 45% of time
-        # below 20% SoC — the old penalty was only 7.5% of per-step profit.
-        calendar_aging_coefficient: float = 200.0,
+        # Calendar aging — tiered continuous penalty based on SoC zone.
+        # Li-ion batteries degrade faster at extreme SoC (high voltage stress
+        # at top, copper dissolution at bottom). I use escalating marginal
+        # rates instead of a quadratic so the 30-70% zone is FREE and
+        # extremes are penalized more severely.
+        #
+        # Zone          SoC Range       Marginal    Cost at edge
+        # Safe          30% - 70%       0           0 EUR/step
+        # Caution       20-30% / 70-80% 60/unit     6 EUR at 20%/80%
+        # Warning       10-20% / 80-90% 180/unit    24 EUR at 10%/90%
+        # Critical      <10%  / >90%    480/unit    48 EUR at 5%/95%
+        soc_penalty_caution: float = 60.0,    # EUR per unit SoC in caution zone
+        soc_penalty_warning: float = 180.0,   # EUR per unit SoC in warning zone
+        soc_penalty_critical: float = 480.0,  # EUR per unit SoC in critical zone
 
         # Scaling — I raised from 0.001 to 0.01 so that a typical 300 EUR
         # trade produces a reward of 3.0 instead of 0.3, giving the NN a
@@ -119,7 +126,9 @@ class UnifiedRewardCalculator:
         self.afrr_response_bonus = afrr_response_bonus
         self.cycle_target = cycle_target
         self.cycle_excess_penalty = cycle_excess_penalty
-        self.calendar_aging_coefficient = calendar_aging_coefficient
+        self.soc_penalty_caution = soc_penalty_caution
+        self.soc_penalty_warning = soc_penalty_warning
+        self.soc_penalty_critical = soc_penalty_critical
         self.reward_scale = reward_scale
 
     def calculate(
@@ -372,13 +381,13 @@ class UnifiedRewardCalculator:
         components['cycle_excess_cost'] = cycle_excess_cost
 
         # =====================================================================
-        # 7c. CALENDAR AGING COST
+        # 7c. CALENDAR AGING COST (tiered)
         # =====================================================================
-        # I model calendar aging as a quadratic penalty on SoC distance from 50%.
-        # Li-ion batteries degrade faster at extreme SoC (high voltage stress at
-        # top, copper dissolution at bottom). The cost is per time step.
-        soc_deviation = current_soc - 0.5
-        calendar_aging_cost = (soc_deviation ** 2) * self.calendar_aging_coefficient
+        # I use a continuous piecewise-linear penalty with escalating marginal
+        # rates. The 30-70% zone is FREE (no penalty), and severity increases
+        # at each boundary. This is more realistic than a quadratic because
+        # Li-ion degradation is negligible in mid-SoC but accelerates at extremes.
+        calendar_aging_cost = self._calculate_calendar_aging(current_soc)
         components['calendar_aging_cost'] = calendar_aging_cost
 
         # =====================================================================
@@ -417,6 +426,47 @@ class UnifiedRewardCalculator:
             'reward': scaled_reward,
             'components': components
         }
+
+    def _calculate_calendar_aging(self, soc: float) -> float:
+        """
+        I calculate tiered calendar aging cost based on SoC zone.
+
+        Zones (symmetric around 50%):
+          Safe     30-70%: 0 EUR/step (free trading zone)
+          Caution  20-30% / 70-80%: escalating at caution rate
+          Warning  10-20% / 80-90%: escalating at warning rate
+          Critical  <10%  / >90%:   escalating at critical rate
+
+        The function is continuous (no jumps at boundaries) because each
+        tier builds on the cumulative cost of the previous tier's full width.
+        """
+        # I compute distance from the safe zone [0.30, 0.70]
+        if 0.30 <= soc <= 0.70:
+            return 0.0
+
+        if soc < 0.30:
+            d = 0.30 - soc
+        else:
+            d = soc - 0.70
+
+        # I accumulate cost across tiers (each tier is 0.10 wide)
+        cost = 0.0
+
+        # Caution tier: first 0.10 of distance (20-30% or 70-80%)
+        caution_d = min(d, 0.10)
+        cost += caution_d * self.soc_penalty_caution
+
+        # Warning tier: next 0.10 of distance (10-20% or 80-90%)
+        if d > 0.10:
+            warning_d = min(d - 0.10, 0.10)
+            cost += warning_d * self.soc_penalty_warning
+
+        # Critical tier: beyond 0.20 of distance (<10% or >90%)
+        if d > 0.20:
+            critical_d = d - 0.20
+            cost += critical_d * self.soc_penalty_critical
+
+        return cost
 
     def _weighted_ida_price(self, market: UnifiedMarketState) -> float:
         """I compute a weighted average of IDA clearing prices for settlement."""

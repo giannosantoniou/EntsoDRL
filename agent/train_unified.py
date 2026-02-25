@@ -342,7 +342,9 @@ def create_training_env(
             'afrr_nonresponse_penalty': 500.0,
             'cycle_target': 2.0,
             'cycle_excess_penalty': 3000.0,
-            'calendar_aging_coefficient': 200.0,
+            'soc_penalty_caution': 60.0,
+            'soc_penalty_warning': 180.0,
+            'soc_penalty_critical': 480.0,
             'reward_scale': 0.01
         }
 
@@ -707,7 +709,9 @@ def train_unified_model(
         'degradation_cost': 25.0,
         'cycle_target': 2.0,
         'cycle_excess_penalty': 3000.0,
-        'calendar_aging_coefficient': 200.0,
+        'soc_penalty_caution': 60.0,
+        'soc_penalty_warning': 180.0,
+        'soc_penalty_critical': 480.0,
         'timestamp': timestamp
     }
 
@@ -861,7 +865,9 @@ def evaluate_model(
         'afrr_nonresponse_penalty': 500.0,
         'cycle_target': train_cfg.get('cycle_target', 2.0),
         'cycle_excess_penalty': train_cfg.get('cycle_excess_penalty', 3000.0),
-        'calendar_aging_coefficient': train_cfg.get('calendar_aging_coefficient', 50.0),
+        'soc_penalty_caution': train_cfg.get('soc_penalty_caution', 60.0),
+        'soc_penalty_warning': train_cfg.get('soc_penalty_warning', 180.0),
+        'soc_penalty_critical': train_cfg.get('soc_penalty_critical', 480.0),
         'reward_scale': 0.01
     }
     print(f"  Eval degradation_cost: {eval_degradation} EUR/MWh")

@@ -200,7 +200,9 @@ class BatteryEnvUnified(gym.Env):
             afrr_nonresponse_penalty=self.reward_config.get('afrr_nonresponse_penalty', 500.0),
             cycle_target=self.reward_config.get('cycle_target', 2.0),
             cycle_excess_penalty=self.reward_config.get('cycle_excess_penalty', 3000.0),
-            calendar_aging_coefficient=self.reward_config.get('calendar_aging_coefficient', 50.0),
+            soc_penalty_caution=self.reward_config.get('soc_penalty_caution', 60.0),
+            soc_penalty_warning=self.reward_config.get('soc_penalty_warning', 180.0),
+            soc_penalty_critical=self.reward_config.get('soc_penalty_critical', 480.0),
             reward_scale=self.reward_config.get('reward_scale', 0.01)
         )
 

@@ -539,7 +539,7 @@ class TestUnifiedRewardCalculator:
 
 
 class TestCalendarAging:
-    """I test the calendar aging cost that penalizes extreme SoC."""
+    """I test the tiered calendar aging cost that penalizes extreme SoC."""
 
     @staticmethod
     def _idle_market():
@@ -554,71 +554,66 @@ class TestCalendarAging:
             mfrr_price_up=120.0, mfrr_price_down=60.0,
         )
 
-    def test_zero_cost_at_50_percent(self):
-        """I verify calendar aging cost is zero when SoC is exactly 50%."""
+    @staticmethod
+    def _make_calc(**kwargs):
         from gym_envs.unified_reward_calculator import UnifiedRewardCalculator
+        return UnifiedRewardCalculator(**kwargs)
 
-        calculator = UnifiedRewardCalculator(calendar_aging_coefficient=50.0)
-        result = calculator.calculate(
+    def _cost_at_soc(self, soc, **kwargs):
+        """I return the calendar aging cost at a given SoC."""
+        calc = self._make_calc(**kwargs)
+        result = calc.calculate(
             market=self._idle_market(), actual_energy_mw=0.0,
             afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
-            current_soc=0.5, capacity_mwh=146.0
+            current_soc=soc, capacity_mwh=146.0
         )
-        assert result['components']['calendar_aging_cost'] == pytest.approx(0.0, abs=1e-6), \
-            "Calendar aging should be zero at 50% SoC"
+        return result['components']['calendar_aging_cost']
 
-    def test_maximum_cost_at_extremes(self):
-        """I verify calendar aging cost is highest at SoC extremes (5% and 95%)."""
-        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator
+    def test_zero_cost_in_safe_zone(self):
+        """I verify calendar aging is zero in the 30-70% safe zone."""
+        for soc in [0.30, 0.40, 0.50, 0.60, 0.70]:
+            cost = self._cost_at_soc(soc)
+            assert cost == pytest.approx(0.0, abs=1e-6), \
+                f"Calendar aging should be zero at {soc:.0%} SoC (safe zone)"
 
-        calculator = UnifiedRewardCalculator(calendar_aging_coefficient=50.0)
-        # I test at 95% SoC
-        result_high = calculator.calculate(
-            market=self._idle_market(), actual_energy_mw=0.0,
-            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
-            current_soc=0.95, capacity_mwh=146.0
-        )
-        # I test at 5% SoC
-        result_low = calculator.calculate(
-            market=self._idle_market(), actual_energy_mw=0.0,
-            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
-            current_soc=0.05, capacity_mwh=146.0
-        )
-        # (0.95-0.5)^2 * 50 = 0.2025 * 50 = 10.125
-        expected = (0.45 ** 2) * 50.0
-        assert result_high['components']['calendar_aging_cost'] == pytest.approx(expected, abs=0.01)
-        assert result_low['components']['calendar_aging_cost'] == pytest.approx(expected, abs=0.01), \
-            "Calendar aging should be symmetric around 50%"
+    def test_symmetric_around_center(self):
+        """I verify the penalty is symmetric: cost at 20% == cost at 80%."""
+        for low, high in [(0.25, 0.75), (0.20, 0.80), (0.10, 0.90), (0.05, 0.95)]:
+            cost_low = self._cost_at_soc(low)
+            cost_high = self._cost_at_soc(high)
+            assert cost_low == pytest.approx(cost_high, abs=0.01), \
+                f"Cost at {low:.0%} ({cost_low:.2f}) should equal cost at {high:.0%} ({cost_high:.2f})"
 
-    def test_quadratic_scaling(self):
-        """I verify the cost scales quadratically with distance from 50%."""
-        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator
+    def test_tiered_escalation(self):
+        """I verify costs escalate through caution → warning → critical zones."""
+        # Caution zone: 20-30%, rate=60 per unit SoC
+        # At 25% (d=0.05): 0.05 * 60 = 3.0
+        assert self._cost_at_soc(0.25) == pytest.approx(3.0, abs=0.01)
+        # At 20% (d=0.10): 0.10 * 60 = 6.0
+        assert self._cost_at_soc(0.20) == pytest.approx(6.0, abs=0.01)
+        # Warning zone: 10-20%, rate=180 per unit SoC (cumulative)
+        # At 15% (d=0.15): 6.0 + 0.05 * 180 = 15.0
+        assert self._cost_at_soc(0.15) == pytest.approx(15.0, abs=0.01)
+        # At 10% (d=0.20): 6.0 + 0.10 * 180 = 24.0
+        assert self._cost_at_soc(0.10) == pytest.approx(24.0, abs=0.01)
+        # Critical zone: <10%, rate=480 per unit SoC (cumulative)
+        # At 5% (d=0.25): 24.0 + 0.05 * 480 = 48.0
+        assert self._cost_at_soc(0.05) == pytest.approx(48.0, abs=0.01)
 
-        calculator = UnifiedRewardCalculator(calendar_aging_coefficient=50.0)
-        # I test at 70% SoC: (0.7-0.5)^2 * 50 = 0.04 * 50 = 2.0
-        result_70 = calculator.calculate(
-            market=self._idle_market(), actual_energy_mw=0.0,
-            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
-            current_soc=0.7, capacity_mwh=146.0
-        )
-        # I test at 90% SoC: (0.9-0.5)^2 * 50 = 0.16 * 50 = 8.0
-        result_90 = calculator.calculate(
-            market=self._idle_market(), actual_energy_mw=0.0,
-            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
-            current_soc=0.9, capacity_mwh=146.0
-        )
-        assert result_70['components']['calendar_aging_cost'] == pytest.approx(2.0, abs=0.01)
-        assert result_90['components']['calendar_aging_cost'] == pytest.approx(8.0, abs=0.01)
-        # 4x ratio (quadratic: 0.4^2 / 0.2^2 = 4)
-        ratio = result_90['components']['calendar_aging_cost'] / result_70['components']['calendar_aging_cost']
-        assert ratio == pytest.approx(4.0, abs=0.01)
+    def test_monotonically_increasing(self):
+        """I verify cost increases monotonically as SoC moves from safe zone."""
+        soc_levels = [0.70, 0.65, 0.50, 0.35, 0.30, 0.25, 0.20, 0.15, 0.10, 0.05]
+        costs = [self._cost_at_soc(s) for s in soc_levels]
+        # I check first 5 are zero (safe zone), then strictly increasing
+        for i in range(5):
+            assert costs[i] == pytest.approx(0.0, abs=1e-6)
+        for i in range(5, len(costs) - 1):
+            assert costs[i] < costs[i + 1], \
+                f"Cost at SoC={soc_levels[i]:.0%} ({costs[i]:.2f}) should be < cost at {soc_levels[i+1]:.0%} ({costs[i+1]:.2f})"
 
     def test_included_in_net_profit(self):
-        """I verify calendar aging cost reduces net profit."""
-        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator
-
-        # I compare reward at 50% vs 95% SoC (no trading, just sitting idle)
-        calc = UnifiedRewardCalculator(calendar_aging_coefficient=50.0)
+        """I verify calendar aging cost reduces net profit at extremes."""
+        calc = self._make_calc()
         result_50 = calc.calculate(
             market=self._idle_market(), actual_energy_mw=0.0,
             afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
@@ -632,22 +627,23 @@ class TestCalendarAging:
         assert result_50['components']['net_profit'] > result_95['components']['net_profit'], \
             "Sitting idle at 50% should yield higher net profit than at 95%"
 
-    def test_coefficient_configurable(self, unified_env):
-        """I verify the coefficient flows from reward_config to the calculator."""
-        assert unified_env.reward_calculator.calendar_aging_coefficient == pytest.approx(50.0), \
-            "Default calendar_aging_coefficient should be 50.0"
+    def test_rates_configurable(self):
+        """I verify the tiered rates flow from constructor to calculation."""
+        # I use custom rates and verify
+        cost = self._cost_at_soc(0.05,
+                                  soc_penalty_caution=100.0,
+                                  soc_penalty_warning=300.0,
+                                  soc_penalty_critical=1000.0)
+        # d=0.25: 0.10*100 + 0.10*300 + 0.05*1000 = 10 + 30 + 50 = 90
+        assert cost == pytest.approx(90.0, abs=0.01)
 
-    def test_zero_coefficient_disables(self):
-        """I verify setting coefficient=0 disables calendar aging entirely."""
-        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator
-
-        calc = UnifiedRewardCalculator(calendar_aging_coefficient=0.0)
-        result = calc.calculate(
-            market=self._idle_market(), actual_energy_mw=0.0,
-            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
-            current_soc=0.95, capacity_mwh=146.0
-        )
-        assert result['components']['calendar_aging_cost'] == pytest.approx(0.0, abs=1e-6)
+    def test_zero_rates_disable(self):
+        """I verify setting all rates to 0 disables calendar aging."""
+        cost = self._cost_at_soc(0.05,
+                                  soc_penalty_caution=0.0,
+                                  soc_penalty_warning=0.0,
+                                  soc_penalty_critical=0.0)
+        assert cost == pytest.approx(0.0, abs=1e-6)
 
 
 class TestDAMSoCReservation:
