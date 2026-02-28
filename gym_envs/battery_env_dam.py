@@ -144,6 +144,14 @@ class BatteryEnvDAM(gym.Env):
         if 'price_lag_24h' not in df.columns:
             df['price_lag_24h'] = df['price'].shift(w24)
 
+        # LEAKAGE FIX: I mark the first w24 rows as INVALID for forecasting.
+        # shift(w24) produces NaN for the first w24 rows. Using bfill() would
+        # contaminate these rows with FUTURE prices. Instead, I fill them with
+        # the dataset-wide mean (a non-informative prior) and exclude them
+        # from episode starts below.
+        price_mean = df['price'].mean()
+        df['price_lag_24h'] = df['price_lag_24h'].fillna(price_mean)
+
         # I create rolling statistics for forecast context (backward-looking)
         if 'price_mean_7d' not in df.columns:
             w7d = 7 * 24 * self._sph
@@ -152,24 +160,26 @@ class BatteryEnvDAM(gym.Env):
             w7d = 7 * 24 * self._sph
             df['price_std_7d'] = df['price'].rolling(w7d, min_periods=1).std().fillna(10.0)
 
-        # I fill NaN values
+        # I fill remaining NaN values (NOT price_lag_24h, already handled above)
         df = df.ffill().bfill()
         self.df = df
 
         # I identify valid day start indices (midnight boundaries)
-        # Each "day" must have at least 24 hours of data
+        # LEAKAGE FIX: I skip the first w24 rows where price_lag_24h was
+        # filled with non-informative mean instead of actual lagged prices
+        warmup = w24  # first 24h have no valid lag
         self.day_starts = []
-        for i in range(0, len(df) - 24 * self._sph, self._sph):
+        for i in range(warmup, len(df) - 24 * self._sph, self._sph):
             if df.index[i].hour == 0 and df.index[i].minute == 0:
                 self.day_starts.append(i)
 
-        # I fallback: if no midnight boundaries, use any 24h window
+        # I fallback: if no midnight boundaries, use any 24h window after warmup
         if len(self.day_starts) == 0:
             step = 24 * self._sph
-            self.day_starts = list(range(w24, len(df) - step, step))
+            self.day_starts = list(range(warmup, len(df) - step, step))
 
         if len(self.day_starts) == 0:
-            self.day_starts = [0]
+            self.day_starts = [warmup]
 
     def reset(self, seed=None, options=None):
         """I reset the environment for a new 24-step DAM episode."""
@@ -195,17 +205,19 @@ class BatteryEnvDAM(gym.Env):
         self._day_start = day_start
 
         # I extract 24-hour forecast (D-1 prices = yesterday same hour)
+        # LEAKAGE FIX: I NEVER fall back to actual 'price' column.
+        # If price_lag_24h is unavailable, I use the dataset-wide mean
+        # (non-informative prior) to prevent the agent from seeing actuals.
         self.day_forecast = np.zeros(24, dtype=np.float32)
+        price_mean = float(self.df['price'].mean()) if 'price' in self.df.columns else 80.0
         for h in range(24):
             row_idx = day_start + h * self._sph
             if row_idx < len(self.df):
-                # I use lagged price as naive forecast (NOT actual clearing price)
                 self.day_forecast[h] = self.df.iloc[row_idx].get(
-                    'price_lag_24h',
-                    self.df.iloc[row_idx].get('price', 80.0)
+                    'price_lag_24h', price_mean
                 )
             else:
-                self.day_forecast[h] = 80.0  # safe default
+                self.day_forecast[h] = price_mean
 
         obs = self._build_observation()
         return obs, {}

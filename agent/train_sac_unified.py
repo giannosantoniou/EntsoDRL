@@ -262,11 +262,9 @@ def train_sac_unified(
     dam_bidder_min_spread: float = 30.0,
     mfrr_activation_rate: float = 0.35,
     mfrr_price_cap: float = 500.0,
-    # SAC-specific penalty overrides
-    soc_penalty: float = 200.0,
-    gate_penalty: float = 50.0,
-    mfrr_penalty: float = 50.0,
-    cycle_penalty: float = 100.0,
+    # SAC-specific soft penalty overrides (hard violations handled by action filtering)
+    soc_soft_margin_penalty: float = 60.0,
+    cycle_penalty: float = 2000.0,
 ) -> str:
     """
     I train the unified multi-market SAC model.
@@ -287,8 +285,8 @@ def train_sac_unified(
     print(f"Parallel environments: {n_envs}")
     print(f"Time step: {time_step_hours*60:.0f}-min resolution")
     print(f"Algorithm: SAC (continuous action space, off-policy)")
-    print(f"Penalties: SoC={soc_penalty}, gate={gate_penalty}, "
-          f"mFRR={mfrr_penalty}, cycle={cycle_penalty}")
+    print(f"Penalties: SoC_margin={soc_soft_margin_penalty}, "
+          f"cycle={cycle_penalty} (action filtering for hard constraints)")
 
     # I resolve data path
     if not Path(data_path).exists():
@@ -306,11 +304,9 @@ def train_sac_unified(
     print(f"                eval ={len(df_eval)} rows "
           f"({df_eval.index[0]} to {df_eval.index[-1]})")
 
-    # I prepare penalty config
+    # I prepare soft penalty config (hard violations handled by action filtering)
     penalties = {
-        'soc_hard': soc_penalty,
-        'gate_closure': gate_penalty,
-        'mfrr_unavailable': mfrr_penalty,
+        'soc_soft_margin': soc_soft_margin_penalty,
         'cycle_excess': cycle_penalty,
     }
 
@@ -696,6 +692,9 @@ def evaluate_sac_model(
             'afrr_cap': last_info.get('afrr_capacity_profit', 0),
             'afrr_energy': last_info.get('afrr_energy_profit', 0),
             'mfrr': last_info.get('mfrr_profit', 0),
+            'ida': last_info.get('ida_profit', 0),
+            'xbid': last_info.get('xbid_profit', 0),
+            'free_bid': last_info.get('free_bid_profit', 0),
         }
         results['per_market'].append(market_summary)
 
@@ -704,7 +703,9 @@ def evaluate_sac_model(
               f"Penalty={total_penalty:,.0f}, "
               f"DAM={market_summary['dam']:,.0f}, "
               f"aFRR_cap={market_summary['afrr_cap']:,.0f}, "
-              f"ID={market_summary['intraday']:,.0f}")
+              f"ID={market_summary['intraday']:,.0f}, "
+              f"mFRR={market_summary['mfrr']:,.0f}, "
+              f"FreeBid={market_summary['free_bid']:,.0f}")
 
     # I calculate summary statistics
     results['mean_profit'] = np.mean(results['episode_profits'])
@@ -715,7 +716,8 @@ def evaluate_sac_model(
     )
     results['mean_penalty'] = np.mean(results['total_penalties'])
 
-    market_keys = ['dam', 'intraday', 'afrr_cap', 'afrr_energy', 'mfrr']
+    market_keys = ['dam', 'intraday', 'afrr_cap', 'afrr_energy', 'mfrr',
+                    'ida', 'xbid', 'free_bid']
     results['mean_per_market'] = {
         k: np.mean([m[k] for m in results['per_market']]) for k in market_keys
     }
@@ -788,14 +790,10 @@ if __name__ == "__main__":
     parser.add_argument("--mfrr-activation-rate", type=float, default=0.35)
     parser.add_argument("--mfrr-price-cap", type=float, default=500.0)
     # SAC-specific penalty args
-    parser.add_argument("--soc-penalty", type=float, default=200.0,
-                        help="SoC hard violation penalty EUR/MW")
-    parser.add_argument("--gate-penalty", type=float, default=50.0,
-                        help="IntraDay gate closure penalty EUR/MW")
-    parser.add_argument("--mfrr-penalty", type=float, default=50.0,
-                        help="mFRR unavailable penalty EUR/MW")
-    parser.add_argument("--cycle-penalty", type=float, default=100.0,
-                        help="Daily cycle excess penalty EUR/cycle")
+    parser.add_argument("--soc-soft-margin-penalty", type=float, default=60.0,
+                        help="SoC soft margin penalty EUR/MW (proximity to limits)")
+    parser.add_argument("--cycle-penalty", type=float, default=2000.0,
+                        help="Daily cycle excess penalty EUR/cycle (super-linear)")
 
     args = parser.parse_args()
 
@@ -835,9 +833,7 @@ if __name__ == "__main__":
             dam_bidder_min_spread=args.dam_bidder_min_spread,
             mfrr_activation_rate=args.mfrr_activation_rate,
             mfrr_price_cap=args.mfrr_price_cap,
-            soc_penalty=args.soc_penalty,
-            gate_penalty=args.gate_penalty,
-            mfrr_penalty=args.mfrr_penalty,
+            soc_soft_margin_penalty=args.soc_soft_margin_penalty,
             cycle_penalty=args.cycle_penalty,
         )
 

@@ -166,17 +166,18 @@ class BatteryEnvMFRR(gym.Env):
             df['day_of_week'] = df.index.dayofweek
 
         # I create lagged features (LAGGED to prevent information leakage)
+        # LEAKAGE FIX: I fill shift NaN with column mean instead of bfill()
         for col in ['mfrr_price_up', 'mfrr_price_down', 'net_imbalance_mw']:
             lag_col = f'{col}_lag'
             if lag_col not in df.columns:
-                df[lag_col] = df[col].shift(1)
+                col_mean = df[col].mean()
+                df[lag_col] = df[col].shift(1).fillna(col_mean)
 
         # I create mFRR spread
         if 'mfrr_spread_lag' not in df.columns:
-            df['mfrr_spread_lag'] = (
-                df.get('mfrr_price_up', pd.Series(100.0, index=df.index)).shift(1) -
-                df.get('mfrr_price_down', pd.Series(80.0, index=df.index)).shift(1)
-            )
+            up_lag = df.get('mfrr_price_up', pd.Series(100.0, index=df.index)).shift(1)
+            down_lag = df.get('mfrr_price_down', pd.Series(80.0, index=df.index)).shift(1)
+            df['mfrr_spread_lag'] = (up_lag - down_lag).fillna(20.0)
 
         # I create system stress indicator
         if 'system_stress' not in df.columns:

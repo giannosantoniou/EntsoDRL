@@ -151,11 +151,13 @@ class BatteryEnvIntraDay(gym.Env):
             df['day_of_week'] = df.index.dayofweek
 
         # I create lagged features (backward-looking only)
+        # LEAKAGE FIX: I fill shift NaN with column mean instead of bfill()
         lag_1isp = 1
         for col in ['intraday_bid', 'intraday_ask', 'intraday_spread', 'intraday_volume']:
             lag_col = f'{col}_lag'
             if lag_col not in df.columns:
-                df[lag_col] = df[col].shift(lag_1isp)
+                col_mean = df[col].mean()
+                df[lag_col] = df[col].shift(lag_1isp).fillna(col_mean)
 
         # I create price momentum (4-ISP lookback)
         if 'price_momentum_4isp' not in df.columns:

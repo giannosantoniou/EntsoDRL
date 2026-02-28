@@ -54,7 +54,10 @@ class BatteryEnvMasked(gym.Env):
         use_ml_forecaster: bool = False,
         forecaster_path: str = "models/intraday_forecaster.pkl",
         # v20: Price awareness features (adds 2 extra obs features)
-        include_price_awareness: bool = True
+        include_price_awareness: bool = True,
+        # v22: Gate closure awareness (HEnEx compliance)
+        gate_closure_hours: float = 1.0,  # IntraDay gate closes H-1 before delivery
+        enable_gate_closure: bool = True   # Enable gate closure feature
     ):
         super().__init__()
 
@@ -80,6 +83,10 @@ class BatteryEnvMasked(gym.Env):
         self.base_spread = base_spread
         self.noise_std = noise_std
         self.price_cap = price_cap
+
+        # v22: Gate closure awareness (HEnEx compliance)
+        self.gate_closure_hours = gate_closure_hours
+        self.enable_gate_closure = enable_gate_closure
         self.extreme_spike_prob = extreme_spike_prob
         
         # Forecast Uncertainty Settings
@@ -115,7 +122,9 @@ class BatteryEnvMasked(gym.Env):
         self.strategic_lookahead = int(self.strategic_lookahead_hours / self.time_step_hours)  # 24 for hourly
         # I track whether to include v20 price awareness features (2 extra obs)
         self.include_price_awareness = include_price_awareness
-        feature_count = 44 if include_price_awareness else 42
+        # v22: Gate closure adds 1 feature (hours_until_gate_closure normalized)
+        base_features = 44 if include_price_awareness else 42
+        feature_count = base_features + (1 if enable_gate_closure else 0)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(feature_count,), dtype=np.float32)
 
         # Feature Engineer
@@ -244,6 +253,22 @@ class BatteryEnvMasked(gym.Env):
 
         # I normalize by 100€ to keep in [0, 1] range
         self.trade_worthiness = np.clip(avg_spread / 100.0, 0.0, 1.0)
+
+        # v21: Price momentum (6-hour backward-looking)
+        # I compute (current_price - price_6h_ago) / price_6h_ago
+        # This is a backward-looking feature that captures price trend direction
+        # and replaces the forward-looking max_future_price for timing rewards.
+        momentum_lookback = 6  # 6 hours
+        self.price_momentum = np.zeros(n)
+        for i in range(n):
+            if i >= momentum_lookback:
+                past_price = prices[i - momentum_lookback]
+                if past_price > 1.0:  # Avoid division by near-zero
+                    self.price_momentum[i] = (prices[i] - past_price) / past_price
+                else:
+                    self.price_momentum[i] = 0.0
+            else:
+                self.price_momentum[i] = 0.0
 
     def _prepare_imbalance_data(self):
         """Pre-load data arrays for FeatureEngineer."""
@@ -433,35 +458,33 @@ class BatteryEnvMasked(gym.Env):
         reward_calc = RewardCalculator(
             deg_cost_per_mwh=rc.get('deg_cost_per_mwh', 0.5),
             violation_penalty=rc.get('violation_penalty', 5.0),
-            imbalance_penalty_multiplier=rc.get('imbalance_penalty_multiplier', 20.0),
-            fixed_shortfall_penalty=rc.get('fixed_shortfall_penalty', 800.0),
+            # v22: FIXED commitment violation penalty (no data leakage)
+            commitment_violation_penalty=rc.get('commitment_violation_penalty', 1500.0),
             proactive_risk_penalty=rc.get('proactive_risk_penalty', 50.0),
             soc_buffer_bonus=rc.get('soc_buffer_bonus', 2.0),
             min_soc_threshold=rc.get('min_soc_threshold', 0.25),
             price_timing_bonus=rc.get('price_timing_bonus', 0.1),
-            # v13 timing rewards
-            peak_sell_bonus=rc.get('peak_sell_bonus', 10.0),
-            early_sell_penalty=rc.get('early_sell_penalty', 15.0),
-            early_sell_threshold=rc.get('early_sell_threshold', 1.3),
+            # v21 momentum rewards (backward-looking, replaces forward-looking lookahead)
+            momentum_bonus=rc.get('momentum_bonus', 8.0),
+            momentum_threshold=rc.get('momentum_threshold', 0.05),
             # v16 price quartile awareness
             quartile_sell_cheap_penalty=rc.get('quartile_sell_cheap_penalty', 15.0),
             quartile_buy_expensive_penalty=rc.get('quartile_buy_expensive_penalty', 15.0),
-            quartile_good_trade_bonus=rc.get('quartile_good_trade_bonus', 8.0)
+            quartile_good_trade_bonus=rc.get('quartile_good_trade_bonus', 8.0),
+            # Two-Stage Training: DAM compliance bonus
+            dam_compliance_bonus=rc.get('dam_compliance_bonus', 0.0)
         )
 
-        # I get price stats for timing and quartile calculations
+        # I get price stats for timing and quartile calculations (all BACKWARD-LOOKING)
         mean_24h = self.price_mean_24h[self.current_step] if self.current_step < len(self.price_mean_24h) else 100.0
         min_24h = self.price_min_24h[self.current_step] if self.current_step < len(self.price_min_24h) else 50.0
         max_24h = self.price_max_24h[self.current_step] if self.current_step < len(self.price_max_24h) else 150.0
 
-        # v13: Calculate max future price for lookahead timing reward
-        max_future_price = row.get('price', 100.0)  # Default to current
-        for i in range(1, 13):
-            future_step = min(self.current_step + i, len(self.df) - 1)
-            future_price = self.df.iloc[future_step].get('price', max_future_price)
-            max_future_price = max(max_future_price, future_price)
+        # v21: Get backward-looking price momentum (replaces forward-looking max_future_price)
+        # Momentum = (current - price_6h_ago) / price_6h_ago
+        price_momentum = self.price_momentum[self.current_step] if self.current_step < len(self.price_momentum) else 0.0
 
-        # v13: Check if current hour has DAM commitment (agent must respect it)
+        # Check if current hour has DAM commitment (agent must respect it)
         has_dam_now = abs(dam_comm_mw) > 0.1
 
         reward_info = reward_calc.calculate(
@@ -472,10 +495,10 @@ class BatteryEnvMasked(gym.Env):
             shortfall_risk=shortfall_info['shortfall_risk'],
             current_soc=self.current_soc,
             price_mean_24h=mean_24h,
-            # v13 lookahead timing
-            max_future_price=max_future_price,
+            # v21: backward-looking momentum (replaces forward-looking lookahead)
+            price_momentum=price_momentum,
             has_dam_now=has_dam_now,
-            # v16 price quartile awareness
+            # v16 price quartile awareness (BACKWARD-LOOKING 24h window)
             price_min_24h=min_24h,
             price_max_24h=max_24h
         )
@@ -491,6 +514,7 @@ class BatteryEnvMasked(gym.Env):
             'violation': violation_mw,
             'soc': self.current_soc,
             'dam_price': market.dam_price,
+            'dam_commitment': dam_comm_mw,  # I added this for compliance tracking
             'best_bid': market.best_bid,
             'best_ask': market.best_ask,
             'spread': market.spread,
@@ -527,14 +551,30 @@ class BatteryEnvMasked(gym.Env):
             err = self.forecast_err_1h * (1 + vol/50.0)
             next_price = next_price_raw * (1 + np.random.normal(0, err))
         
-        # DAM Commitments - Extended to 12 hours for better planning
-        # I clip all DAM commitments to battery's physical limits
+        # DAM Commitments - v22 HEnEx Compliant (no future day leakage)
+        # I only show commitments for the CURRENT delivery day (known from D-1 at 14:00)
+        # Commitments for future days (D+1, D+2...) are NOT yet submitted, so unknown
         dam_commitments = []
+        current_timestamp = pd.Timestamp(row.name)
+        current_delivery_day = current_timestamp.date()
+
         for i in range(1, 13):  # 12 steps ahead
             step_offset = int(i / self.time_step_hours)
             target = min(self.current_step + step_offset, len(self.df)-1)
-            future_dam = self.df.iloc[target].get('dam_commitment', 0.0)
-            future_dam = np.clip(future_dam, -self.max_power_mw, self.max_power_mw)
+            target_row = self.df.iloc[target]
+            target_timestamp = pd.Timestamp(target_row.name)
+            target_day = target_timestamp.date()
+
+            # I check if the target hour is in the SAME delivery day
+            if target_day == current_delivery_day:
+                # Same day - commitment is KNOWN (bid submitted D-1 at 14:00)
+                future_dam = target_row.get('dam_commitment', 0.0)
+                future_dam = np.clip(future_dam, -self.max_power_mw, self.max_power_mw)
+            else:
+                # Future day - commitment is UNKNOWN (not yet submitted)
+                # I use 0 as a neutral placeholder (agent doesn't know future plans)
+                future_dam = 0.0
+
             dam_commitments.append(future_dam)
 
         # Price Lookahead - 12 hours of future prices for strategic planning
@@ -612,5 +652,58 @@ class BatteryEnvMasked(gym.Env):
             battery_soc=self.current_soc,
             imbalance_info=imbalance_risk
         )
-        
+
+        # v22: Add gate closure feature (HEnEx compliance)
+        if self.enable_gate_closure:
+            # I calculate hours until next DAM commitment with gate closure
+            # The agent should know when it can no longer adjust positions
+            hours_until_closure = self._get_hours_until_gate_closure()
+            # Normalize to [0, 1] where 0 = gate closed, 1 = 24+ hours until closure
+            gate_closure_normalized = min(1.0, hours_until_closure / 24.0)
+            obs = np.append(obs, gate_closure_normalized)
+
         return obs
+
+    def _get_hours_until_gate_closure(self) -> float:
+        """
+        v22: Calculate hours until next gate closure for DAM commitment.
+
+        I find the next hour with a DAM commitment and calculate how many
+        hours remain before the gate closes (H-1 before delivery).
+
+        Returns:
+            Hours until gate closure (0 if gate already closed)
+        """
+        # I look ahead to find the next DAM commitment
+        lookahead = min(24, len(self.df) - self.current_step - 1)
+
+        for i in range(1, lookahead + 1):
+            step_offset = int(i / self.time_step_hours)
+            target = min(self.current_step + step_offset, len(self.df) - 1)
+            future_dam = self.df.iloc[target].get('dam_commitment', 0.0)
+
+            if abs(future_dam) > 0.1:  # Found a commitment
+                # Hours until delivery
+                hours_until_delivery = i * self.time_step_hours
+                # Hours until gate closure (H-1)
+                hours_until_closure = hours_until_delivery - self.gate_closure_hours
+
+                # If gate already closed, return 0
+                return max(0.0, hours_until_closure)
+
+        # No commitment found in lookahead, return max
+        return 24.0
+
+    def is_gate_open_for_step(self, step_offset: int) -> bool:
+        """
+        v22: Check if IntraDay gate is open for a future delivery step.
+
+        Args:
+            step_offset: Steps ahead for delivery
+
+        Returns:
+            True if gate is open (can still adjust position)
+        """
+        hours_until_delivery = step_offset * self.time_step_hours
+        hours_until_closure = hours_until_delivery - self.gate_closure_hours
+        return hours_until_closure > 0

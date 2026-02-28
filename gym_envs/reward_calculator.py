@@ -8,8 +8,26 @@ I apply SYMMETRIC penalties for ALL commitment violations:
 
 This reflects real-world HEnEx rules: a commitment is a commitment,
 regardless of direction. Both have financial AND administrative consequences.
+
+IMPORTANT - DATA LEAKAGE FIX (v21):
+I removed all forward-looking features (max_future_price, lookahead timing rewards)
+because they constitute data leakage - the agent would train on oracle information
+not available in production. All timing rewards now use BACKWARD-looking statistics
+(price momentum, rolling percentiles) that are genuinely available at decision time.
+
+CRITICAL FIX (v22) - IMBALANCE PRICE DATA LEAKAGE:
+I removed the dependency on actual imbalance prices (Long/Short) for penalty calculation.
+These prices are published EX-POST (after settlement) and are NOT available at decision time.
+The agent was "cheating" by seeing the actual penalty before deciding to deviate.
+Now I use a FIXED, HIGH penalty (5000€/MWh) that:
+1. Eliminates data leakage (no future information used)
+2. Strongly discourages deviation from commitments (administrative + financial risk)
+3. Reflects worst-case scenario (conservative, production-safe)
 """
+import logging
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class RewardCalculator:
@@ -29,18 +47,22 @@ class RewardCalculator:
         # TUNED v10: Encourage more trading, stricter DAM compliance
         deg_cost_per_mwh: float = 0.5,  # REDUCED from 2.0 - allow more cycling
         violation_penalty: float = 5.0,
-        imbalance_penalty_multiplier: float = 20.0,
-        fixed_shortfall_penalty: float = 800.0,     # INCREASED from 600 - stricter DAM
+        # v22: FIXED commitment violation penalty (no data leakage)
+        # I use a high, fixed penalty instead of actual imbalance prices
+        # This reflects both financial AND administrative consequences
+        # 1500€/MWh = ~6x best trade profit, strong but not paralyzing
+        commitment_violation_penalty: float = 1500.0,  # €/MWh - strict but balanced
         proactive_risk_penalty: float = 50.0,       # REDUCED from 100 - less conservative
         proactive_risk_threshold: float = 0.20,     # RELAXED from 0.15
         soc_buffer_bonus: float = 2.0,              # REDUCED from 5.0 - less idle incentive
         min_soc_threshold: float = 0.25,            # RELAXED from 0.30
         # NEW: Price timing bonus to encourage buy-low-sell-high
         price_timing_bonus: float = 0.1,            # Bonus multiplier for good timing
-        # v13: Lookahead timing rewards
-        peak_sell_bonus: float = 10.0,              # Bonus for selling at/near peak
-        early_sell_penalty: float = 15.0,           # Penalty for selling when better prices coming
-        early_sell_threshold: float = 1.3,          # Penalty if max_future > current * threshold
+        # v21: Backward-looking momentum rewards (replacing forward-looking lookahead)
+        # I reward selling when price momentum is positive (prices rising to current level)
+        # I reward buying when price momentum is negative (prices falling to current level)
+        momentum_bonus: float = 8.0,                # Bonus for trading with momentum
+        momentum_threshold: float = 0.05,           # Min momentum (5% change) to trigger bonus
         # v16: Price quartile awareness - penalize bad price decisions (ADDITIVE - deprecated)
         quartile_sell_cheap_penalty: float = 15.0,  # Penalty for selling in Q1 (cheap)
         quartile_buy_expensive_penalty: float = 15.0,  # Penalty for buying in Q4 (expensive)
@@ -54,21 +76,22 @@ class RewardCalculator:
         expensive_charge_multiplier: float = 1.5,   # Multiply charge cost when price > 70th percentile
         cheap_charge_multiplier: float = 0.7,       # Multiply charge cost when price < 30th percentile
         charge_expensive_threshold: float = 0.7,    # Price percentile above which charging is "expensive"
-        charge_cheap_threshold: float = 0.3         # Price percentile below which charging is "cheap"
+        charge_cheap_threshold: float = 0.3,        # Price percentile below which charging is "cheap"
+        # Two-Stage Training: DAM compliance bonus
+        dam_compliance_bonus: float = 0.0           # Bonus for correctly following DAM commitment
     ):
         self.deg_cost_per_mwh = deg_cost_per_mwh
         self.violation_penalty = violation_penalty
-        self.imbalance_penalty_multiplier = imbalance_penalty_multiplier
-        self.fixed_shortfall_penalty = fixed_shortfall_penalty
+        # v22: Fixed penalty for commitment violations (no data leakage)
+        self.commitment_violation_penalty = commitment_violation_penalty
         self.proactive_risk_penalty = proactive_risk_penalty
         self.proactive_risk_threshold = proactive_risk_threshold
         self.soc_buffer_bonus = soc_buffer_bonus
         self.min_soc_threshold = min_soc_threshold
         self.price_timing_bonus = price_timing_bonus
-        # v13 timing
-        self.peak_sell_bonus = peak_sell_bonus
-        self.early_sell_penalty = early_sell_penalty
-        self.early_sell_threshold = early_sell_threshold
+        # v21 momentum rewards (backward-looking, no data leakage)
+        self.momentum_bonus = momentum_bonus
+        self.momentum_threshold = momentum_threshold
         # v16 price quartile awareness (additive)
         self.quartile_sell_cheap_penalty = quartile_sell_cheap_penalty
         self.quartile_buy_expensive_penalty = quartile_buy_expensive_penalty
@@ -83,6 +106,8 @@ class RewardCalculator:
         self.cheap_charge_multiplier = cheap_charge_multiplier
         self.charge_expensive_threshold = charge_expensive_threshold
         self.charge_cheap_threshold = charge_cheap_threshold
+        # Two-Stage Training
+        self.dam_compliance_bonus = dam_compliance_bonus
 
     def calculate(
         self,
@@ -93,10 +118,10 @@ class RewardCalculator:
         shortfall_risk: float = 0.0,  # I added this for proactive penalty
         current_soc: float = 0.5,     # I added this for SoC buffer bonus
         price_mean_24h: float = None, # I added this for price timing bonus (v10)
-        # v13: Lookahead info for timing rewards
-        max_future_price: float = None,  # Max price in next 12 hours
+        # v21: Backward-looking momentum (replaces forward-looking max_future_price)
+        price_momentum: float = None,    # (current - price_6h_ago) / price_6h_ago, backward-looking
         has_dam_now: bool = False,       # Whether current hour has DAM commitment
-        # v16: Price range for quartile calculation
+        # v16: Price range for quartile calculation (BACKWARD-LOOKING 24h window)
         price_min_24h: float = None,
         price_max_24h: float = None
     ) -> dict:
@@ -148,23 +173,36 @@ class RewardCalculator:
             # Example: commitment +15MW, actual -5MW → shortfall 20MW (severe!)
             shortfall_mw = dam_commitment - actual_physical
 
-            shortfall_penalty = shortfall_mw * (
-                market_state.best_ask * self.imbalance_penalty_multiplier
-                + self.fixed_shortfall_penalty
-            )
+            # v22: FIXED penalty - no data leakage from actual imbalance prices!
+            # I use a high, fixed penalty that reflects:
+            # - Financial cost (worst-case imbalance settlement)
+            # - Administrative cost (regulatory scrutiny, reputation damage)
+            # - Operational risk (repeated violations = loss of market access)
+            shortfall_penalty = shortfall_mw * self.commitment_violation_penalty
 
         elif dam_commitment < 0 and actual_physical > dam_commitment:
-            # CASE 2: FAILURE TO HONOR BUY COMMITMENT (NEW!)
+            # CASE 2: FAILURE TO HONOR BUY COMMITMENT
             # Promised to buy X MW, bought less (or even discharged!)
             # Example: commitment -10MW, actual -5MW → shortfall 5MW
             # Example: commitment -10MW, actual +5MW → shortfall 15MW (severe!)
             shortfall_mw = actual_physical - dam_commitment  # Both negative, so this gives positive
 
-            # I apply the SAME penalty - a commitment is a commitment!
-            shortfall_penalty = shortfall_mw * (
-                market_state.best_ask * self.imbalance_penalty_multiplier
-                + self.fixed_shortfall_penalty
-            )
+            # v22: I apply the SAME fixed penalty - a commitment is a commitment!
+            shortfall_penalty = shortfall_mw * self.commitment_violation_penalty
+
+        # DAM Compliance Bonus (Two-Stage Training)
+        # I reward the agent for correctly executing DAM commitments
+        dam_bonus = 0.0
+        if self.dam_compliance_bonus > 0 and abs(dam_commitment) > 0.1:
+            # Check if agent fulfilled commitment direction and at least 50% magnitude
+            if dam_commitment > 0 and actual_physical >= dam_commitment * 0.5:
+                # SELL commitment honored (at least 50% delivered)
+                compliance_ratio = min(1.0, actual_physical / dam_commitment)
+                dam_bonus = self.dam_compliance_bonus * compliance_ratio
+            elif dam_commitment < 0 and actual_physical <= dam_commitment * 0.5:
+                # BUY commitment honored (at least 50% charged)
+                compliance_ratio = min(1.0, actual_physical / dam_commitment)
+                dam_bonus = self.dam_compliance_bonus * compliance_ratio
 
         if imbalance_mw > 0:
             # We delivered MORE than committed (or bought LESS)
@@ -254,24 +292,33 @@ class RewardCalculator:
                 # I reward buying when price is BELOW average (negative deviation = bonus)
                 timing_bonus = abs(actual_physical) * (-price_deviation) * self.price_timing_bonus * 100
 
-        # 10. v13 Lookahead Timing Reward/Penalty
-        # I teach the agent to use the 12-hour lookahead for optimal timing
-        lookahead_timing = 0.0
-        if max_future_price is not None and actual_physical > 0.1:  # Only for selling
-            current_price = market_state.dam_price
-            price_ratio = max_future_price / max(current_price, 1.0)
+        # 10. v21 Momentum-Based Timing Reward (BACKWARD-LOOKING, no data leakage)
+        # I reward the agent for trading WITH the momentum:
+        # - Selling when prices have risen (positive momentum) = good timing
+        # - Buying when prices have fallen (negative momentum) = good timing
+        # This uses only PAST information, available at decision time.
+        momentum_timing = 0.0
+        if price_momentum is not None and not has_dam_now:  # Only for IntraDay trades
+            abs_momentum = abs(price_momentum)
 
-            # Case A: Selling at/near peak - BONUS!
-            if current_price >= max_future_price * 0.95:
-                # Great timing! Selling at the best price
-                lookahead_timing = self.peak_sell_bonus * (actual_physical / 30.0)
+            if abs_momentum > self.momentum_threshold:
+                power_factor = abs(actual_physical) / 30.0  # Normalize by max power
 
-            # Case B: Selling with high upside and NO DAM forcing it - PENALTY!
-            elif price_ratio > self.early_sell_threshold and not has_dam_now:
-                # Bad timing! Could have waited for better price
-                # Penalty scales with how much upside was missed
-                upside_missed = (price_ratio - 1.0)  # e.g., 0.5 for 50% upside
-                lookahead_timing = -self.early_sell_penalty * upside_missed * (actual_physical / 30.0)
+                if actual_physical > 0.5 and price_momentum > 0:
+                    # Selling after prices rose - I reward good timing
+                    momentum_timing = self.momentum_bonus * power_factor * min(price_momentum, 0.3)
+
+                elif actual_physical < -0.5 and price_momentum < 0:
+                    # Buying after prices fell - I reward good timing
+                    momentum_timing = self.momentum_bonus * power_factor * min(abs_momentum, 0.3)
+
+                elif actual_physical > 0.5 and price_momentum < -self.momentum_threshold:
+                    # Selling after prices fell - suboptimal timing (small penalty)
+                    momentum_timing = -self.momentum_bonus * 0.5 * power_factor * min(abs_momentum, 0.3)
+
+                elif actual_physical < -0.5 and price_momentum > self.momentum_threshold:
+                    # Buying after prices rose - suboptimal timing (small penalty)
+                    momentum_timing = -self.momentum_bonus * 0.5 * power_factor * min(abs_momentum, 0.3)
 
         # 11. v16/v18: Price Quartile Awareness
         # I penalize selling in Q1 (cheap) and buying in Q4 (expensive)
@@ -329,7 +376,17 @@ class RewardCalculator:
         # 12. Total Reward
         # v18: Apply multiplicative factor to net_profit before adding other components
         adjusted_profit = net_profit * profit_multiplier
-        total_reward = adjusted_profit + penalty - proactive_penalty + soc_bonus + timing_bonus + lookahead_timing + quartile_adjustment
+        total_reward = adjusted_profit + penalty - proactive_penalty + soc_bonus + timing_bonus + momentum_timing + quartile_adjustment + dam_bonus
+
+        # I validate the reward is not NaN/Inf (safety check)
+        if not np.isfinite(total_reward):
+            logger.warning(
+                f"Non-finite reward detected: {total_reward}. "
+                f"Components: profit={adjusted_profit}, penalty={penalty}, "
+                f"proactive={proactive_penalty}, soc={soc_bonus}, timing={timing_bonus}, "
+                f"momentum={momentum_timing}, quartile={quartile_adjustment}, dam_bonus={dam_bonus}"
+            )
+            total_reward = 0.0  # Safe fallback
 
         return {
             "reward": total_reward / 100.0,  # Scale for NN
@@ -339,10 +396,11 @@ class RewardCalculator:
                 "degradation": degradation,
                 "shortfall_mw": shortfall_mw,
                 "shortfall_penalty": shortfall_penalty,
+                "dam_bonus": dam_bonus,
                 "proactive_penalty": proactive_penalty,
                 "soc_bonus": soc_bonus,
                 "timing_bonus": timing_bonus,  # v10
-                "lookahead_timing": lookahead_timing,  # v13 - peak/early sell reward
+                "momentum_timing": momentum_timing,  # v21 - backward-looking momentum reward
                 "quartile_adj": quartile_adjustment,  # v16 - price quartile penalty/bonus
                 "price_pct": price_percentile,  # v16 - for debugging
                 "profit_mult": profit_multiplier,  # v18 - multiplicative factor applied

@@ -95,6 +95,14 @@ class BatteryEnvRealistic(gym.Env):
         self.total_profit = 0.0
         self.total_cycles = 0.0
 
+        # Episode stats tracking (initialized for safety)
+        self._profit_history = []
+        self._cumulative_profit = 0.0
+        self._peak_profit = 0.0
+        self._max_drawdown = 0.0
+        self._discharge_prices = []
+        self._charge_prices = []
+
         print(f"Realistic Environment: {n_actions} actions, {len(df)} rows")
         print(f"  NO future price lookahead (realistic)")
         print(f"  Uses only lagged prices and time features")
@@ -144,6 +152,14 @@ class BatteryEnvRealistic(gym.Env):
         # Reset tracking
         self.total_profit = 0.0
         self.total_cycles = 0.0
+
+        # Episode stats tracking
+        self._profit_history = []
+        self._cumulative_profit = 0.0
+        self._peak_profit = 0.0
+        self._max_drawdown = 0.0
+        self._discharge_prices = []
+        self._charge_prices = []
 
         obs = self._get_observation()
         info = {'soc': self.soc, 'step': self.current_step}
@@ -278,6 +294,21 @@ class BatteryEnvRealistic(gym.Env):
         profit = revenue - degradation
         self.total_profit += profit
 
+        # Track episode stats
+        self._profit_history.append(profit)
+        self._cumulative_profit += profit
+        if self._cumulative_profit > self._peak_profit:
+            self._peak_profit = self._cumulative_profit
+        drawdown = self._peak_profit - self._cumulative_profit
+        if drawdown > self._max_drawdown:
+            self._max_drawdown = drawdown
+
+        # Track prices by action type
+        if power_mw > 0 and price > 0:  # Discharge
+            self._discharge_prices.append(price)
+        elif power_mw < 0 and price > 0:  # Charge
+            self._charge_prices.append(price)
+
         # Reward (scaled for RL)
         reward = profit * self.reward_scale
 
@@ -304,6 +335,39 @@ class BatteryEnvRealistic(gym.Env):
         }
 
         return obs, reward, terminated, truncated, info
+
+    def get_episode_stats(self) -> Dict:
+        """Return episode statistics for evaluation callback."""
+        # Calculate Sharpe ratio (annualized)
+        if hasattr(self, '_profit_history') and len(self._profit_history) > 1:
+            profits = np.array(self._profit_history)
+            mean_profit = np.mean(profits)
+            std_profit = np.std(profits) + 1e-8
+            sharpe = mean_profit / std_profit * np.sqrt(8760)  # Annualized
+            max_drawdown = self._max_drawdown
+        else:
+            sharpe = 0.0
+            max_drawdown = 0.0
+
+        # Calculate average prices
+        if hasattr(self, '_discharge_prices') and self._discharge_prices:
+            avg_discharge_price = np.mean(self._discharge_prices)
+        else:
+            avg_discharge_price = 0.0
+
+        if hasattr(self, '_charge_prices') and self._charge_prices:
+            avg_charge_price = np.mean(self._charge_prices)
+        else:
+            avg_charge_price = 0.0
+
+        return {
+            'total_profit': self.total_profit,
+            'total_cycles': self.total_cycles,
+            'sharpe_ratio': sharpe,
+            'max_drawdown': max_drawdown,
+            'avg_discharge_price': avg_discharge_price,
+            'avg_charge_price': avg_charge_price,
+        }
 
     def render(self, mode='human'):
         """Render current state."""

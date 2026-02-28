@@ -304,6 +304,52 @@ class TestAFRRSimulation:
                 unified_env.reset(seed=42)
 
 
+class TestAFRRParallelExecution:
+    """I verify IntraDay/mFRR execute in parallel with aFRR activation."""
+
+    def test_intraday_executes_during_afrr(self, unified_env):
+        """I verify IntraDay trades happen even when aFRR is activated."""
+        unified_env.reset(seed=42)
+
+        # I alternate buy/sell to keep SoC in range, with 50% aFRR
+        afrr_and_intraday = 0
+        for i in range(500):
+            # I sell (index 10) when SoC > 50%, buy (index 0) when SoC < 50%
+            id_action = 10 if unified_env.soc > 0.5 else 0
+            action = np.array([2, 2, id_action, 5])  # 50% aFRR, ID trade, idle mFRR
+            obs, reward, done, truncated, info = unified_env.step(action)
+
+            if info.get('afrr_activated', False) and abs(info.get('intraday_energy_mw', 0)) > 0.1:
+                afrr_and_intraday += 1
+
+            if done or truncated:
+                unified_env.reset(seed=42)
+
+        # I expect at least some co-execution (aFRR activates ~15% of steps)
+        assert afrr_and_intraday > 0, \
+            "IntraDay should execute in parallel with aFRR activation"
+
+    def test_mfrr_executes_during_afrr(self, unified_env):
+        """I verify mFRR trades happen even when aFRR is activated."""
+        unified_env.reset(seed=42)
+
+        # I use 50% aFRR (level 2) so capacity remains for mFRR
+        afrr_and_mfrr = 0
+        for _ in range(500):
+            action = np.array([2, 2, 5, 0])  # 50% aFRR, neutral price, idle ID, max mFRR sell
+            obs, reward, done, truncated, info = unified_env.step(action)
+
+            if info.get('afrr_activated', False) and abs(info.get('mfrr_energy_mw', 0)) > 0.1:
+                afrr_and_mfrr += 1
+
+            if done or truncated:
+                unified_env.reset(seed=42)
+
+        # I expect at least some co-execution (aFRR ~15% × mFRR ~30%)
+        assert afrr_and_mfrr > 0, \
+            "mFRR should execute in parallel with aFRR activation"
+
+
 class TestRewardCalculation:
     """I test reward calculation."""
 
@@ -629,6 +675,73 @@ class TestCalendarAging:
         """I verify setting coeff=0 disables the penalty entirely."""
         cost = self._cost_at_soc(0.05, soc_penalty_coeff=0.0)
         assert cost == pytest.approx(0.0, abs=1e-6)
+
+
+class TestDegradationIsShapingOnly:
+    """I verify degradation_cost is a shaping signal, not a real market cost."""
+
+    @staticmethod
+    def _idle_market():
+        from gym_envs.unified_reward_calculator import UnifiedMarketState
+        return UnifiedMarketState(
+            dam_price=100.0, dam_commitment=0.0,
+            intraday_bid=100.0, intraday_ask=100.0, intraday_spread=0.0,
+            afrr_cap_up_price=20.0, afrr_cap_down_price=30.0,
+            afrr_energy_up_price=80.0, afrr_energy_down_price=80.0,
+            afrr_activated=False, afrr_activation_direction=None,
+            mfrr_price_up=120.0, mfrr_price_down=60.0,
+        )
+
+    def test_degradation_not_in_trading_pnl(self):
+        """I verify trading_pnl is the same whether I cycle or idle."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator
+        calc = UnifiedRewardCalculator(degradation_cost_per_mwh=25.0)
+
+        # I idle — no cycling
+        result_idle = calc.calculate(
+            market=self._idle_market(), actual_energy_mw=0.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0
+        )
+
+        # I cycle 30 MW — degradation should be in shaping, not trading PnL
+        result_cycle = calc.calculate(
+            market=self._idle_market(), actual_energy_mw=30.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0, intraday_energy_mw=30.0
+        )
+
+        # I verify trading_pnl differs only by market revenue, not degradation
+        # Idle: no revenue, no costs → trading_pnl = 0
+        # Cycle: 30 MW × 100 EUR/MWh × 1h = 3000 revenue → trading_pnl = 3000
+        assert result_idle['components']['trading_pnl'] == pytest.approx(0.0, abs=0.01)
+        assert result_cycle['components']['trading_pnl'] == pytest.approx(3000.0, abs=0.01)
+
+        # I verify degradation IS in shaping_penalty
+        assert result_idle['components']['degradation_cost'] == pytest.approx(0.0, abs=0.01)
+        assert result_cycle['components']['degradation_cost'] > 0
+        assert result_cycle['components']['shaping_penalty'] >= result_cycle['components']['degradation_cost']
+
+    def test_degradation_affects_net_profit_not_trading(self):
+        """I verify net_profit includes degradation but trading_pnl does not."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator
+        calc = UnifiedRewardCalculator(degradation_cost_per_mwh=25.0)
+
+        result = calc.calculate(
+            market=self._idle_market(), actual_energy_mw=30.0,
+            afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0, intraday_energy_mw=30.0
+        )
+
+        # I verify: net_profit = trading_pnl + bonus - shaping_penalty
+        trading = result['components']['trading_pnl']
+        bonus = result['components']['shaping_bonus']
+        penalty = result['components']['shaping_penalty']
+        net = result['components']['net_profit']
+
+        assert net == pytest.approx(trading + bonus - penalty, abs=0.01)
+        # I verify net_profit < trading_pnl (degradation reduces it)
+        assert net < trading
 
 
 class TestDAMSoCReservation:

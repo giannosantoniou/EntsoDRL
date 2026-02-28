@@ -5,11 +5,26 @@ This module defines the interface and implementations for data sources.
 The Agent/Environment never knows where data comes from - it just asks the provider.
 """
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+from enum import Enum
 import datetime
+import logging
+import time
 import numpy as np
 import pandas as pd
+
+
+# I configure module-level logger for production-grade logging
+logger = logging.getLogger(__name__)
+
+
+class DataFreshness(Enum):
+    """I track how fresh our market data is for alerting."""
+    LIVE = "live"           # Fresh data from API
+    CACHED = "cached"       # Within cache TTL
+    STALE = "stale"         # Older than TTL but usable
+    UNAVAILABLE = "unavailable"  # No data available
 
 
 # ============================================================================
@@ -344,63 +359,144 @@ class LiveDataProvider(IDataProvider):
             power_scale=self.max_power_mw
         )
         
-        print(f"LiveDataProvider initialized: buffer={buffer_hours}h, time_step={time_step_hours}h")
+        # I track data freshness for monitoring and alerting
+        self._data_freshness = DataFreshness.UNAVAILABLE
+        self._consecutive_failures = 0
+        self._max_retries = 3
+        self._retry_delay_seconds = 5
+        self._stale_threshold_minutes = 30  # Alert if data older than this
+
+        logger.info(f"LiveDataProvider initialized: buffer={buffer_hours}h, time_step={time_step_hours}h")
     
     def _fetch_latest_data(self) -> Dict:
-        """Fetch latest market data from ENTSO-E."""
+        """
+        Fetch latest market data from ENTSO-E with retry logic and alerting.
+
+        I implement:
+        - Retry logic with exponential backoff
+        - Data freshness tracking for monitoring
+        - Proper logging instead of print statements
+        - Alerting when using stale data
+        """
         now = pd.Timestamp.now(tz='Europe/Athens')
-        
+
         # Check cache validity
         if self._cached_market_data and self._last_fetch_time:
-            elapsed = (now - self._last_fetch_time).total_seconds() / 60
-            if elapsed < self._cache_ttl_minutes:
+            elapsed_minutes = (now - self._last_fetch_time).total_seconds() / 60
+            if elapsed_minutes < self._cache_ttl_minutes:
+                self._data_freshness = DataFreshness.CACHED
                 return self._cached_market_data
-        
-        # Fetch fresh data
+
+        # Fetch fresh data with retry logic
         start = now.floor('D') - pd.Timedelta(days=1)
         end = now.floor('D') + pd.Timedelta(days=2)
-        
-        try:
-            # DAM prices
-            dam_df = self.entsoe.fetch_day_ahead_prices(start, end)
-            
-            # Wind/Solar forecasts
-            res_df = self.entsoe.fetch_wind_solar_forecast(start, end)
-            
-            # Imbalance prices
-            imb_df = self.entsoe.fetch_imbalance_prices(start, end)
-            
-            # Merge all data
-            data = {
-                'dam_prices': dam_df,
-                'res_forecast': res_df,
-                'imbalance': imb_df,
-                'fetch_time': now
-            }
-            
-            # Calculate Daily Stats for DAM Commitment Heuristic
-            if not dam_df.empty:
-                # Filter for *today* to calculate today's median
-                today = now.floor('D')
-                today_mask = (dam_df.index >= today) & (dam_df.index < today + pd.Timedelta(days=1))
-                today_prices = dam_df.loc[today_mask, 'price']
-                
-                if not today_prices.empty:
-                    data['daily_median'] = today_prices.median()
-                    data['daily_max'] = today_prices.max()
-                    data['daily_min'] = today_prices.min()
-            
-            self._cached_market_data = data
-            self._last_fetch_time = now
-            
-            # Update rolling buffers
-            self._update_buffers(dam_df, res_df)
-            
-            return data
-            
-        except Exception as e:
-            print(f"Error fetching ENTSO-E data: {e}")
-            return self._cached_market_data or {}
+
+        last_error = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                logger.debug(f"Fetching ENTSO-E data (attempt {attempt}/{self._max_retries})")
+
+                # DAM prices
+                dam_df = self.entsoe.fetch_day_ahead_prices(start, end)
+
+                # Wind/Solar forecasts
+                res_df = self.entsoe.fetch_wind_solar_forecast(start, end)
+
+                # Imbalance prices
+                imb_df = self.entsoe.fetch_imbalance_prices(start, end)
+
+                # I validate that we got meaningful data
+                if dam_df.empty:
+                    raise ValueError("DAM prices DataFrame is empty - API returned no data")
+
+                if 'price' not in dam_df.columns:
+                    raise ValueError(f"DAM prices missing 'price' column. Got: {list(dam_df.columns)}")
+
+                # Merge all data
+                data = {
+                    'dam_prices': dam_df,
+                    'res_forecast': res_df,
+                    'imbalance': imb_df,
+                    'fetch_time': now
+                }
+
+                # Calculate Daily Stats for DAM Commitment Heuristic
+                if not dam_df.empty:
+                    today = now.floor('D')
+                    today_mask = (dam_df.index >= today) & (dam_df.index < today + pd.Timedelta(days=1))
+                    today_prices = dam_df.loc[today_mask, 'price']
+
+                    if not today_prices.empty:
+                        data['daily_median'] = today_prices.median()
+                        data['daily_max'] = today_prices.max()
+                        data['daily_min'] = today_prices.min()
+
+                self._cached_market_data = data
+                self._last_fetch_time = now
+                self._data_freshness = DataFreshness.LIVE
+                self._consecutive_failures = 0
+
+                # Update rolling buffers
+                self._update_buffers(dam_df, res_df)
+
+                logger.info(f"Successfully fetched ENTSO-E data: {len(dam_df)} DAM prices")
+                return data
+
+            except Exception as e:
+                last_error = e
+                self._consecutive_failures += 1
+                logger.warning(
+                    f"ENTSO-E fetch attempt {attempt}/{self._max_retries} failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+                if attempt < self._max_retries:
+                    delay = self._retry_delay_seconds * (2 ** (attempt - 1))  # Exponential backoff
+                    logger.info(f"Retrying in {delay}s...")
+                    time.sleep(delay)
+
+        # All retries failed - use cached data with alerting
+        logger.error(
+            f"All {self._max_retries} ENTSO-E fetch attempts failed. "
+            f"Last error: {type(last_error).__name__}: {last_error}"
+        )
+
+        if self._cached_market_data and self._last_fetch_time:
+            elapsed_minutes = (now - self._last_fetch_time).total_seconds() / 60
+
+            if elapsed_minutes > self._stale_threshold_minutes:
+                self._data_freshness = DataFreshness.STALE
+                logger.warning(
+                    f"ALERT: Using STALE market data! "
+                    f"Data is {elapsed_minutes:.1f} minutes old (threshold: {self._stale_threshold_minutes}min). "
+                    f"Consecutive failures: {self._consecutive_failures}"
+                )
+            else:
+                self._data_freshness = DataFreshness.CACHED
+                logger.info(f"Using cached data from {elapsed_minutes:.1f} minutes ago")
+
+            return self._cached_market_data
+
+        # No cached data available
+        self._data_freshness = DataFreshness.UNAVAILABLE
+        logger.critical(
+            "CRITICAL: No market data available! "
+            "API failed and no cached data exists. Trading should be HALTED."
+        )
+        return {}
+
+    def get_data_freshness(self) -> DataFreshness:
+        """I expose data freshness status for external monitoring."""
+        return self._data_freshness
+
+    def get_health_status(self) -> Dict:
+        """I provide health status for monitoring dashboards."""
+        return {
+            'freshness': self._data_freshness.value,
+            'consecutive_failures': self._consecutive_failures,
+            'last_fetch_time': self._last_fetch_time.isoformat() if self._last_fetch_time else None,
+            'has_cached_data': self._cached_market_data is not None
+        }
     
     def _update_buffers(self, dam_df: pd.DataFrame, res_df: pd.DataFrame):
         """Update rolling buffers with latest data."""
@@ -634,7 +730,7 @@ class LiveDataProvider(IDataProvider):
         
         self.current_soc = np.clip(self.current_soc, 0.0, 1.0)
         
-        print(f"[DISPATCH] {mw_setpoint:+.1f} MW -> SoC: {self.current_soc:.1%}")
+        logger.debug(f"[DISPATCH] {mw_setpoint:+.1f} MW -> SoC: {self.current_soc:.1%}")
     
     def step(self) -> bool:
         """In production, always return True (continuous operation)."""

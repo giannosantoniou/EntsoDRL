@@ -10,8 +10,9 @@ I calculate rewards for the unified multi-market environment that handles:
 The reward formula ensures proper incentives for all market activities while
 maintaining strict compliance with HEnEx regulatory requirements.
 
-Total Reward = DAM_Revenue + IntraDay_Revenue + aFRR_Capacity + aFRR_Energy + mFRR_Revenue
-               - Degradation - Calendar_Aging - DAM_Violation_Penalty - aFRR_NonResponse_Penalty
+Trading PnL = DAM_Revenue + IntraDay_Revenue + aFRR_Capacity + aFRR_Energy + mFRR_Revenue
+              - DAM_Violation_Penalty - aFRR_NonResponse_Penalty
+Shaped Reward = Trading_PnL + DAM_Bonus - Degradation - Calendar_Aging - Physical_Penalty
 """
 
 import numpy as np
@@ -375,6 +376,9 @@ class UnifiedRewardCalculator:
         # what the agent optimizes during training.
 
         # Trading P&L: real market revenues minus real costs
+        # I moved degradation_cost to shaping — it's a teaching signal to
+        # discourage excessive cycling, not a real-time settlement cost.
+        # The actual battery wear is an OpEx/CapEx concern, not a market cost.
         market_revenue = (
             dam_revenue +
             afrr_capacity_revenue + afrr_energy_revenue +
@@ -383,7 +387,6 @@ class UnifiedRewardCalculator:
             free_bid_revenue + mfrr_revenue
         )
         real_costs = (
-            degradation_cost +
             dam_violation_cost +
             afrr_nonresponse_cost
         )
@@ -391,8 +394,10 @@ class UnifiedRewardCalculator:
         components['trading_pnl'] = trading_pnl
 
         # Shaping: bonuses and penalties that exist only during training
+        # I include degradation_cost here so the agent learns to avoid
+        # unnecessary cycling, but it doesn't affect reported trading PnL.
         shaping_bonus = dam_bonus
-        shaping_penalty = physical_penalty + calendar_aging_cost
+        shaping_penalty = physical_penalty + calendar_aging_cost + degradation_cost
         components['shaping_bonus'] = shaping_bonus
         components['shaping_penalty'] = shaping_penalty
 

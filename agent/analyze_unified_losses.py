@@ -2,6 +2,7 @@
 Detailed Loss Analysis for Unified Model
 
 I analyze exactly where money is being lost:
+- IntraDay trading losses (buy high, sell low on XBID)
 - mFRR trading losses (buy high, sell low)
 - Degradation costs
 - aFRR penalties
@@ -73,6 +74,9 @@ def analyze_losses(n_episodes: int = 10):
         step = 0
 
         # I reset episode tracking
+        ep_intraday_profit = 0
+        ep_intraday_buy_cost = 0
+        ep_intraday_sell_revenue = 0
         ep_mfrr_profit = 0
         ep_mfrr_buy_cost = 0
         ep_mfrr_sell_revenue = 0
@@ -81,6 +85,8 @@ def analyze_losses(n_episodes: int = 10):
         ep_degradation_cost = 0
         ep_cycles = 0
 
+        intraday_buys = []
+        intraday_sells = []
         mfrr_buys = []
         mfrr_sells = []
 
@@ -96,6 +102,25 @@ def analyze_losses(n_episodes: int = 10):
 
             post_soc = env.soc
             soc_change = post_soc - pre_soc
+
+            # I track IntraDay trades
+            id_mw = info.get('intraday_energy_mw', 0)
+            if abs(id_mw) > 0.1:
+                row = env.df.iloc[env.current_step - 1]
+                if id_mw > 0:  # Selling at bid
+                    price = row.get('intraday_bid', row.get('price', 100) - 2)
+                    revenue = info.get('intraday_revenue', 0)
+                    if revenue == 0:
+                        revenue = abs(id_mw) * price
+                    ep_intraday_sell_revenue += abs(revenue)
+                    intraday_sells.append({'mw': id_mw, 'price': price, 'revenue': abs(revenue)})
+                else:  # Buying at ask
+                    price = row.get('intraday_ask', row.get('price', 100) + 2)
+                    cost = abs(info.get('intraday_revenue', 0))
+                    if cost == 0:
+                        cost = abs(id_mw) * price
+                    ep_intraday_buy_cost += cost
+                    intraday_buys.append({'mw': id_mw, 'price': price, 'cost': cost})
 
             # I track mFRR trades
             mfrr_mw = info.get('mfrr_energy_mw', 0)
@@ -130,9 +155,13 @@ def analyze_losses(n_episodes: int = 10):
         ep_cycles = final_info.get('total_cycles', 0)
         ep_degradation_cost = ep_cycles * env.capacity_mwh * env.reward_calculator.degradation_cost
 
+        ep_intraday_profit = ep_intraday_sell_revenue - ep_intraday_buy_cost
         ep_mfrr_profit = ep_mfrr_sell_revenue - ep_mfrr_buy_cost
 
         # I store episode stats
+        stats['intraday_sell_revenue'].append(ep_intraday_sell_revenue)
+        stats['intraday_buy_cost'].append(ep_intraday_buy_cost)
+        stats['intraday_net'].append(ep_intraday_profit)
         stats['mfrr_sell_revenue'].append(ep_mfrr_sell_revenue)
         stats['mfrr_buy_cost'].append(ep_mfrr_buy_cost)
         stats['mfrr_net'].append(ep_mfrr_profit)
@@ -143,6 +172,12 @@ def analyze_losses(n_episodes: int = 10):
         stats['total_profit'].append(final_info.get('total_profit', 0))
 
         # I calculate average buy/sell prices
+        if intraday_buys:
+            avg_id_buy = np.mean([t['price'] for t in intraday_buys])
+            stats['avg_id_buy_price'].append(avg_id_buy)
+        if intraday_sells:
+            avg_id_sell = np.mean([t['price'] for t in intraday_sells])
+            stats['avg_id_sell_price'].append(avg_id_sell)
         if mfrr_buys:
             avg_buy_price = np.mean([t['price'] for t in mfrr_buys])
             stats['avg_buy_price'].append(avg_buy_price)
@@ -150,7 +185,7 @@ def analyze_losses(n_episodes: int = 10):
             avg_sell_price = np.mean([t['price'] for t in mfrr_sells])
             stats['avg_sell_price'].append(avg_sell_price)
 
-        print(f"Episode {ep+1}: mFRR net={ep_mfrr_profit:,.0f}, "
+        print(f"Episode {ep+1}: ID net={ep_intraday_profit:,.0f}, mFRR net={ep_mfrr_profit:,.0f}, "
               f"Degradation={ep_degradation_cost:,.0f}, Cycles={ep_cycles:.2f}")
 
     vec_env.close()
@@ -159,6 +194,19 @@ def analyze_losses(n_episodes: int = 10):
     print("\n" + "=" * 70)
     print("DETAILED LOSS ANALYSIS")
     print("=" * 70)
+
+    print("\n[INTRADAY TRADING]")
+    print("-" * 50)
+    print(f"  Sell Revenue (discharge): {np.mean(stats['intraday_sell_revenue']):>12,.0f} EUR")
+    print(f"  Buy Cost (charge):        {np.mean(stats['intraday_buy_cost']):>12,.0f} EUR")
+    print(f"  Net IntraDay Profit:      {np.mean(stats['intraday_net']):>12,.0f} EUR")
+    if stats['avg_id_buy_price'] and stats['avg_id_sell_price']:
+        print(f"\n  Avg Buy Price (ask):      {np.mean(stats['avg_id_buy_price']):>12,.1f} EUR/MWh")
+        print(f"  Avg Sell Price (bid):     {np.mean(stats['avg_id_sell_price']):>12,.1f} EUR/MWh")
+        id_spread = np.mean(stats['avg_id_sell_price']) - np.mean(stats['avg_id_buy_price'])
+        print(f"  Price Spread:             {id_spread:>12,.1f} EUR/MWh")
+        if id_spread < 0:
+            print(f"  [PROBLEM] IntraDay: Buying HIGH, selling LOW!")
 
     print("\n[mFRR TRADING]")
     print("-" * 50)
@@ -171,7 +219,7 @@ def analyze_losses(n_episodes: int = 10):
         spread = np.mean(stats['avg_sell_price']) - np.mean(stats['avg_buy_price'])
         print(f"  Price Spread:             {spread:>12,.1f} EUR/MWh")
         if spread < 0:
-            print(f"  [PROBLEM] Buying HIGH, selling LOW!")
+            print(f"  [PROBLEM] mFRR: Buying HIGH, selling LOW!")
 
     print("\n[aFRR REVENUE]")
     print("-" * 50)
@@ -186,7 +234,8 @@ def analyze_losses(n_episodes: int = 10):
 
     print("\n[SUMMARY]")
     print("-" * 50)
-    total_revenue = (np.mean(stats['mfrr_net']) +
+    total_revenue = (np.mean(stats['intraday_net']) +
+                    np.mean(stats['mfrr_net']) +
                     np.mean(stats['afrr_cap_revenue']) +
                     np.mean(stats['afrr_energy_revenue']))
     total_cost = np.mean(stats['degradation_cost'])

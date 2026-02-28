@@ -48,6 +48,8 @@ class ADMIEDataFetcher:
     # I define all file types we need
     FILE_CATEGORIES = {
         'isp1': 'ISP1ISPResults',
+        'isp2': 'ISP2ISPResults',
+        'isp3': 'ISP3ISPResults',
         'imbabe': 'IMBABE',
         'balancing_energy': 'BalancingEnergyProduct',
         'system_load': 'RealTimeSCADASystemLoad',
@@ -95,8 +97,14 @@ class ADMIEDataFetcher:
         logger.info(f"Fetching ADMIE data from {start_date} to {end_date}")
 
         # I fetch each data type independently
-        isp_data = self._fetch_and_parse_category(
+        isp1_data = self._fetch_and_parse_category(
             'isp1', start, end, self._parse_isp_file
+        )
+        isp2_data = self._fetch_and_parse_category(
+            'isp2', start, end, self._parse_isp_file
+        )
+        isp3_data = self._fetch_and_parse_category(
+            'isp3', start, end, self._parse_isp_file
         )
         imbabe_data = self._fetch_and_parse_category(
             'imbabe', start, end, self._parse_imbabe_file
@@ -117,6 +125,15 @@ class ADMIEDataFetcher:
             'res_forecast', start, end, self._parse_scada_res_file
         )
 
+        # I rename ISP2/ISP3 columns to distinguish from ISP1
+        # (ISP parser produces generic afrr_/mfrr_ prefixed columns)
+        for isp_num, isp_df in [('isp2', isp2_data), ('isp3', isp3_data)]:
+            if isp_df is not None and not isp_df.empty:
+                rename_map = {
+                    col: f"{isp_num}_{col}" for col in isp_df.columns
+                }
+                isp_df.rename(columns=rename_map, inplace=True)
+
         # I rename forecast columns to distinguish from actuals
         if load_forecast_data is not None and not load_forecast_data.empty:
             load_forecast_data = load_forecast_data.rename(columns={
@@ -130,7 +147,7 @@ class ADMIEDataFetcher:
         # I filter each DataFrame to the requested date range before merging
         # (weekly files like IMBABE may contain data outside our range)
         all_sources = [
-            isp_data, imbabe_data, balancing_data,
+            isp1_data, isp2_data, isp3_data, imbabe_data, balancing_data,
             load_data, res_data, load_forecast_data, res_forecast_data
         ]
         filtered = []

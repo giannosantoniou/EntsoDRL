@@ -169,11 +169,14 @@ class BatteryEnvAFRR(gym.Env):
                 df[col] = default
 
         # I create lagged features (backward-looking only)
+        # LEAKAGE FIX: I fill NaN from shift() with column mean (non-informative)
+        # instead of bfill() which would leak future values into early rows
         w_block = self.HOURS_PER_BLOCK * self._sph  # 16 ISPs per block
         for col in ['afrr_cap_up_price', 'afrr_cap_down_price', 'afrr_up']:
             lag_col = f'{col}_lag_1block'
             if lag_col not in df.columns:
-                df[lag_col] = df[col].shift(w_block)
+                col_mean = df[col].mean()
+                df[lag_col] = df[col].shift(w_block).fillna(col_mean)
 
         # I create rolling statistics
         w24 = 24 * self._sph
@@ -189,7 +192,7 @@ class BatteryEnvAFRR(gym.Env):
         if 'price_mean_24h' not in df.columns:
             df['price_mean_24h'] = df['price'].rolling(w24, min_periods=1).mean()
 
-        # I fill NaN
+        # I fill remaining NaN (non-lag columns safe to ffill/bfill)
         df = df.ffill().bfill()
         self.df = df
 

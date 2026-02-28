@@ -23,9 +23,11 @@ from dotenv import load_dotenv
 sys.path.append(str(Path(__file__).parent.parent))
 
 from sb3_contrib import MaskablePPO
+from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 from agent.feature_engineer import FeatureEngineer, MarketStateDTO
 from agent.decision_strategy import create_strategy, IDecisionStrategy
 from data.data_provider import LiveDataProvider
+import pickle
 
 # Load environment
 load_dotenv()
@@ -59,10 +61,16 @@ class PaperTradingSimulator:
         self.data_provider = data_provider
 
         # I load the appropriate strategy
+        self.vec_normalize = None  # VecNormalize for observation normalization
+
         if self.strategy_type == "AI":
             logger.info(f"Loading AI model from {model_path}...")
             self.model = MaskablePPO.load(model_path)
             self.strategy = None  # Use model directly for AI
+
+            # I look for VecNormalize stats alongside the model
+            # Common naming patterns: vec_normalize.pkl, vecnormalize.pkl, or same name as model
+            self._load_vec_normalize(model_path)
         else:
             logger.info(f"Initializing {self.strategy_type} strategy...")
             self.model = None
@@ -85,11 +93,18 @@ class PaperTradingSimulator:
         self.min_soc = 0.05
         self.max_soc = 0.95
         
-        # P&L Tracking
+        # P&L Tracking (total + per-market breakdown)
         self.total_profit = 0.0
         self.total_revenue = 0.0
         self.total_cost = 0.0
         self.decisions_count = 0
+        self.dam_profit = 0.0
+        self.afrr_cap_profit = 0.0
+        self.afrr_energy_profit = 0.0
+        self.intraday_profit = 0.0
+        self.mfrr_profit = 0.0
+        self.free_bid_profit = 0.0
+        self.total_fees = 0.0
         
         # Decision Log
         self.log_file = log_file
@@ -98,13 +113,89 @@ class PaperTradingSimulator:
         logger.info("Paper Trading Simulator initialized (VIRTUAL MODE)")
         logger.info(f"Virtual SoC: {self.virtual_soc:.2%}")
         logger.info(f"Logging to: {self.log_file}")
+
+    def _load_vec_normalize(self, model_path: str):
+        """
+        I load VecNormalize stats to ensure observations are normalized
+        the same way as during training.
+
+        CRITICAL: If the model was trained with VecNormalize but we don't
+        load it here, the model receives un-normalized observations and
+        will produce garbage predictions.
+        """
+        model_dir = Path(model_path).parent
+        model_stem = Path(model_path).stem
+
+        # I try multiple common naming patterns
+        candidates = [
+            model_dir / "vec_normalize.pkl",
+            model_dir / "vecnormalize.pkl",
+            model_dir / f"{model_stem}_vec_normalize.pkl",
+            model_dir / f"vec_normalize_{model_stem}.pkl",
+            Path(model_path).with_suffix('.pkl'),  # Same name, different extension
+        ]
+
+        for vec_path in candidates:
+            if vec_path.exists():
+                try:
+                    logger.info(f"Loading VecNormalize from {vec_path}...")
+
+                    # I load the VecNormalize object
+                    with open(vec_path, 'rb') as f:
+                        self.vec_normalize = pickle.load(f)
+
+                    # I set inference mode (no updates to running stats)
+                    self.vec_normalize.training = False
+                    self.vec_normalize.norm_reward = False
+
+                    logger.info(
+                        f"VecNormalize loaded successfully. "
+                        f"obs_rms mean: {self.vec_normalize.obs_rms.mean[:3]}... "
+                        f"(showing first 3 of {len(self.vec_normalize.obs_rms.mean)})"
+                    )
+                    return
+
+                except Exception as e:
+                    logger.warning(f"Failed to load VecNormalize from {vec_path}: {e}")
+                    continue
+
+        # No VecNormalize found - this is a potential issue
+        logger.warning(
+            "WARNING: No VecNormalize stats found! "
+            "If the model was trained with normalized observations, "
+            "predictions may be incorrect. "
+            f"Searched in: {model_dir}"
+        )
+
+    def _normalize_obs(self, obs: np.ndarray) -> np.ndarray:
+        """
+        I normalize observations using loaded VecNormalize stats.
+
+        If VecNormalize is not loaded, I return the observation unchanged
+        but log a warning on the first call.
+        """
+        if self.vec_normalize is None:
+            return obs
+
+        # I apply normalization: (obs - mean) / sqrt(var + epsilon)
+        obs_rms = self.vec_normalize.obs_rms
+        epsilon = self.vec_normalize.epsilon
+        clip_obs = self.vec_normalize.clip_obs
+
+        normalized = (obs - obs_rms.mean) / np.sqrt(obs_rms.var + epsilon)
+        normalized = np.clip(normalized, -clip_obs, clip_obs)
+
+        return normalized
     
     def _init_log_file(self):
-        """Initialize CSV log file."""
+        """Initialize CSV log file with per-market breakdown."""
         if not os.path.exists(self.log_file):
             with open(self.log_file, 'w') as f:
                 f.write("timestamp,price_eur,soc,risk_score,action_idx,action_level,mw_setpoint,"
-                       "step_profit,total_profit,revenue,cost,gradient,res_deviation\n")
+                       "step_profit,total_profit,revenue,cost,"
+                       "dam_profit,afrr_cap_profit,afrr_energy_profit,"
+                       "intraday_profit,mfrr_profit,free_bid_profit,fees,"
+                       "gradient,res_deviation\n")
     
     def _update_virtual_battery(self, mw_setpoint: float):
         """
@@ -130,6 +221,15 @@ class PaperTradingSimulator:
             # ------------------------------------------------
             market_state = self.data_provider.get_current_market_state()
             imbalance_risk = self.data_provider.get_imbalance_risk()
+
+            # I check data freshness and log warnings if stale
+            from data.data_provider import DataFreshness
+            freshness = self.data_provider.get_data_freshness()
+            if freshness == DataFreshness.STALE:
+                logger.warning("Trading with STALE market data - exercise caution!")
+            elif freshness == DataFreshness.UNAVAILABLE:
+                logger.error("No market data available - skipping this tick")
+                return None
             
             # 2. Prepare Market State DTO
             # ------------------------------------------------
@@ -192,11 +292,35 @@ class PaperTradingSimulator:
             # I use the appropriate prediction method based on strategy type
             if self.model is not None:
                 # AI mode - use MaskablePPO directly
-                action, _ = self.model.predict(obs, action_masks=mask, deterministic=True)
+                # CRITICAL: I normalize observations to match training conditions
+                obs_normalized = self._normalize_obs(obs)
+                action, _ = self.model.predict(obs_normalized, action_masks=mask, deterministic=True)
             else:
-                # Strategy mode - use IDecisionStrategy interface
+                # Strategy mode - use IDecisionStrategy interface (no normalization needed)
                 action = self.strategy.predict_action(obs, mask)
             
+            # 4b. Log IntraDay Proposal with Forecast Justification
+            # ------------------------------------------------
+            # I check if forecast features are present in observation (indices 63-71)
+            if len(obs) > 67:
+                proposal = {
+                    'timestamp': datetime.now().isoformat(),
+                    'forecast_1h': obs[63] * 100,
+                    'forecast_2h': obs[64] * 100,
+                    'correction_signal': obs[67],
+                    'dam_price': obs[3] * 100,
+                    'solar_mw': obs[69] * 3000 if len(obs) > 69 else 0,
+                    'wind_mw': obs[70] * 3000 if len(obs) > 70 else 0,
+                    'status': 'PENDING_APPROVAL'
+                }
+                logger.info(
+                    f"INTRADAY PROPOSAL: "
+                    f"forecast={proposal['forecast_1h']:.1f} EUR "
+                    f"| dam={proposal['dam_price']:.1f} EUR "
+                    f"| correction={proposal['correction_signal']:.3f} "
+                    f"| solar={proposal['solar_mw']:.0f} wind={proposal['wind_mw']:.0f}"
+                )
+
             # 5. Calculate VIRTUAL P&L (NO real dispatch!)
             # ------------------------------------------------
             action_idx = int(action)
@@ -234,22 +358,35 @@ class PaperTradingSimulator:
             # Total Profit for this step (Cashflow view)
             # Note: This is a simplified settlement view.
             step_profit = imbalance_revenue # We track specific balancing profit here
-            
+
             # Define price for logging
             price = market_state.intraday_price
-            
+
+            # I calculate HEnEx/ADMIE fees for this step
+            step_dam_vol = abs(dam_commitment) * self.data_provider.time_step_hours
+            step_bal_vol = abs(deviation_mw) * self.data_provider.time_step_hours
+            charge_mwh = abs(min(0, mw_setpoint)) * self.data_provider.time_step_hours
+            step_fees = step_dam_vol * 0.04 + step_bal_vol * 0.02 + charge_mwh * 2.5
+
+            # I track per-market profit (simplified for paper trading)
+            step_dam_profit = dam_revenue
+            step_imbalance_profit = imbalance_revenue
+
+            self.dam_profit += step_dam_profit
+            self.total_fees += step_fees
+
             # Update cumulative stats
             current_revenue = dam_revenue
-            current_cost = 0.0
-            
+            current_cost = step_fees
+
             if imbalance_revenue > 0:
                 current_revenue += imbalance_revenue
             else:
                 current_cost += abs(imbalance_revenue)
-                
+
             self.total_revenue += current_revenue
             self.total_cost += current_cost
-            self.total_profit += step_profit
+            self.total_profit += step_profit - step_fees
             
             # 6. Update VIRTUAL Battery
             # ------------------------------------------------
@@ -264,6 +401,10 @@ class PaperTradingSimulator:
                        f"{imbalance_risk['risk_score']:.4f},{action_idx},{action_level:.2f},"
                        f"{mw_setpoint:.2f},{step_profit:.2f},{self.total_profit:.2f},"
                        f"{self.total_revenue:.2f},{self.total_cost:.2f},"
+                       f"{step_dam_profit:.2f},{self.afrr_cap_profit:.2f},"
+                       f"{self.afrr_energy_profit:.2f},{self.intraday_profit:.2f},"
+                       f"{self.mfrr_profit:.2f},{self.free_bid_profit:.2f},"
+                       f"{step_fees:.2f},"
                        f"{imbalance_risk['gradient']:.2f},{imbalance_risk['res_deviation']:.2f}\n")
             
             # 8. Return Status
@@ -321,12 +462,15 @@ class PaperTradingSimulator:
                     )
                     logger.info(log_msg)
                     
-                    # Periodic summary
+                    # Periodic summary with per-market breakdown
                     if self.decisions_count % 10 == 0:
                         avg_profit = self.total_profit / self.decisions_count if self.decisions_count > 0 else 0
                         logger.info(f"--- Stats after {self.decisions_count} ticks ---")
                         logger.info(f"Avg Profit/Tick: {avg_profit:+.2f}€")
-                        logger.info(f"Revenue: {self.total_revenue:,.2f}€ | Cost: {self.total_cost:,.2f}€")
+                        logger.info(f"Revenue: {self.total_revenue:,.2f}€ | Cost: {self.total_cost:,.2f}€ | Fees: {self.total_fees:,.2f}€")
+                        logger.info(f"DAM={self.dam_profit:+,.0f}€ | aFRR_cap={self.afrr_cap_profit:+,.0f}€ | "
+                                    f"aFRR_e={self.afrr_energy_profit:+,.0f}€ | ID={self.intraday_profit:+,.0f}€ | "
+                                    f"mFRR={self.mfrr_profit:+,.0f}€ | FreeBid={self.free_bid_profit:+,.0f}€")
                 
                 # Wait for next tick
                 elapsed = time.time() - start_time
@@ -338,9 +482,16 @@ class PaperTradingSimulator:
                 logger.info("PAPER TRADING STOPPED BY USER")
                 logger.info("=" * 80)
                 logger.info(f"Total Ticks: {self.decisions_count}")
-                logger.info(f"Total Profit: {self.total_profit:+,.2f}€")
+                logger.info(f"Total Profit: {self.total_profit:+,.2f}€ (net of fees)")
                 logger.info(f"Total Revenue: {self.total_revenue:,.2f}€")
                 logger.info(f"Total Cost: {self.total_cost:,.2f}€")
+                logger.info(f"Total Fees: {self.total_fees:,.2f}€")
+                logger.info(f"Per-Market: DAM={self.dam_profit:+,.0f}€ | "
+                            f"aFRR_cap={self.afrr_cap_profit:+,.0f}€ | "
+                            f"aFRR_e={self.afrr_energy_profit:+,.0f}€ | "
+                            f"ID={self.intraday_profit:+,.0f}€ | "
+                            f"mFRR={self.mfrr_profit:+,.0f}€ | "
+                            f"FreeBid={self.free_bid_profit:+,.0f}€")
                 logger.info(f"Final Virtual SoC: {self.virtual_soc:.2%}")
                 logger.info(f"Log saved to: {os.path.abspath(self.log_file)}")
                 break

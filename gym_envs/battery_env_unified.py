@@ -543,7 +543,7 @@ class BatteryEnvUnified(gym.Env):
         price_mask = np.ones(len(self.AFRR_PRICE_TIERS), dtype=bool)
 
         # Mask 3: IntraDay actions (11 options)
-        # I enforce IntraDay gate: open 00:00-22:59, closed 23:00+ and during aFRR
+        # I enforce IntraDay gate: open 00:00-22:59, closed 23:00+
         # I use adjusted capacity/limits that account for aFRR commitment
         intraday_mask = np.zeros(self.N_INTRADAY_ACTIONS, dtype=bool)
 
@@ -949,7 +949,11 @@ class BatteryEnvUnified(gym.Env):
         mfrr_energy_mw = 0.0
         mfrr_revenue = 0.0
 
-        if not afrr_activated:
+        # I removed the `not afrr_activated` guard. In production, aFRR
+        # activates in real-time (AGC signal) while mFRR positions are
+        # pre-committed. Both execute simultaneously — the only constraint
+        # is physical MW headroom, already handled by remaining_after_ida.
+        if True:
             mfrr_level = self.MFRR_LEVELS[mfrr_qty_action]
             requested_mfrr = mfrr_level * remaining_after_ida
 
@@ -1072,7 +1076,9 @@ class BatteryEnvUnified(gym.Env):
 
         active_market = self._get_intraday_market(row)
         intraday_open = self._is_intraday_open(row)
-        if not afrr_activated and intraday_open and active_market != 'closed':
+        # I removed the `not afrr_activated` guard. aFRR and IntraDay
+        # execute in parallel — capacity already reduced via cascade.
+        if intraday_open and active_market != 'closed':
             intraday_level = self.INTRADAY_LEVELS[xbid_action]
             requested_intraday = intraday_level * remaining_after_mfrr
 
@@ -1141,7 +1147,9 @@ class BatteryEnvUnified(gym.Env):
         free_bid_activated = False
         agent_bid_price = 0.0
 
-        if self.enable_full_market and not afrr_activated:
+        # I removed the `not afrr_activated` guard. Free Bids execute
+        # in parallel with aFRR — capacity cascade handles the constraint.
+        if self.enable_full_market:
             freebid_level = self.FREEBID_QTY_LEVELS[freebid_qty_action]
             requested_freebid = freebid_level * remaining_after_intraday
 
@@ -2084,11 +2092,8 @@ class BatteryEnvUnified(gym.Env):
         """I check if any IntraDay market (IDA or XBID) is open for trading.
 
         I open IntraDay for all hours 00:00-22:59 (covers IDA1/2/3 + XBID).
-        Only blocked during aFRR activation and at 23:00-23:59.
+        aFRR and IntraDay execute in parallel — no blocking needed.
         """
-        if self.steps_since_afrr_activation <= 0:
-            return False
-
         ts = self.df.index[self.current_step]
         if ts.hour >= 23:
             return False
