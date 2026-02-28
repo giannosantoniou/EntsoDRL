@@ -100,8 +100,8 @@ class BatteryEnvUnified(gym.Env):
         mfrr_activation_rate: float = 0.35,  # Probability of mFRR bid acceptance (35%)
         mfrr_price_cap: float = 1000.0,  # EUR/MWh cap — real prices reach 1190 EUR
 
-        # Cycling limits — 2.5 gives breathing room for mandatory DAM + aFRR
-        # while the cycle_target (2.0) still penalizes excess via reward shaping
+        # Cycling — degradation_cost already penalizes each cycle proportionally.
+        # I removed the cycle_target/excess penalty — if profit/cycle is high, cycle freely.
         max_daily_cycles: float = 2.5,
         degradation_cost: float = 15.0,
 
@@ -198,11 +198,7 @@ class BatteryEnvUnified(gym.Env):
             degradation_cost_per_mwh=self.reward_config.get('degradation_cost', 5.0),
             dam_violation_penalty=self.reward_config.get('dam_violation_penalty', 800.0),
             afrr_nonresponse_penalty=self.reward_config.get('afrr_nonresponse_penalty', 500.0),
-            cycle_target=self.reward_config.get('cycle_target', 2.0),
-            cycle_excess_penalty=self.reward_config.get('cycle_excess_penalty', 3000.0),
-            soc_penalty_caution=self.reward_config.get('soc_penalty_caution', 60.0),
-            soc_penalty_warning=self.reward_config.get('soc_penalty_warning', 180.0),
-            soc_penalty_critical=self.reward_config.get('soc_penalty_critical', 480.0),
+            soc_penalty_coeff=self.reward_config.get('soc_penalty_coeff', 0.05),
             reward_scale=self.reward_config.get('reward_scale', 0.01)
         )
 
@@ -422,6 +418,8 @@ class BatteryEnvUnified(gym.Env):
         # I track episode
         self.episode_start_step = self.current_step
         self.episode_profit = 0.0
+        self.episode_shaping_penalty = 0.0
+        self.episode_net_profit = 0.0
 
         # I track SoC extremes over the episode
         self.episode_min_soc = 1.0
@@ -1028,11 +1026,11 @@ class BatteryEnvUnified(gym.Env):
                         self.soc = max(self.min_soc, self.soc - soc_delta)
                         actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
 
-                        # I use LAGGED mFRR price — the settlement price is ex-post,
-                        # so I use the best estimate available at decision time (1h lag).
+                        # I use CURRENT mFRR clearing price for settlement.
+                        # Same as IntraDay: agent decides without knowing the price,
+                        # but settlement uses the realized clearing price (production-like).
                         mfrr_price = min(
-                            row.get('mfrr_price_up_lag_1h',
-                                    row.get('mfrr_price_up', 120.0)),
+                            row.get('mfrr_price_up', 120.0),
                             self.mfrr_price_cap
                         )
                         mfrr_revenue = actual_energy * mfrr_price
@@ -1045,8 +1043,7 @@ class BatteryEnvUnified(gym.Env):
                         actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
 
                         mfrr_price = min(
-                            row.get('mfrr_price_down_lag_1h',
-                                    row.get('mfrr_price_down', 60.0)),
+                            row.get('mfrr_price_down', 60.0),
                             self.mfrr_price_cap
                         )
                         mfrr_revenue = actual_energy * mfrr_price
@@ -1274,6 +1271,8 @@ class BatteryEnvUnified(gym.Env):
         trading_pnl = reward_info['components'].get('trading_pnl', 0)
         self.total_profit += trading_pnl
         self.episode_profit += trading_pnl
+        self.episode_shaping_penalty += reward_info['components'].get('shaping_penalty', 0)
+        self.episode_net_profit += reward_info['components'].get('net_profit', 0)
 
         # =====================================================================
         # STAGE 11: ADVANCE STEP
@@ -2226,6 +2225,8 @@ class BatteryEnvUnified(gym.Env):
             'daily_cycles': self.daily_cycles,
             'episode_min_soc': self.episode_min_soc,
             'episode_max_soc': self.episode_max_soc,
+            'episode_shaping_penalty': self.episode_shaping_penalty,
+            'episode_net_profit': self.episode_net_profit,
         }
         if self.enable_full_market:
             info.update({

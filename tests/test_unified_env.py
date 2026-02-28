@@ -539,7 +539,7 @@ class TestUnifiedRewardCalculator:
 
 
 class TestCalendarAging:
-    """I test the tiered calendar aging cost that penalizes extreme SoC."""
+    """I test the quadratic SoC deviation penalty: coeff × (|SoC% - 50|)²."""
 
     @staticmethod
     def _idle_market():
@@ -569,80 +569,65 @@ class TestCalendarAging:
         )
         return result['components']['calendar_aging_cost']
 
-    def test_zero_cost_in_safe_zone(self):
-        """I verify calendar aging is zero in the 30-70% safe zone."""
-        for soc in [0.30, 0.40, 0.50, 0.60, 0.70]:
-            cost = self._cost_at_soc(soc)
-            assert cost == pytest.approx(0.0, abs=1e-6), \
-                f"Calendar aging should be zero at {soc:.0%} SoC (safe zone)"
+    def test_zero_cost_at_50_pct(self):
+        """I verify zero penalty at exactly 50% SoC."""
+        assert self._cost_at_soc(0.50) == pytest.approx(0.0, abs=1e-6)
 
-    def test_symmetric_around_center(self):
-        """I verify the penalty is symmetric: cost at 20% == cost at 80%."""
-        for low, high in [(0.25, 0.75), (0.20, 0.80), (0.10, 0.90), (0.05, 0.95)]:
+    def test_quadratic_values(self):
+        """I verify penalty = 0.05 × (|SoC% - 50|)² at default coeff=0.05."""
+        # At 40%: deviation=10, 0.05 × 100 = 5
+        assert self._cost_at_soc(0.40) == pytest.approx(5.0, abs=0.01)
+        # At 30%: deviation=20, 0.05 × 400 = 20
+        assert self._cost_at_soc(0.30) == pytest.approx(20.0, abs=0.01)
+        # At 20%: deviation=30, 0.05 × 900 = 45
+        assert self._cost_at_soc(0.20) == pytest.approx(45.0, abs=0.01)
+        # At 5%: deviation=45, 0.05 × 2025 = 101.25
+        assert self._cost_at_soc(0.05) == pytest.approx(101.25, abs=0.01)
+
+    def test_symmetric_around_50(self):
+        """I verify the penalty is symmetric: cost at 30% == cost at 70%."""
+        for low, high in [(0.40, 0.60), (0.30, 0.70), (0.20, 0.80), (0.05, 0.95)]:
             cost_low = self._cost_at_soc(low)
             cost_high = self._cost_at_soc(high)
             assert cost_low == pytest.approx(cost_high, abs=0.01), \
                 f"Cost at {low:.0%} ({cost_low:.2f}) should equal cost at {high:.0%} ({cost_high:.2f})"
 
-    def test_tiered_escalation(self):
-        """I verify costs escalate through caution → warning → critical zones."""
-        # Caution zone: 20-30%, rate=60 per unit SoC
-        # At 25% (d=0.05): 0.05 * 60 = 3.0
-        assert self._cost_at_soc(0.25) == pytest.approx(3.0, abs=0.01)
-        # At 20% (d=0.10): 0.10 * 60 = 6.0
-        assert self._cost_at_soc(0.20) == pytest.approx(6.0, abs=0.01)
-        # Warning zone: 10-20%, rate=180 per unit SoC (cumulative)
-        # At 15% (d=0.15): 6.0 + 0.05 * 180 = 15.0
-        assert self._cost_at_soc(0.15) == pytest.approx(15.0, abs=0.01)
-        # At 10% (d=0.20): 6.0 + 0.10 * 180 = 24.0
-        assert self._cost_at_soc(0.10) == pytest.approx(24.0, abs=0.01)
-        # Critical zone: <10%, rate=480 per unit SoC (cumulative)
-        # At 5% (d=0.25): 24.0 + 0.05 * 480 = 48.0
-        assert self._cost_at_soc(0.05) == pytest.approx(48.0, abs=0.01)
-
-    def test_monotonically_increasing(self):
-        """I verify cost increases monotonically as SoC moves from safe zone."""
-        soc_levels = [0.70, 0.65, 0.50, 0.35, 0.30, 0.25, 0.20, 0.15, 0.10, 0.05]
+    def test_monotonically_increasing_from_center(self):
+        """I verify cost increases monotonically as SoC moves away from 50%."""
+        soc_levels = [0.50, 0.45, 0.40, 0.35, 0.30, 0.20, 0.10, 0.05]
         costs = [self._cost_at_soc(s) for s in soc_levels]
-        # I check first 5 are zero (safe zone), then strictly increasing
-        for i in range(5):
-            assert costs[i] == pytest.approx(0.0, abs=1e-6)
-        for i in range(5, len(costs) - 1):
+        for i in range(len(costs) - 1):
             assert costs[i] < costs[i + 1], \
                 f"Cost at SoC={soc_levels[i]:.0%} ({costs[i]:.2f}) should be < cost at {soc_levels[i+1]:.0%} ({costs[i+1]:.2f})"
 
-    def test_included_in_net_profit(self):
-        """I verify calendar aging cost reduces net profit at extremes."""
+    def test_does_not_affect_trading_pnl(self):
+        """I verify the penalty is shaping only — trading_pnl stays the same."""
         calc = self._make_calc()
         result_50 = calc.calculate(
             market=self._idle_market(), actual_energy_mw=0.0,
             afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
             current_soc=0.5, capacity_mwh=146.0
         )
-        result_95 = calc.calculate(
+        result_05 = calc.calculate(
             market=self._idle_market(), actual_energy_mw=0.0,
             afrr_capacity_committed_mw=0.0, afrr_energy_delivered_mw=0.0,
-            current_soc=0.95, capacity_mwh=146.0
+            current_soc=0.05, capacity_mwh=146.0
         )
-        assert result_50['components']['net_profit'] > result_95['components']['net_profit'], \
-            "Sitting idle at 50% should yield higher net profit than at 95%"
+        # I verify trading_pnl is identical (no real cost difference)
+        assert result_50['components']['trading_pnl'] == pytest.approx(
+            result_05['components']['trading_pnl'], abs=0.01)
+        # I verify net_profit differs (shaping penalty applied)
+        assert result_50['components']['net_profit'] > result_05['components']['net_profit']
 
-    def test_rates_configurable(self):
-        """I verify the tiered rates flow from constructor to calculation."""
-        # I use custom rates and verify
-        cost = self._cost_at_soc(0.05,
-                                  soc_penalty_caution=100.0,
-                                  soc_penalty_warning=300.0,
-                                  soc_penalty_critical=1000.0)
-        # d=0.25: 0.10*100 + 0.10*300 + 0.05*1000 = 10 + 30 + 50 = 90
-        assert cost == pytest.approx(90.0, abs=0.01)
+    def test_coeff_configurable(self):
+        """I verify the coefficient flows from constructor to calculation."""
+        # At 5% SoC with coeff=5: deviation=45, 5 × 2025 = 10125
+        cost = self._cost_at_soc(0.05, soc_penalty_coeff=5.0)
+        assert cost == pytest.approx(10125.0, abs=0.01)
 
-    def test_zero_rates_disable(self):
-        """I verify setting all rates to 0 disables calendar aging."""
-        cost = self._cost_at_soc(0.05,
-                                  soc_penalty_caution=0.0,
-                                  soc_penalty_warning=0.0,
-                                  soc_penalty_critical=0.0)
+    def test_zero_coeff_disables(self):
+        """I verify setting coeff=0 disables the penalty entirely."""
+        cost = self._cost_at_soc(0.05, soc_penalty_coeff=0.0)
         assert cost == pytest.approx(0.0, abs=1e-6)
 
 

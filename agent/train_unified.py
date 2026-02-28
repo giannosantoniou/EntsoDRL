@@ -154,6 +154,10 @@ class TensorboardLoggingCallback(BaseCallback):
         self.episode_min_socs = []
         self.episode_max_socs = []
 
+        # I track shaping penalty and net profit (reward) per episode
+        self.episode_shaping_penalties = []
+        self.episode_net_profits = []
+
         # I track participation counts per episode
         self.afrr_bids_per_ep = []
         self.afrr_selections_per_ep = []
@@ -218,6 +222,8 @@ class TensorboardLoggingCallback(BaseCallback):
                 self.mfrr_profits.append(info.get('mfrr_profit', 0))
                 self.episode_min_socs.append(info.get('episode_min_soc', 0.5))
                 self.episode_max_socs.append(info.get('episode_max_soc', 0.5))
+                self.episode_shaping_penalties.append(info.get('episode_shaping_penalty', 0))
+                self.episode_net_profits.append(info.get('episode_net_profit', 0))
                 if 'ida_profit' in info:
                     self.ida_profits.append(info['ida_profit'])
                 if 'xbid_profit' in info:
@@ -256,6 +262,11 @@ class TensorboardLoggingCallback(BaseCallback):
                 self.logger.record('soc/avg_max_soc', np.mean(self.episode_max_socs[-100:]))
                 self.logger.record('soc/worst_min_soc', np.min(self.episode_min_socs[-100:]))
                 self.logger.record('soc/worst_max_soc', np.max(self.episode_max_socs[-100:]))
+
+            # I log shaping penalty and net profit to see reward vs real P&L gap
+            if len(self.episode_shaping_penalties) > 0:
+                self.logger.record('custom/avg_shaping_penalty', np.mean(self.episode_shaping_penalties[-100:]))
+                self.logger.record('custom/avg_net_profit', np.mean(self.episode_net_profits[-100:]))
 
             # I log full-market mode metrics from episode-level accumulators
             if self.ida_profits:
@@ -343,11 +354,7 @@ def create_training_env(
             'degradation_cost': 25.0,
             'dam_violation_penalty': 800.0,
             'afrr_nonresponse_penalty': 500.0,
-            'cycle_target': 2.0,
-            'cycle_excess_penalty': 3000.0,
-            'soc_penalty_caution': 60.0,
-            'soc_penalty_warning': 180.0,
-            'soc_penalty_critical': 480.0,
+            'soc_penalty_coeff': 0.05,
             'reward_scale': 0.01
         }
 
@@ -710,11 +717,7 @@ def train_unified_model(
         'mfrr_activation_rate': mfrr_activation_rate,
         'mfrr_price_cap': mfrr_price_cap,
         'degradation_cost': 25.0,
-        'cycle_target': 2.0,
-        'cycle_excess_penalty': 3000.0,
-        'soc_penalty_caution': 60.0,
-        'soc_penalty_warning': 180.0,
-        'soc_penalty_critical': 480.0,
+        'soc_penalty_coeff': 0.05,
         'timestamp': timestamp
     }
 
@@ -866,11 +869,7 @@ def evaluate_model(
         'degradation_cost': eval_degradation,
         'dam_violation_penalty': 800.0,
         'afrr_nonresponse_penalty': 500.0,
-        'cycle_target': train_cfg.get('cycle_target', 2.0),
-        'cycle_excess_penalty': train_cfg.get('cycle_excess_penalty', 3000.0),
-        'soc_penalty_caution': train_cfg.get('soc_penalty_caution', 60.0),
-        'soc_penalty_warning': train_cfg.get('soc_penalty_warning', 180.0),
-        'soc_penalty_critical': train_cfg.get('soc_penalty_critical', 480.0),
+        'soc_penalty_coeff': train_cfg.get('soc_penalty_coeff', 0.05),
         'reward_scale': 0.01
     }
     print(f"  Eval degradation_cost: {eval_degradation} EUR/MWh")
@@ -980,8 +979,8 @@ def evaluate_model(
 
             info = info[0]
             last_info = info
-            step_net_profit = info.get('net_profit', 0)
-            episode_profit += step_net_profit
+            step_trading_pnl = info.get('trading_pnl', 0)
+            episode_profit += step_trading_pnl
             episode_length += 1
 
             # I accumulate cost components for full accounting
@@ -1078,7 +1077,9 @@ def evaluate_model(
         gross_sum = sum(market_summary.values())
         total_costs = episode_degradation + episode_dam_violation + episode_afrr_nonresponse + episode_physical_penalty + episode_cycle_excess + episode_calendar_aging
 
-        print(f"Episode {episode + 1}: Profit={episode_profit:,.0f} EUR, "
+        shaped_profit = episode_profit - episode_calendar_aging - episode_cycle_excess - episode_physical_penalty + episode_dam_bonus
+        print(f"Episode {episode + 1}: TradingPnL={episode_profit:,.0f} EUR, "
+              f"Shaped={shaped_profit:,.0f} EUR, "
               f"Cycles={episode_cycles:.2f}, "
               f"Gross={gross_sum:,.0f}")
         print(f"  Markets: DAM={market_summary['dam']:,.0f}, "
@@ -1095,7 +1096,7 @@ def evaluate_model(
               f"CalAging={episode_calendar_aging:,.0f}, "
               f"DAM_bonus=+{episode_dam_bonus:,.0f}")
         if abs(episode_profit - env_total_profit) > 1.0:
-            print(f"  WARNING: profit mismatch! accumulated={episode_profit:,.0f} "
+            print(f"  WARNING: trading_pnl mismatch! accumulated={episode_profit:,.0f} "
                   f"vs env.total_profit={env_total_profit:,.0f}")
 
     # I close the trace file if it was opened
@@ -1140,10 +1141,10 @@ def evaluate_model(
     print("EVALUATION SUMMARY")
     print("=" * 60)
     print(f"Episodes:       {n_episodes}")
-    print(f"Mean Profit:    {results['mean_profit']:,.0f} EUR "
+    print(f"Mean Trading PnL: {results['mean_profit']:,.0f} EUR "
           f"(+/-{results['std_profit']:,.0f})")
-    print(f"Mean Cycles:    {results['mean_cycles']:.2f}")
-    print(f"Profit/Cycle:   {results['profit_per_cycle']:,.0f} EUR")
+    print(f"Mean Cycles:      {results['mean_cycles']:.2f}")
+    print(f"PnL/Cycle:        {results['profit_per_cycle']:,.0f} EUR")
     print(f"DAM Violations: {results['dam_violation_rate']:.2%}")
     print(f"aFRR Activations: {results['afrr_activation_rate']:.2%}")
     print(f"\nPer-Market Gross Revenue (mean):")
@@ -1161,7 +1162,7 @@ def evaluate_model(
     print(f"  {'dam_bonus':>16s}: {mean_bonuses:>+10,.0f} EUR")
     print(f"\nAccounting: Gross({mean_gross:,.0f}) - Costs({mean_total_costs:,.0f}) "
           f"+ Bonus({mean_bonuses:,.0f}) = {mean_gross - mean_total_costs + mean_bonuses:,.0f}")
-    print(f"Reported Net:  {results['mean_profit']:,.0f} EUR")
+    print(f"Reported Trading PnL:  {results['mean_profit']:,.0f} EUR")
 
     return results
 
