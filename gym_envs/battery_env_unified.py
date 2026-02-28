@@ -1218,12 +1218,16 @@ class BatteryEnvUnified(gym.Env):
         # =====================================================================
         # STAGE 10: CALCULATE REWARD
         # =====================================================================
+        # I use ADMIE single imbalance price for IntraDay settlement (no bid-ask spread)
+        imbalance_price = row.get('imbalance_price', row.get('price', 100.0))
+        if np.isnan(imbalance_price) or imbalance_price <= 0:
+            imbalance_price = row.get('price', 100.0)
         market_state = UnifiedMarketState(
             dam_price=row.get('price', 100.0),
             dam_commitment=dam_commitment,
-            intraday_bid=row.get('intraday_bid', row.get('price', 100.0) - 2.0),
-            intraday_ask=row.get('intraday_ask', row.get('price', 100.0) + 2.0),
-            intraday_spread=row.get('intraday_spread', 4.0),
+            intraday_bid=imbalance_price,   # single pricing (was ISP1 UP)
+            intraday_ask=imbalance_price,   # single pricing (was ISP1 DOWN)
+            intraday_spread=0.0,            # no bid-ask spread in single pricing
             afrr_cap_up_price=row.get('afrr_cap_up_price', 20.0),
             afrr_cap_down_price=row.get('afrr_cap_down_price', 30.0),
             afrr_energy_up_price=row.get('afrr_up', 80.0),
@@ -1232,7 +1236,7 @@ class BatteryEnvUnified(gym.Env):
             afrr_activation_direction=afrr_direction,
             mfrr_price_up=row.get('mfrr_price_up', 120.0),
             mfrr_price_down=row.get('mfrr_price_down', 60.0),
-            # IDA sub-market fields (full market mode) — I pass ISP prices
+            # IDA sub-market fields (full market mode) — I pass clearing prices
             ida1_clearing_price=row.get('ida1_clearing_price', 0.0),
             ida2_clearing_price=row.get('ida2_clearing_price', 0.0),
             ida3_clearing_price=row.get('ida3_clearing_price', 0.0) if not np.isnan(row.get('ida3_clearing_price', 0.0)) else 0.0,
@@ -1654,31 +1658,28 @@ class BatteryEnvUnified(gym.Env):
         dam_price = row.get('price', 100.0)
         features.append(dam_price / 100.0)  # [3] DAM price
 
-        # I use XBID lag prices for accurate IntraDay signal (preferred over
-        # ISP1 settlement prices which have balancing-market convention mismatch).
-        # With battery convention fix, intraday_bid = sell/UP price, intraday_ask = buy/DOWN price.
-        id_bid = row.get('xbid_bid_lag_1h', row.get('intraday_bid_lag_1h', 0.0))
-        id_ask = row.get('xbid_ask_lag_1h', row.get('intraday_ask_lag_1h', 0.0))
-        id_spread = abs(id_ask - id_bid) if (id_bid > 0 and id_ask > 0) else row.get('intraday_spread_lag_1h', 0.0)
-        id_volume = row.get('intraday_volume_lag_1h', 0.5)
-        features.append(id_bid / 100.0)      # [4] IntraDay bid
-        features.append(id_ask / 100.0)      # [5] IntraDay ask
-        features.append(id_spread / 100.0)   # [6] IntraDay spread
-        features.append(id_volume)            # [7] IntraDay volume (already 0-1)
+        # I use single imbalance pricing — no bid/ask spread for non-IDA settlement.
+        # The ADMIE imbalance price is the single settlement price for deviations.
+        # Profit comes from timing (trade when imbalance_price ≠ DAM), not from spread.
+        imb_price_lag = row.get('imbalance_price_lag_1h', dam_price)
+        net_imb_lag = row.get('net_imbalance_mw_lag_1h',
+                              row.get('net_imbalance_mw', 0.0))
+        features.append(imb_price_lag / 100.0)                    # [4] Imbalance settlement price (1h lag)
+        features.append(np.sign(net_imb_lag))                      # [5] System direction (-1/0/+1)
+        features.append(min(abs(net_imb_lag) / 500.0, 1.0))       # [6] System imbalance magnitude (norm)
+        features.append(row.get('intraday_volume_lag_1h', 0.5))   # [7] Volume
 
         # mFRR prices (lagged — NO fallback to current-step)
         mfrr_up = row.get('mfrr_price_up_lag_1h', 0.0)
         mfrr_down = row.get('mfrr_price_down_lag_1h', 0.0)
         features.append(mfrr_up / 100.0)     # [8] mFRR up
         features.append(mfrr_down / 100.0)   # [9] mFRR down
-
-        # mFRR spread
         features.append((mfrr_up - mfrr_down) / 100.0)  # [10] mFRR spread
 
         # Cross-market signals (help agent pick the best market)
-        features.append((id_bid - dam_price) / 100.0)    # [11] IntraDay-DAM spread
-        features.append((mfrr_up - dam_price) / 100.0)   # [12] mFRR premium over DAM
-        features.append((mfrr_up - id_ask) / 100.0)      # [13] mFRR-IntraDay spread
+        features.append((imb_price_lag - dam_price) / 100.0)      # [11] Imbalance-DAM spread (key signal)
+        features.append((mfrr_up - dam_price) / 100.0)            # [12] mFRR premium over DAM
+        features.append((mfrr_up - imb_price_lag) / 100.0)        # [13] mFRR-Imbalance spread
 
         # =====================================================================
         # 3. TIME ENCODING (4 features)
@@ -2024,11 +2025,11 @@ class BatteryEnvUnified(gym.Env):
             features.append(row.get('ida1_position', 0.0) / self.max_power_mw)    # [63]
             features.append(row.get('ida2_position', 0.0) / self.max_power_mw)    # [64]
             features.append(row.get('ida3_position', 0.0) / self.max_power_mw)    # [65]
-            # [66]: Lagged ISP1 sell price (1h ago) — current ISP1 is the settlement
-            # price, not yet known at decision time. I use lag-1h instead.
-            features.append(row.get('intraday_bid_lag_1h', dam_price) / 100.0)   # [66]
-            # [67]: Lagged ISP1 buy price (1h ago) — same reasoning.
-            features.append(row.get('intraday_ask_lag_1h', dam_price) / 100.0)   # [67]
+            # [66]: Lagged imbalance settlement price (single pricing)
+            features.append(row.get('imbalance_price_lag_1h', dam_price) / 100.0)   # [66]
+            # [67]: System direction signal (helps agent decide sell/buy timing)
+            features.append(np.sign(row.get('net_imbalance_mw_lag_1h',
+                                            row.get('net_imbalance_mw', 0.0))))     # [67]
             features.append(row.get('net_ida_position', 0.0) / self.max_power_mw) # [68]
             features.append(1.0 if self._is_intraday_open(row) else 0.0)          # [69]
 
@@ -2129,11 +2130,12 @@ class BatteryEnvUnified(gym.Env):
             return 0.0    # Before any IDA results
 
     def _get_intraday_sell_price(self, active_market, row):
-        """I return the sell (discharge) price using real ISP clearing data.
+        """I return the sell (discharge) price for IntraDay settlement.
 
-        I settle at ISP1 (known ~18h before delivery).
-        ISP2/ISP3 are future information at decision time — using them is data leakage.
-        ISP UP prices = what the battery receives for selling regulation energy.
+        I use ADMIE single imbalance pricing for non-IDA hours.
+        In the Greek market, all deviations settle at one imbalance_price —
+        there is no separate UP/DOWN bid-ask spread. Profit comes from timing
+        (trade when imbalance_price ≠ DAM), not from a guaranteed spread.
         For IDA auctions, I still use the IDA clearing price.
         """
         if active_market in ('ida1', 'ida2', 'ida3'):
@@ -2145,18 +2147,19 @@ class BatteryEnvUnified(gym.Env):
                 if ts.hour < 14:
                     id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
             return id_price
-        # I use ISP1 only — ISP2/ISP3 are future information at decision time
-        p1 = row.get('isp1_price_up', np.nan)
-        if not np.isnan(p1) and p1 > 0:
-            return p1
-        return row.get('price', 100.0)
+        # I use ADMIE single imbalance price for both buy AND sell
+        imb = row.get('imbalance_price', np.nan)
+        if not np.isnan(imb) and imb > 0:
+            return imb
+        return row.get('price', 100.0)  # DAM fallback
 
     def _get_intraday_buy_price(self, active_market, row):
-        """I return the buy (charge) price using real ISP clearing data.
+        """I return the buy (charge) price for IntraDay settlement.
 
-        I settle at ISP1 (known ~18h before delivery).
-        ISP2/ISP3 are future information at decision time — using them is data leakage.
-        ISP DOWN prices = what the battery pays for buying regulation energy.
+        I use ADMIE single imbalance pricing for non-IDA hours.
+        In the Greek market, all deviations settle at one imbalance_price —
+        there is no separate UP/DOWN bid-ask spread. The price already encodes
+        system direction: HIGH during deficit, LOW during surplus.
         For IDA auctions, I still use the IDA clearing price.
         """
         if active_market in ('ida1', 'ida2', 'ida3'):
@@ -2168,11 +2171,11 @@ class BatteryEnvUnified(gym.Env):
                 if ts.hour < 14:
                     id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
             return id_price
-        # I use ISP1 only — ISP2/ISP3 are future information at decision time
-        p1 = row.get('isp1_price_down', np.nan)
-        if not np.isnan(p1) and p1 > 0:
-            return p1
-        return row.get('price', 100.0)
+        # I use ADMIE single imbalance price for both buy AND sell
+        imb = row.get('imbalance_price', np.nan)
+        if not np.isnan(imb) and imb > 0:
+            return imb
+        return row.get('price', 100.0)  # DAM fallback
 
     def _simulate_free_bid_activation(self, bid_price, ref_price, imbalance, row):
         """I simulate merit-order based Free Bid activation."""
