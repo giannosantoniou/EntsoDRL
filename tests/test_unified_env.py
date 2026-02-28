@@ -3743,6 +3743,75 @@ class TestObservationNoLeakage:
         assert obs[cascade_idx] == pytest.approx(lagged_norm, abs=0.01), \
             f"Full-market cascade spread should be lagged (0.05), got {obs[cascade_idx]}"
 
+    def test_full_market_isp_prices_are_lagged(self, sample_data):
+        """I verify full-market obs features [66],[67] use lagged ISP1 prices,
+        not current settlement prices. The current ISP1 price is the settlement
+        price — the agent must NOT see it before trading."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data.copy()
+        # I set current ISP1 to a distinctive value and lag to a different one
+        df['isp1_price_up'] = 200.0    # current settlement (should NOT appear)
+        df['isp1_price_down'] = 180.0  # current settlement (should NOT appear)
+        # intraday_bid = isp1_price_up in real data, so lag = shift(sph)
+        df['intraday_bid_lag_1h'] = 90.0   # lagged (should appear)
+        df['intraday_ask_lag_1h'] = 85.0   # lagged (should appear)
+
+        env = BatteryEnvUnified(
+            df=df, episode_length=72, random_start=False,
+            enable_full_market=True
+        )
+        env.reset(seed=42)
+        obs = env._build_observation()
+
+        # Full-market Group 10 starts at index 64. Features:
+        # [63]=ida1_pos, [64]=ida2_pos, [65]=ida3_pos, [66]=ISP sell, [67]=ISP buy
+        # So [66] is at index 64+3=67, [67] is at index 64+4=68
+        sell_idx = 64 + 3  # feature [66]
+        buy_idx = 64 + 4   # feature [67]
+
+        # I verify the observation uses lagged values, not current settlement
+        current_sell_norm = 200.0 / 100.0  # 2.0
+        current_buy_norm = 180.0 / 100.0   # 1.8
+        lagged_sell_norm = 90.0 / 100.0    # 0.9
+        lagged_buy_norm = 85.0 / 100.0     # 0.85
+
+        assert obs[sell_idx] == pytest.approx(lagged_sell_norm, abs=0.01), \
+            f"Full-market ISP sell should be lagged (0.9), got {obs[sell_idx]}"
+        assert obs[buy_idx] == pytest.approx(lagged_buy_norm, abs=0.01), \
+            f"Full-market ISP buy should be lagged (0.85), got {obs[buy_idx]}"
+        assert obs[sell_idx] != pytest.approx(current_sell_norm, abs=0.01), \
+            "Full-market ISP sell should NOT show current settlement price"
+
+    def test_base_obs_no_current_isp1(self, sample_data):
+        """I verify the base 64-feature observation doesn't contain the current
+        ISP1 settlement price. Only lagged values should appear."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data.copy()
+        # I set ISP1 to a unique value unlikely to appear by coincidence
+        df['isp1_price_up'] = 777.77
+        df['isp1_price_down'] = 666.66
+        # I set lagged values to something different
+        df['intraday_bid_lag_1h'] = 90.0
+        df['intraday_ask_lag_1h'] = 85.0
+
+        env = BatteryEnvUnified(
+            df=df, episode_length=72, random_start=False
+        )
+        env.reset(seed=42)
+        obs = env._build_observation()
+
+        # I check that the unique current ISP1 values don't appear in the 64-feature obs
+        isp1_sell_norm = 777.77 / 100.0  # 7.7777
+        isp1_buy_norm = 666.66 / 100.0   # 6.6666
+
+        obs_rounded = [round(v, 3) for v in obs.tolist()]
+        assert round(isp1_sell_norm, 3) not in obs_rounded, \
+            f"Current ISP1 sell ({isp1_sell_norm}) found in base observation — data leakage!"
+        assert round(isp1_buy_norm, 3) not in obs_rounded, \
+            f"Current ISP1 buy ({isp1_buy_norm}) found in base observation — data leakage!"
+
 
 class TestForecastColumnsNoLeakage:
     """I verify forecast columns in create_unified_training_data don't use future data."""

@@ -2024,10 +2024,11 @@ class BatteryEnvUnified(gym.Env):
             features.append(row.get('ida1_position', 0.0) / self.max_power_mw)    # [63]
             features.append(row.get('ida2_position', 0.0) / self.max_power_mw)    # [64]
             features.append(row.get('ida3_position', 0.0) / self.max_power_mw)    # [65]
-            # [66]: ISP1 sell price — no ISP3 leakage (uses fixed _get_intraday_sell_price)
-            features.append(self._get_intraday_sell_price(None, row) / 100.0)     # [66]
-            # [67]: ISP1 buy price — no ISP3 leakage (uses fixed _get_intraday_buy_price)
-            features.append(self._get_intraday_buy_price(None, row) / 100.0)      # [67]
+            # [66]: Lagged ISP1 sell price (1h ago) — current ISP1 is the settlement
+            # price, not yet known at decision time. I use lag-1h instead.
+            features.append(row.get('intraday_bid_lag_1h', dam_price) / 100.0)   # [66]
+            # [67]: Lagged ISP1 buy price (1h ago) — same reasoning.
+            features.append(row.get('intraday_ask_lag_1h', dam_price) / 100.0)   # [67]
             features.append(row.get('net_ida_position', 0.0) / self.max_power_mw) # [68]
             features.append(1.0 if self._is_intraday_open(row) else 0.0)          # [69]
 
