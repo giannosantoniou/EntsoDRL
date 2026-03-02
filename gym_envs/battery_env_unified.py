@@ -836,7 +836,8 @@ class BatteryEnvUnified(gym.Env):
                     self.soc = max(self.min_soc, self.soc - soc_delta)
                     actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
 
-                    afrr_price = row.get('afrr_up', 80.0)
+                    # I apply ADMIE "highest value rule": max(aFRR, mFRR)
+                    afrr_price = max(row.get('afrr_up', 80.0), row.get('mfrr_price_up', 0.0))
                     afrr_energy_revenue = actual_energy * afrr_price
 
                     cycle_fraction = actual_energy / self.capacity_mwh
@@ -854,7 +855,8 @@ class BatteryEnvUnified(gym.Env):
                     self.soc = min(self.max_soc, self.soc + soc_delta)
                     actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
 
-                    afrr_price = row.get('afrr_down', 80.0)
+                    # I apply ADMIE "highest value rule": max(aFRR, mFRR)
+                    afrr_price = max(row.get('afrr_down', 80.0), row.get('mfrr_price_down', 0.0))
                     afrr_energy_revenue = -actual_energy * afrr_price
 
                     cycle_fraction = actual_energy / self.capacity_mwh

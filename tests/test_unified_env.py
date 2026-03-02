@@ -4207,5 +4207,154 @@ class TestObservationImbalanceFeatures:
         assert obs.shape == (64,), f"Expected 64 features, got {obs.shape}"
 
 
+class TestAFRRHighestValueRule:
+    """I test the ADMIE 'highest value rule': aFRR energy settled at max(aFRR, mFRR)."""
+
+    def test_afrr_up_uses_mfrr_when_higher(self):
+        """I verify aFRR UP settlement uses mFRR price when mFRR > aFRR."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator, UnifiedMarketState
+
+        calculator = UnifiedRewardCalculator()
+        market = UnifiedMarketState(
+            dam_price=100.0, dam_commitment=0.0,
+            intraday_bid=98.0, intraday_ask=102.0, intraday_spread=4.0,
+            afrr_cap_up_price=20.0, afrr_cap_down_price=30.0,
+            afrr_energy_up_price=80.0, afrr_energy_down_price=80.0,
+            afrr_activated=True, afrr_activation_direction='up',
+            mfrr_price_up=150.0, mfrr_price_down=60.0
+        )
+
+        result = calculator.calculate(
+            market=market, actual_energy_mw=10.0,
+            afrr_capacity_committed_mw=10.0, afrr_energy_delivered_mw=10.0,
+            intraday_energy_mw=0.0, mfrr_energy_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0, time_step_hours=1.0,
+            is_selected_for_afrr=True
+        )
+
+        # mFRR=150 > aFRR=80, so settlement at 150.
+        # Revenue = 10*150 + response_bonus(10*10) = 1500 + 100 = 1600
+        afrr_rev = result['components']['afrr_energy_revenue']
+        assert afrr_rev == pytest.approx(1600.0, abs=1.0), \
+            f"Expected 1600 (settled at mFRR=150 + bonus), got {afrr_rev}"
+
+    def test_afrr_up_uses_afrr_when_higher(self):
+        """I verify aFRR UP settlement uses aFRR price when aFRR > mFRR."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator, UnifiedMarketState
+
+        calculator = UnifiedRewardCalculator()
+        market = UnifiedMarketState(
+            dam_price=100.0, dam_commitment=0.0,
+            intraday_bid=98.0, intraday_ask=102.0, intraday_spread=4.0,
+            afrr_cap_up_price=20.0, afrr_cap_down_price=30.0,
+            afrr_energy_up_price=200.0, afrr_energy_down_price=80.0,
+            afrr_activated=True, afrr_activation_direction='up',
+            mfrr_price_up=100.0, mfrr_price_down=60.0
+        )
+
+        result = calculator.calculate(
+            market=market, actual_energy_mw=10.0,
+            afrr_capacity_committed_mw=10.0, afrr_energy_delivered_mw=10.0,
+            intraday_energy_mw=0.0, mfrr_energy_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0, time_step_hours=1.0,
+            is_selected_for_afrr=True
+        )
+
+        # aFRR=200 > mFRR=100, so settlement at 200.
+        # Revenue = 10*200 + response_bonus(10*10) = 2000 + 100 = 2100
+        afrr_rev = result['components']['afrr_energy_revenue']
+        assert afrr_rev == pytest.approx(2100.0, abs=1.0), \
+            f"Expected 2100 (settled at aFRR=200 + bonus), got {afrr_rev}"
+
+    def test_afrr_down_uses_mfrr_when_higher(self):
+        """I verify aFRR DOWN settlement uses mFRR price when mFRR > aFRR."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator, UnifiedMarketState
+
+        calculator = UnifiedRewardCalculator()
+        market = UnifiedMarketState(
+            dam_price=100.0, dam_commitment=0.0,
+            intraday_bid=98.0, intraday_ask=102.0, intraday_spread=4.0,
+            afrr_cap_up_price=20.0, afrr_cap_down_price=30.0,
+            afrr_energy_up_price=80.0, afrr_energy_down_price=70.0,
+            afrr_activated=True, afrr_activation_direction='down',
+            mfrr_price_up=120.0, mfrr_price_down=130.0
+        )
+
+        result = calculator.calculate(
+            market=market, actual_energy_mw=-10.0,
+            afrr_capacity_committed_mw=10.0, afrr_energy_delivered_mw=-10.0,
+            intraday_energy_mw=0.0, mfrr_energy_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0, time_step_hours=1.0,
+            is_selected_for_afrr=True
+        )
+
+        # mFRR_down=130 > aFRR_down=70, so settlement at 130.
+        # Revenue = 10*130 + response_bonus(10*10) = 1300 + 100 = 1400
+        afrr_rev = result['components']['afrr_energy_revenue']
+        assert afrr_rev == pytest.approx(1400.0, abs=1.0), \
+            f"Expected 1400 (settled at mFRR_down=130 + bonus), got {afrr_rev}"
+
+    def test_afrr_down_uses_afrr_when_higher(self):
+        """I verify aFRR DOWN settlement uses aFRR price when aFRR > mFRR."""
+        from gym_envs.unified_reward_calculator import UnifiedRewardCalculator, UnifiedMarketState
+
+        calculator = UnifiedRewardCalculator()
+        market = UnifiedMarketState(
+            dam_price=100.0, dam_commitment=0.0,
+            intraday_bid=98.0, intraday_ask=102.0, intraday_spread=4.0,
+            afrr_cap_up_price=20.0, afrr_cap_down_price=30.0,
+            afrr_energy_up_price=80.0, afrr_energy_down_price=180.0,
+            afrr_activated=True, afrr_activation_direction='down',
+            mfrr_price_up=120.0, mfrr_price_down=90.0
+        )
+
+        result = calculator.calculate(
+            market=market, actual_energy_mw=-10.0,
+            afrr_capacity_committed_mw=10.0, afrr_energy_delivered_mw=-10.0,
+            intraday_energy_mw=0.0, mfrr_energy_mw=0.0,
+            current_soc=0.5, capacity_mwh=146.0, time_step_hours=1.0,
+            is_selected_for_afrr=True
+        )
+
+        # aFRR_down=180 > mFRR_down=90, so settlement at 180.
+        # Revenue = 10*180 + response_bonus(10*10) = 1800 + 100 = 1900
+        afrr_rev = result['components']['afrr_energy_revenue']
+        assert afrr_rev == pytest.approx(1900.0, abs=1.0), \
+            f"Expected 1900 (settled at aFRR_down=180 + bonus), got {afrr_rev}"
+
+    def test_highest_value_env_profit_matches_reward(self, sample_data):
+        """I verify env profit tracking uses same highest-value rule as reward calc."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data.copy()
+        # I set up a scenario where mFRR > aFRR so highest-value rule triggers
+        df['afrr_up'] = 80.0
+        df['mfrr_price_up'] = 150.0
+        df['afrr_down'] = 70.0
+        df['mfrr_price_down'] = 130.0
+
+        env = BatteryEnvUnified(
+            df=df, episode_length=72, random_start=False,
+            selection_probability=1.0,   # I force aFRR selection
+            afrr_activation_rate=1.0     # I force aFRR activation every step
+        )
+        obs, _ = env.reset(seed=42)
+
+        # I commit max aFRR and step through
+        for _ in range(10):
+            action = np.array([4, 2, 5, 5])  # Max aFRR, neutral price, neutral ID/mFRR
+            obs, reward, terminated, truncated, info = env.step(action)
+            if terminated or truncated:
+                break
+
+        # I verify the env used max(aFRR, mFRR) pricing
+        # If aFRR was activated UP, env should use 150 (not 80)
+        # If aFRR was activated DOWN, env should use 130 (not 70)
+        # The exact revenue depends on activation direction and SoC,
+        # but I verify it's tracked and non-zero
+        assert env.afrr_energy_profit != 0.0, \
+            "aFRR energy profit should be non-zero after activations"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

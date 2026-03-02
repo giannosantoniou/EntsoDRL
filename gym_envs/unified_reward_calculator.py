@@ -232,7 +232,9 @@ class UnifiedRewardCalculator:
                 # Must discharge
                 if afrr_energy_delivered_mw > 0.1:
                     # Good - I responded
-                    afrr_energy_revenue = afrr_energy_delivered_mw * market.afrr_energy_up_price * time_step_hours
+                    # I apply ADMIE "highest value rule": aFRR settled at max(aFRR, mFRR)
+                    settlement_price_up = max(market.afrr_energy_up_price, market.mfrr_price_up)
+                    afrr_energy_revenue = afrr_energy_delivered_mw * settlement_price_up * time_step_hours
                     # I add response bonus for timely compliance
                     if afrr_energy_delivered_mw >= required_power * 0.9:
                         afrr_energy_revenue += required_power * self.afrr_response_bonus * time_step_hours
@@ -249,7 +251,9 @@ class UnifiedRewardCalculator:
                 # Must charge
                 if afrr_energy_delivered_mw < -0.1:
                     # Good - I responded (delivered is negative for charging)
-                    afrr_energy_revenue = abs(afrr_energy_delivered_mw) * market.afrr_energy_down_price * time_step_hours
+                    # I apply ADMIE "highest value rule": aFRR settled at max(aFRR, mFRR)
+                    settlement_price_down = max(market.afrr_energy_down_price, market.mfrr_price_down)
+                    afrr_energy_revenue = abs(afrr_energy_delivered_mw) * settlement_price_down * time_step_hours
                     if abs(afrr_energy_delivered_mw) >= required_power * 0.9:
                         afrr_energy_revenue += required_power * self.afrr_response_bonus * time_step_hours
                 else:
