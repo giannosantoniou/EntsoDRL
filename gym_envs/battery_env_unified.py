@@ -463,11 +463,14 @@ class BatteryEnvUnified(gym.Env):
         return ts.dayofyear + ts.year * 1000
 
     def _check_day_reset(self):
-        """I reset daily cycling counter at day boundaries."""
+        """I reset daily cycling counter and regenerate DAM schedule at day boundaries."""
         current_day = self._get_current_day()
         if self.current_day is None or current_day != self.current_day:
             self.current_day = current_day
             self.daily_cycles = 0.0
+            # I regenerate endogenous DAM schedule for the new day
+            if self.enable_endogenous_dam:
+                self.dam_schedule = self._generate_endogenous_dam_schedule()
 
     def action_masks(self) -> np.ndarray:
         """

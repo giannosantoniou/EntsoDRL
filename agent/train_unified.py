@@ -463,7 +463,7 @@ def train_unified_model(
     forecaster_path: str = "models/intraday_forecaster.pkl",
     enable_market_forecast: bool = False,
     market_forecaster_path: str = "models/market_forecaster.pkl",
-    enable_endogenous_dam: bool = False,
+    enable_endogenous_dam: bool = True,  # I enable forecast-powered DAM bidding by default
     dam_bidder_min_spread: float = 30.0,
     mfrr_activation_rate: float = 0.35,
     mfrr_price_cap: float = 1000.0

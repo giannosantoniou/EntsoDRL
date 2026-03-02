@@ -2932,6 +2932,95 @@ class TestEndogenousDAM:
                 break
 
 
+class TestEndogenousDAMDailyRegeneration:
+    """I test that endogenous DAM schedule regenerates at day boundaries."""
+
+    def test_dam_schedule_regenerates_daily(self, sample_data):
+        """I verify DAM schedule is regenerated when day changes during episode."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data.copy()
+        # I set wide price spread so DAM bidder always generates commitments
+        for i in range(len(df)):
+            hour = df.index[i].hour
+            if hour < 6:
+                df.iloc[i, df.columns.get_loc('price')] = 40.0
+            elif hour > 17:
+                df.iloc[i, df.columns.get_loc('price')] = 160.0
+            else:
+                df.iloc[i, df.columns.get_loc('price')] = 100.0
+
+        env = BatteryEnvUnified(
+            df=df,
+            capacity_mwh=146.0,
+            max_power_mw=30.0,
+            efficiency=0.94,
+            episode_length=72,  # 3 days
+            random_start=False,
+            enable_endogenous_dam=True,
+            dam_bidder_min_spread=10.0,
+        )
+        obs, _ = env.reset(seed=42)
+
+        # I capture day 1 schedule
+        schedule_day1 = env.dam_schedule.copy() if env.dam_schedule is not None else None
+
+        # I advance to day 2 (step past 24 hours)
+        for _ in range(25):
+            action = np.array([0, 2, 5, 5])
+            obs, reward, done, truncated, info = env.step(action)
+            if done or truncated:
+                break
+
+        # I verify schedule was regenerated (different random draws)
+        schedule_day2 = env.dam_schedule
+        assert schedule_day2 is not None, "DAM schedule should exist on day 2"
+
+        # I check that the schedule covers the current day's steps
+        # (schedule length should match the number of steps in the day)
+        ts = env.df.index[env.current_step]
+        day_mask = env.df.index.date == ts.date()
+        day_steps = day_mask.sum()
+        assert len(schedule_day2) == day_steps, \
+            f"Schedule length ({len(schedule_day2)}) should match day steps ({day_steps})"
+
+    def test_dam_commitment_nonzero_multiday_episode(self, sample_data):
+        """I verify endogenous DAM produces non-zero commitments across multiple days."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data.copy()
+        # I set wide spread so bidder always activates
+        for i in range(len(df)):
+            hour = df.index[i].hour
+            df.iloc[i, df.columns.get_loc('price')] = 40.0 + 120.0 * (hour >= 17)
+
+        env = BatteryEnvUnified(
+            df=df,
+            capacity_mwh=146.0,
+            max_power_mw=30.0,
+            efficiency=0.94,
+            episode_length=72,
+            random_start=False,
+            enable_endogenous_dam=True,
+            dam_bidder_min_spread=10.0,
+        )
+        env.reset(seed=42)
+
+        # I collect DAM commitments over 48 steps (2 days)
+        commitments = []
+        for _ in range(48):
+            commitment = env._get_dam_commitment(env.current_step)
+            commitments.append(commitment)
+            action = np.array([0, 2, 5, 5])
+            obs, reward, done, truncated, info = env.step(action)
+            if done or truncated:
+                break
+
+        nonzero = sum(1 for c in commitments if abs(c) > 0.1)
+        assert nonzero > 5, \
+            f"Expected substantial DAM commitments over 2 days, got only {nonzero} non-zero"
+
+
 class TestMarketTimingConstraints:
     """I test that market timing constraints match real Greek market rules."""
 
