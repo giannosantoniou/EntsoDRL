@@ -158,10 +158,18 @@ class TensorboardLoggingCallback(BaseCallback):
         self.episode_shaping_penalties = []
         self.episode_net_profits = []
 
+        # I track commitment violation costs per episode
+        self.episode_dam_violation_costs = []
+        self.episode_afrr_nonresponse_costs = []
+        self.episode_dam_violations = []  # count of violation steps
+
         # I track participation counts per episode
         self.afrr_bids_per_ep = []
         self.afrr_selections_per_ep = []
         self.afrr_activations_per_ep = []
+
+        # I track episode lengths (in steps) for cycles/day calculation
+        self.episode_lengths = []
 
         # I track step-level counts (reset each logging period)
         self.step_afrr_bids = 0
@@ -215,6 +223,9 @@ class TensorboardLoggingCallback(BaseCallback):
             if is_done:
                 self.episode_profits.append(info.get('total_profit', 0))
                 self.episode_cycles.append(info.get('total_cycles', 0))
+                # I track episode length for cycles/day calculation
+                ep_steps = info.get('episode_step', info.get('step', 672))
+                self.episode_lengths.append(ep_steps)
                 self.dam_profits.append(info.get('dam_profit', 0))
                 self.intraday_profits.append(info.get('intraday_profit', 0))
                 self.afrr_capacity_profits.append(info.get('afrr_capacity_profit', 0))
@@ -224,6 +235,9 @@ class TensorboardLoggingCallback(BaseCallback):
                 self.episode_max_socs.append(info.get('episode_max_soc', 0.5))
                 self.episode_shaping_penalties.append(info.get('episode_shaping_penalty', 0))
                 self.episode_net_profits.append(info.get('episode_net_profit', 0))
+                self.episode_dam_violation_costs.append(info.get('episode_dam_violation_cost', 0))
+                self.episode_afrr_nonresponse_costs.append(info.get('episode_afrr_nonresponse_cost', 0))
+                self.episode_dam_violations.append(info.get('episode_dam_violation_count', 0))
                 if 'ida_profit' in info:
                     self.ida_profits.append(info['ida_profit'])
                 if 'xbid_profit' in info:
@@ -243,6 +257,15 @@ class TensorboardLoggingCallback(BaseCallback):
             self.logger.record('custom/avg_cycles', avg_cycles)
             if avg_cycles > 0:
                 self.logger.record('custom/profit_per_cycle', avg_profit / avg_cycles)
+            # I compute cycles/day from episode length and total cycles
+            if len(self.episode_lengths) > 0:
+                recent_lengths = self.episode_lengths[-100:]
+                recent_cycles = self.episode_cycles[-len(recent_lengths):]
+                # I get time_step_hours from the training env
+                time_step_h = getattr(self.training_env.envs[0].unwrapped, 'time_step_hours', 0.25)
+                avg_ep_days = np.mean(recent_lengths) * time_step_h / 24.0
+                if avg_ep_days > 0:
+                    self.logger.record('custom/cycles_per_day', np.mean(recent_cycles) / avg_ep_days)
 
             # I log per-market profits
             if len(self.dam_profits) > 0:
@@ -267,6 +290,12 @@ class TensorboardLoggingCallback(BaseCallback):
             if len(self.episode_shaping_penalties) > 0:
                 self.logger.record('custom/avg_shaping_penalty', np.mean(self.episode_shaping_penalties[-100:]))
                 self.logger.record('custom/avg_net_profit', np.mean(self.episode_net_profits[-100:]))
+
+            # I log commitment violation costs (DAM + aFRR non-response)
+            if len(self.episode_dam_violation_costs) > 0:
+                self.logger.record('penalties/dam_violation_cost', np.mean(self.episode_dam_violation_costs[-100:]))
+                self.logger.record('penalties/afrr_nonresponse_cost', np.mean(self.episode_afrr_nonresponse_costs[-100:]))
+                self.logger.record('penalties/dam_violation_steps', np.mean(self.episode_dam_violations[-100:]))
 
             # I log full-market mode metrics from episode-level accumulators
             if self.ida_profits:
@@ -351,10 +380,10 @@ def create_training_env(
     # reward_scale raised from 0.001 to 0.01 for stronger NN signal.
     if reward_config is None:
         reward_config = {
-            'degradation_cost': 25.0,
+            'degradation_cost': 12.0,
             'dam_violation_penalty': 800.0,
             'afrr_nonresponse_penalty': 500.0,
-            'soc_penalty_coeff': 0.05,
+            'soc_penalty_coeff': 0.005,
             'reward_scale': 0.01
         }
 
@@ -420,7 +449,7 @@ def train_unified_model(
     learning_rate: float = 1e-4,
     n_steps: int = 2048,
     batch_size: int = 256,
-    n_epochs: int = 10,
+    n_epochs: int = 5,  # I reduced from 10 to avoid overfitting on same rollout batch
     gamma: float = 0.99,
     gae_lambda: float = 0.97,  # I raised from 0.95 to extend advantage horizon to ~18h (was ~12h)
     clip_range: float = 0.2,
@@ -594,7 +623,7 @@ def train_unified_model(
     )
 
     curriculum_callback = DegradationCurriculumCallback(
-        target_degradation=25.0,  # I use 25 EUR/MWh to discourage excessive cycling (1.5-2.0/day target)
+        target_degradation=12.0,  # I use 12 EUR/MWh — realistic LFP BESS cost at 8000+ cycles
         warmup_steps=min(500_000, total_timesteps // 5)
     )
 
@@ -669,10 +698,20 @@ def train_unified_model(
         print(f"  Entropy coefficient: {ent_coef} (annealing to 0.005)")
         print(f"  Value function coefficient: 0.25 (reduced from 0.5 default)")
 
+        # I create a linear LR schedule: starts at learning_rate, decays to
+        # learning_rate/10 by end of training. This stabilizes the policy
+        # in late training and prevents oscillations around the optimum.
+        lr_start = learning_rate
+        lr_end = learning_rate / 10.0
+        def lr_schedule(progress_remaining: float) -> float:
+            return lr_end + (lr_start - lr_end) * progress_remaining
+
+        print(f"  LR schedule: {lr_start} -> {lr_end} (linear decay)")
+
         model = MaskablePPO(
             "MlpPolicy",
             train_env,
-            learning_rate=learning_rate,
+            learning_rate=lr_schedule,
             n_steps=n_steps,
             batch_size=batch_size,
             n_epochs=n_epochs,
@@ -716,8 +755,8 @@ def train_unified_model(
         'dam_bidder_min_spread': dam_bidder_min_spread,
         'mfrr_activation_rate': mfrr_activation_rate,
         'mfrr_price_cap': mfrr_price_cap,
-        'degradation_cost': 25.0,
-        'soc_penalty_coeff': 0.05,
+        'degradation_cost': 12.0,
+        'soc_penalty_coeff': 0.005,
         'timestamp': timestamp
     }
 

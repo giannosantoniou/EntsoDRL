@@ -623,15 +623,15 @@ class TestCalendarAging:
         assert self._cost_at_soc(0.50) == pytest.approx(0.0, abs=1e-6)
 
     def test_quadratic_values(self):
-        """I verify penalty = 0.05 × (|SoC% - 50|)² at default coeff=0.05."""
-        # At 40%: deviation=10, 0.05 × 100 = 5
-        assert self._cost_at_soc(0.40) == pytest.approx(5.0, abs=0.01)
-        # At 30%: deviation=20, 0.05 × 400 = 20
-        assert self._cost_at_soc(0.30) == pytest.approx(20.0, abs=0.01)
-        # At 20%: deviation=30, 0.05 × 900 = 45
-        assert self._cost_at_soc(0.20) == pytest.approx(45.0, abs=0.01)
-        # At 5%: deviation=45, 0.05 × 2025 = 101.25
-        assert self._cost_at_soc(0.05) == pytest.approx(101.25, abs=0.01)
+        """I verify penalty = 0.005 × (|SoC% - 50|)² at default coeff=0.005."""
+        # At 40%: deviation=10, 0.005 × 100 = 0.5
+        assert self._cost_at_soc(0.40) == pytest.approx(0.5, abs=0.01)
+        # At 30%: deviation=20, 0.005 × 400 = 2.0
+        assert self._cost_at_soc(0.30) == pytest.approx(2.0, abs=0.01)
+        # At 20%: deviation=30, 0.005 × 900 = 4.5
+        assert self._cost_at_soc(0.20) == pytest.approx(4.5, abs=0.01)
+        # At 5%: deviation=45, 0.005 × 2025 = 10.125
+        assert self._cost_at_soc(0.05) == pytest.approx(10.125, abs=0.01)
 
     def test_symmetric_around_50(self):
         """I verify the penalty is symmetric: cost at 30% == cost at 70%."""

@@ -78,8 +78,8 @@ class UnifiedRewardCalculator:
     def __init__(
         self,
         # Degradation
-        degradation_cost_per_mwh: float = 5.0,  # I reduced from 15 to 5 EUR/MWh
-        # (realistic Li-ion BESS cost, enables IntraDay with mean spread ~11 EUR/MWh)
+        degradation_cost_per_mwh: float = 12.0,  # I use 12 EUR/MWh — realistic for
+        # modern LFP BESS at 8000+ cycles (system cost ~€150/kWh ÷ 8000 ≈ €9-12/MWh)
 
         # Penalty coefficients — I reduced these to fix the 37:1 penalty/profit
         # asymmetry that was destroying the gradient signal. The old values
@@ -94,12 +94,10 @@ class UnifiedRewardCalculator:
         afrr_response_bonus: float = 10.0,  # EUR/MWh for fast aFRR response
 
         # Calendar aging — quadratic penalty based on SoC deviation from 50%.
-        # Li-ion batteries degrade faster at extreme SoC (high voltage stress
-        # at top, copper dissolution at bottom). Degradation_cost already
-        # penalizes each cycle proportionally, so no separate cycle cap needed.
+        # LFP batteries are more SoC-tolerant than NMC, so I use a low coefficient.
         # penalty = soc_penalty_coeff × (|SoC% - 50|)²
         # This is a pure shaping signal — does NOT affect trading_pnl.
-        soc_penalty_coeff: float = 0.05,  # EUR per (percentage_point_deviation)²
+        soc_penalty_coeff: float = 0.005,  # EUR per (percentage_point_deviation)²
 
         # Scaling — I raised from 0.001 to 0.01 so that a typical 300 EUR
         # trade produces a reward of 3.0 instead of 0.3, giving the NN a

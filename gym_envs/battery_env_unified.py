@@ -195,10 +195,10 @@ class BatteryEnvUnified(gym.Env):
         # Reward calculator
         self.reward_config = reward_config or {}
         self.reward_calculator = UnifiedRewardCalculator(
-            degradation_cost_per_mwh=self.reward_config.get('degradation_cost', 5.0),
+            degradation_cost_per_mwh=self.reward_config.get('degradation_cost', 12.0),
             dam_violation_penalty=self.reward_config.get('dam_violation_penalty', 800.0),
             afrr_nonresponse_penalty=self.reward_config.get('afrr_nonresponse_penalty', 500.0),
-            soc_penalty_coeff=self.reward_config.get('soc_penalty_coeff', 0.05),
+            soc_penalty_coeff=self.reward_config.get('soc_penalty_coeff', 0.005),
             reward_scale=self.reward_config.get('reward_scale', 0.01)
         )
 
@@ -420,6 +420,9 @@ class BatteryEnvUnified(gym.Env):
         self.episode_profit = 0.0
         self.episode_shaping_penalty = 0.0
         self.episode_net_profit = 0.0
+        self.episode_dam_violation_cost = 0.0
+        self.episode_afrr_nonresponse_cost = 0.0
+        self.episode_dam_violation_count = 0
 
         # I track SoC extremes over the episode
         self.episode_min_soc = 1.0
@@ -1285,6 +1288,11 @@ class BatteryEnvUnified(gym.Env):
         self.episode_profit += trading_pnl
         self.episode_shaping_penalty += reward_info['components'].get('shaping_penalty', 0)
         self.episode_net_profit += reward_info['components'].get('net_profit', 0)
+        dam_viol = reward_info['components'].get('dam_violation_cost', 0)
+        self.episode_dam_violation_cost += dam_viol
+        if dam_viol > 0:
+            self.episode_dam_violation_count += 1
+        self.episode_afrr_nonresponse_cost += reward_info['components'].get('afrr_nonresponse_cost', 0)
 
         # =====================================================================
         # STAGE 11: ADVANCE STEP
@@ -2236,6 +2244,10 @@ class BatteryEnvUnified(gym.Env):
             'episode_max_soc': self.episode_max_soc,
             'episode_shaping_penalty': self.episode_shaping_penalty,
             'episode_net_profit': self.episode_net_profit,
+            'episode_dam_violation_cost': self.episode_dam_violation_cost,
+            'episode_afrr_nonresponse_cost': self.episode_afrr_nonresponse_cost,
+            'episode_dam_violation_count': self.episode_dam_violation_count,
+            'episode_step': self.current_step - self.episode_start_step,
         }
         if self.enable_full_market:
             info.update({
