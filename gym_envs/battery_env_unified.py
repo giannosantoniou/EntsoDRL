@@ -369,7 +369,7 @@ class BatteryEnvUnified(gym.Env):
             ])
 
         # I compute dynamic observation size based on enabled feature groups
-        n_obs = 64  # Base features (Groups 1-9) + cycles_remaining
+        n_obs = 66  # Base features (Groups 1-9) + cycles_remaining
         if self.enable_forecast:
             n_obs += 9   # IntraDay forecast + RES fundamentals
         if self.enable_market_forecast:
@@ -1666,7 +1666,7 @@ class BatteryEnvUnified(gym.Env):
         features.append(cycles_remaining)
 
         # =====================================================================
-        # 2. MARKET PRICES (11 features — was 6)
+        # 2. MARKET PRICES (13 features — was 11)
         # =====================================================================
         dam_price = row.get('price', 100.0)
         features.append(dam_price / 100.0)  # [3] DAM price
@@ -1693,6 +1693,13 @@ class BatteryEnvUnified(gym.Env):
         features.append((imb_price_lag - dam_price) / 100.0)      # [11] Imbalance-DAM spread (key signal)
         features.append((mfrr_up - dam_price) / 100.0)            # [12] mFRR premium over DAM
         features.append((mfrr_up - imb_price_lag) / 100.0)        # [13] mFRR-Imbalance spread
+
+        # I add HVR (Highest Value Rule) spreads so the agent sees when aFRR
+        # commitment is extra profitable (mFRR settles higher → aFRR gets uplift)
+        afrr_up_lag = row.get('afrr_up_lag_1h', row.get('afrr_up', 80.0))
+        afrr_down_lag = row.get('afrr_down_lag_1h', row.get('afrr_down', 80.0))
+        features.append((mfrr_up - afrr_up_lag) / 100.0)        # [14] HVR spread UP
+        features.append((mfrr_down - afrr_down_lag) / 100.0)    # [15] HVR spread DOWN
 
         # =====================================================================
         # 3. TIME ENCODING (4 features)
@@ -2061,7 +2068,7 @@ class BatteryEnvUnified(gym.Env):
         # =====================================================================
         obs = np.array(features, dtype=np.float32)
 
-        expected_features = 64  # Base features (Groups 1-9) including cycles_remaining
+        expected_features = 66  # Base features (Groups 1-9) including cycles_remaining
         if self.enable_forecast:
             expected_features += 9
         if self.enable_market_forecast:
