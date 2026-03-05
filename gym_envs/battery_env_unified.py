@@ -428,7 +428,7 @@ class BatteryEnvUnified(gym.Env):
         if self.enable_market_forecast:
             n_obs += 20  # DAM+ID+Imbalance forecast + ISP cascade features (Group 10b)
         if self.enable_full_market:
-            n_obs += 12  # IDA/XBID/FreeBid features
+            n_obs += 13  # IDA/XBID/FreeBid features + ISP1-DAM spread
 
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(n_obs,), dtype=np.float32
@@ -786,9 +786,9 @@ class BatteryEnvUnified(gym.Env):
 
             # I compute participation level from the IntraDay action (reused for IDA)
             # At gate steps: 11 levels → [-100%, ..., 0, 0, 0, ..., +100%]
-            # I use abs() since direction is determined by the schedule generator
+            # Positive = follow generator direction, Negative = reverse direction
             ida_action_raw = action[2]
-            ida_level = abs(self.INTRADAY_LEVELS[ida_action_raw])  # 0.0 to 1.0
+            ida_level = self.INTRADAY_LEVELS[ida_action_raw]  # -1.0 to +1.0
 
             if gate_hour == 15 and gate_minute == 0 and not self.ida1_locked_today:
                 self._trigger_ida_gate(ida_number=1, participation_level=ida_level)
@@ -1874,12 +1874,13 @@ class BatteryEnvUnified(gym.Env):
                 if slot < len(ida_schedule):
                     ida_schedule[slot] = correction_mw
 
+        # I scale by agent's participation level BEFORE SoC cap
+        # Negative participation_level reverses direction (agent directional control)
+        ida_schedule *= participation_level
+
         # I apply SoC trajectory simulation to cap infeasible positions
         ida_schedule = self._soc_cap_ida_schedule(ida_schedule, existing_schedule,
                                                    delivery_hours, day_indices)
-
-        # I scale by agent's participation level
-        ida_schedule *= participation_level
 
         # I clip to inverter limits
         ida_schedule = np.clip(ida_schedule, -self.max_power_mw, self.max_power_mw)
@@ -2550,7 +2551,7 @@ class BatteryEnvUnified(gym.Env):
                                 [dam_price / 100.0] * 2 + [0.0] * 3)
 
         # =====================================================================
-        # 11. FULL MARKET FEATURES (12 features, enable_full_market)
+        # 11. FULL MARKET FEATURES (13 features, enable_full_market)
         # =====================================================================
         if self.enable_full_market:
             imbalance_fm = row.get('net_imbalance_mw', 0.0)
@@ -2588,6 +2589,11 @@ class BatteryEnvUnified(gym.Env):
             correction_needed = self._get_ida_correction_signal()
             features.append(np.clip(correction_needed, -1.0, 1.0))
 
+            # [8] ISP1-DAM spread — directional signal for IDA participation
+            isp1_mid_obs = (isp1_up_obs + isp1_down_obs) / 2.0
+            isp1_dam_spread = (isp1_mid_obs - dam_price) / 50.0
+            features.append(np.clip(isp1_dam_spread, -1.0, 1.0))
+
             # Free Bid State (3 features — preserved from old Group 11)
             features.append(1.0 if abs(imbalance_fm) > self.mfrr_imbalance_threshold else 0.0)
             features.append(row.get('free_bid_activation_base', 0.3))
@@ -2607,7 +2613,7 @@ class BatteryEnvUnified(gym.Env):
         if self.enable_market_forecast:
             expected_features += 20
         if self.enable_full_market:
-            expected_features += 12
+            expected_features += 13
         assert len(obs) == expected_features, f"Expected {expected_features} features, got {len(obs)}"
 
         # I replace any NaN/Inf with 0

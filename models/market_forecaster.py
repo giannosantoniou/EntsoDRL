@@ -492,36 +492,51 @@ class IDASubForecaster:
         self.is_trained = False
 
     def _synthesize_ida_prices(self, dam_prices: np.ndarray, ida_number: int,
-                                seed: int = None) -> np.ndarray:
+                                seed: int = None,
+                                isp1_mid: np.ndarray = None) -> np.ndarray:
         """
-        I generate synthetic IDA clearing prices using Ornstein-Uhlenbeck noise on DAM.
+        I generate synthetic IDA clearing prices correlated with ISP1 mid-price.
 
-        IDA prices deviate from DAM due to updated forecasts:
-        - IDA1 (9-33h before delivery): σ=4 EUR/MWh (closest to DAM, least new info)
-        - IDA2 (2-26h before delivery): σ=8 EUR/MWh (more volatile, more forecast updates)
-        - IDA3 (2-14h before delivery): σ=12 EUR/MWh (most volatile, last correction)
-
-        I use OU process with mean-reversion to DAM (θ=0.3) so spreads don't drift.
+        IDA prices converge toward ISP1 as delivery approaches:
+          IDA1: 85% DAM + 15% ISP1 + OU noise(σ=3)
+          IDA2: 60% DAM + 40% ISP1 + OU noise(σ=4)
+          IDA3: 30% DAM + 70% ISP1 + OU noise(σ=3)
+        Where ISP1 is unavailable, I fall back to pure DAM + OU noise.
         """
         rng = np.random.RandomState(seed)
         n = len(dam_prices)
 
-        # I set volatility by IDA auction (later = more volatile)
-        sigma_map = {1: 4.0, 2: 8.0, 3: 12.0}
-        sigma = sigma_map.get(ida_number, 8.0)
-        theta = 0.3  # Mean-reversion speed to DAM
+        # I define blending and noise parameters per IDA auction
+        ida_cfg = {
+            1: {'alpha': 0.85, 'sigma': 3.0, 'fallback_sigma': 4.0},
+            2: {'alpha': 0.60, 'sigma': 4.0, 'fallback_sigma': 8.0},
+            3: {'alpha': 0.30, 'sigma': 3.0, 'fallback_sigma': 12.0},
+        }
+        cfg = ida_cfg.get(ida_number, ida_cfg[2])
+        theta = 0.3  # Mean-reversion speed
 
-        # I simulate OU process for spread
+        # I simulate OU process for residual noise
         spread = np.zeros(n)
         dt = 1.0  # hourly
         for i in range(1, n):
             spread[i] = (spread[i-1]
                          - theta * spread[i-1] * dt
-                         + sigma * np.sqrt(dt) * rng.normal())
+                         + cfg['sigma'] * np.sqrt(dt) * rng.normal())
 
-        ida_prices = dam_prices + spread
+        if isp1_mid is not None:
+            has_isp1 = ~np.isnan(isp1_mid)
+            # I blend DAM and ISP1 where ISP1 is available
+            blended = np.where(
+                has_isp1,
+                cfg['alpha'] * dam_prices + (1 - cfg['alpha']) * isp1_mid + spread,
+                dam_prices + spread * (cfg['fallback_sigma'] / cfg['sigma'])
+            )
+        else:
+            # I fall back to pure DAM + scaled OU noise
+            blended = dam_prices + spread * (cfg['fallback_sigma'] / cfg['sigma'])
+
         # I ensure non-negative prices
-        ida_prices = np.maximum(ida_prices, 0.0)
+        ida_prices = np.maximum(blended, 0.0)
         return ida_prices
 
     def build_features(self, df: pd.DataFrame, idx: int, ida_number: int) -> np.ndarray:
@@ -632,9 +647,12 @@ class IDASubForecaster:
             X_train, y_train = [], []
             X_val, y_val = [], []
 
-            # I generate synthetic IDA prices for training targets
+            # I generate synthetic IDA prices correlated with ISP1 mid-price
             dam_prices = df['price'].values
-            ida_prices = self._synthesize_ida_prices(dam_prices, ida_num, seed=42 + ida_num)
+            isp1_up = df['isp1_price_up'].values if 'isp1_price_up' in df.columns else None
+            isp1_down = df['isp1_price_down'].values if 'isp1_price_down' in df.columns else None
+            isp1_mid = (isp1_up + isp1_down) / 2.0 if isp1_up is not None and isp1_down is not None else None
+            ida_prices = self._synthesize_ida_prices(dam_prices, ida_num, seed=42 + ida_num, isp1_mid=isp1_mid)
 
             for idx in range(48 * sph, len(df)):
                 features = self.build_features(df, idx, ida_num)

@@ -522,6 +522,8 @@ def train_unified_model(
     mfrr_price_cap: float = 1000.0,
     degradation_cost: float = 0.0,  # I default to 0 — let the agent decide cycling freely
     use_subproc: bool = False,  # I default to DummyVecEnv; SubprocVecEnv has high IPC overhead on Windows
+    enable_ida_forecast: bool = False,
+    ida_forecaster_path: str = "models/market_forecaster.pkl",
 ) -> str:
     """
     I train the unified multi-market model.
@@ -567,6 +569,21 @@ def train_unified_model(
     if enable_endogenous_dam:
         print(f"Endogenous DAM: forecast-powered commitments (min_spread={dam_bidder_min_spread} EUR)")
 
+    # I load IDA sub-forecaster if requested
+    ida_forecaster = None
+    if enable_ida_forecast:
+        try:
+            from models.market_forecaster import MarketForecaster
+            mf = MarketForecaster.load(ida_forecaster_path)
+            if hasattr(mf, 'ida_forecaster') and mf.ida_forecaster is not None and mf.ida_forecaster.is_trained:
+                ida_forecaster = mf.ida_forecaster
+                print(f"IDA Forecast Mode: loaded IDA sub-forecaster from {ida_forecaster_path} "
+                      f"({len(ida_forecaster.models)}/3 auction models)")
+            else:
+                print(f"WARNING: MarketForecaster at {ida_forecaster_path} has no trained IDA sub-forecaster")
+        except Exception as e:
+            print(f"WARNING: Failed to load IDA forecaster from {ida_forecaster_path}: {e}")
+
     # I resolve data path
     if not Path(data_path).exists():
         data_path = project_root / data_path
@@ -607,6 +624,7 @@ def train_unified_model(
                 dam_bidder_min_spread=dam_bidder_min_spread,
                 mfrr_activation_rate=mfrr_activation_rate,
                 mfrr_price_cap=mfrr_price_cap,
+                ida_forecaster=ida_forecaster,
             )
             # I set unique seed for each environment
             env.reset(seed=seed + env_id if seed else env_id)
@@ -656,6 +674,7 @@ def train_unified_model(
             dam_bidder_min_spread=dam_bidder_min_spread,
             mfrr_activation_rate=mfrr_activation_rate,
             mfrr_price_cap=mfrr_price_cap,
+            ida_forecaster=ida_forecaster,
         )
 
     eval_env = MaskableVecEnv([make_eval_env])
@@ -827,6 +846,8 @@ def train_unified_model(
         'mfrr_price_cap': mfrr_price_cap,
         'degradation_cost': degradation_cost,
         'soc_penalty_coeff': 0.005,
+        'enable_ida_forecast': enable_ida_forecast,
+        'ida_forecaster_path': ida_forecaster_path,
         'timestamp': timestamp
     }
 
@@ -928,12 +949,27 @@ def evaluate_model(
     dam_bidder_min_spread = train_cfg.get('dam_bidder_min_spread', 30.0)
     mfrr_activation_rate = train_cfg.get('mfrr_activation_rate', 0.35)
     mfrr_price_cap = train_cfg.get('mfrr_price_cap', 1000.0)
+    enable_ida_forecast = train_cfg.get('enable_ida_forecast', False)
+    ida_forecaster_path = train_cfg.get('ida_forecaster_path', 'models/market_forecaster.pkl')
+
+    # I load IDA sub-forecaster if training used it
+    ida_forecaster = None
+    if enable_ida_forecast:
+        try:
+            from models.market_forecaster import MarketForecaster
+            mf = MarketForecaster.load(ida_forecaster_path)
+            if hasattr(mf, 'ida_forecaster') and mf.ida_forecaster is not None and mf.ida_forecaster.is_trained:
+                ida_forecaster = mf.ida_forecaster
+                print(f"  IDA forecaster loaded from {ida_forecaster_path}")
+        except Exception as e:
+            print(f"  WARNING: Failed to load IDA forecaster: {e}")
 
     print(f"  time_step_hours={time_step_hours}, "
           f"full_market={enable_full_market}, "
           f"forecast={enable_forecast}, "
           f"market_forecast={enable_market_forecast}")
     print(f"  endogenous_dam={enable_endogenous_dam}, "
+          f"ida_forecast={enable_ida_forecast}, "
           f"mfrr: activation_rate={mfrr_activation_rate:.0%}, "
           f"price_cap={mfrr_price_cap:.0f} EUR/MWh")
 
@@ -1000,6 +1036,7 @@ def evaluate_model(
             mfrr_activation_rate=mfrr_activation_rate,
             mfrr_price_cap=mfrr_price_cap,
             reward_config=eval_reward_config,
+            ida_forecaster=ida_forecaster,
         )
         return Monitor(env)
 
@@ -1342,6 +1379,11 @@ if __name__ == "__main__":
                         help="Number of evaluation episodes (default: 10)")
     parser.add_argument("--subproc", action='store_true',
                         help="Use SubprocVecEnv for multi-process parallelism (high IPC overhead on Windows)")
+    parser.add_argument("--enable-ida-forecast", action='store_true',
+                        help="Enable IDA sub-forecaster for IDA schedule generation")
+    parser.add_argument("--ida-forecaster-path", type=str,
+                        default="models/market_forecaster.pkl",
+                        help="Path to MarketForecaster pickle containing IDA sub-forecaster")
 
     args = parser.parse_args()
 
@@ -1376,7 +1418,9 @@ if __name__ == "__main__":
             mfrr_activation_rate=args.mfrr_activation_rate,
             mfrr_price_cap=args.mfrr_price_cap,
             degradation_cost=args.degradation_cost,
-            use_subproc=args.subproc
+            use_subproc=args.subproc,
+            enable_ida_forecast=args.enable_ida_forecast,
+            ida_forecaster_path=args.ida_forecaster_path,
         )
 
         # I run evaluation on trained model

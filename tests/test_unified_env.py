@@ -2168,9 +2168,9 @@ class TestSeparateRevenueTracking:
             assert key in info, f"Missing market profit key: {key}"
 
     def test_full_market_obs_shape(self, full_market_env):
-        """I verify 80-feature observation in full market mode."""
+        """I verify 81-feature observation in full market mode."""
         obs, info = full_market_env.reset(seed=42)
-        assert obs.shape == (80,)
+        assert obs.shape == (81,)
         assert not np.any(np.isnan(obs))
         assert not np.any(np.isinf(obs))
 
@@ -2181,7 +2181,7 @@ class TestSeparateRevenueTracking:
         for _ in range(30):
             action = full_market_env.action_space.sample()
             obs, reward, done, truncated, info = full_market_env.step(action)
-            assert obs.shape == (80,)
+            assert obs.shape == (81,)
             assert np.isfinite(reward)
             assert 0.05 <= info['soc'] <= 0.95
             if done or truncated:
@@ -2328,7 +2328,7 @@ class TestIntraDayForecast:
             "Observations at different steps should differ (no data leakage)"
 
     def test_forecast_plus_full_market_87(self, sample_data_full_market):
-        """87 features with both flags enabled."""
+        """90 features with both flags enabled (68 base + 9 forecast + 13 full_market)."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         env = BatteryEnvUnified(
@@ -2344,9 +2344,9 @@ class TestIntraDayForecast:
             forecast_noise=False,
         )
 
-        assert env.observation_space.shape == (89,)
+        assert env.observation_space.shape == (90,)
         obs, info = env.reset(seed=42)
-        assert obs.shape == (89,)
+        assert obs.shape == (90,)
         assert not np.any(np.isnan(obs))
         assert not np.any(np.isinf(obs))
 
@@ -3849,11 +3849,11 @@ class TestObservationNoLeakage:
         current_norm = 100.0 / 100.0  # 1.0
         lagged_norm = 5.0 / 100.0     # 0.05
 
-        # Base: 68, full_market starts at 68, has 12 features
-        # Group 13 layout: 8 IDA + 3 FreeBid + 1 cascade = 12
-        # Cascade is the 12th feature → index 68 + 11 = 79
+        # Base: 68, full_market starts at 68, has 13 features
+        # Group 13 layout: 8 IDA + 1 ISP1-DAM spread + 3 FreeBid + 1 cascade = 13
+        # Cascade is the 13th feature → index 68 + 12 = 80
         fm_start = 68
-        cascade_idx = fm_start + 11  # Last feature in full-market block
+        cascade_idx = fm_start + 12  # Last feature in full-market block
         assert obs[cascade_idx] == pytest.approx(lagged_norm, abs=0.01), \
             f"Full-market cascade spread should be lagged (0.05), got {obs[cascade_idx]}"
 
@@ -4581,6 +4581,118 @@ class TestSoCAwareDAMBidder:
                 assert expected_sign == actual_sign, \
                     f"Sign mismatch: net_energy={net_energy:.1f} ({expected_sign}) " \
                     f"vs obs={dam_net_energy_ratio:.4f} ({actual_sign})"
+
+
+class TestIDATrainable:
+    """I test the trainable IDA features: directional control, SoC cap ordering,
+    ISP1-DAM spread feature, and correlated IDA prices."""
+
+    def test_ida_directional_control(self, sample_data_full_market):
+        """I verify negative participation level reverses schedule direction."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        env = BatteryEnvUnified(
+            df=sample_data_full_market,
+            episode_length=72,
+            random_start=False,
+            enable_full_market=True,
+        )
+        env.reset(seed=42)
+
+        # I generate the same schedule with positive and negative participation
+        schedule_pos = env._generate_ida_schedule(ida_number=1, participation_level=0.75)
+        # I reset state so the schedule generator produces the same base schedule
+        env.reset(seed=42)
+        schedule_neg = env._generate_ida_schedule(ida_number=1, participation_level=-0.75)
+
+        # I check that non-zero positions have opposite signs
+        nonzero = np.abs(schedule_pos) > 0.01
+        if np.any(nonzero):
+            # I verify sign reversal: pos * neg should be <= 0 for each element
+            products = schedule_pos[nonzero] * schedule_neg[nonzero]
+            assert np.all(products <= 0.01), \
+                "Negative participation should reverse IDA schedule direction"
+
+    def test_ida_participation_before_soc_cap(self, sample_data_full_market):
+        """I verify SoC cap is applied AFTER direction scaling.
+
+        With participation_level=0 the schedule should be all zeros,
+        because scaling to zero happens before SoC cap.
+        """
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        env = BatteryEnvUnified(
+            df=sample_data_full_market,
+            episode_length=72,
+            random_start=False,
+            enable_full_market=True,
+        )
+        env.reset(seed=42)
+
+        # I generate schedule with zero participation
+        schedule = env._generate_ida_schedule(ida_number=1, participation_level=0.0)
+        assert np.all(schedule == 0.0), \
+            "Zero participation should produce zero IDA schedule"
+
+    def test_isp1_dam_spread_feature(self, sample_data_full_market):
+        """I verify the ISP1-DAM spread observation feature."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        df = sample_data_full_market.copy()
+        # I set known ISP1 and DAM prices for ALL rows to avoid step-offset issues
+        df['isp1_price_up'] = 120.0
+        df['isp1_price_down'] = 80.0
+        df['price'] = 90.0
+
+        env = BatteryEnvUnified(
+            df=df, episode_length=72, random_start=False,
+            enable_full_market=True,
+        )
+        env.reset(seed=42)
+        obs = env._build_observation()
+
+        # ISP1 mid = (120 + 80) / 2 = 100, DAM = 90
+        # Spread = (100 - 90) / 50 = 0.2
+        fm_start = 68  # Base features
+        isp1_dam_idx = fm_start + 8  # 9th feature in Group 13 (after 8 IDA features)
+        expected = np.clip((100.0 - 90.0) / 50.0, -1.0, 1.0)
+        assert obs[isp1_dam_idx] == pytest.approx(expected, abs=0.01), \
+            f"ISP1-DAM spread feature should be {expected:.3f}, got {obs[isp1_dam_idx]:.3f}"
+
+    def test_ida_prices_correlate_with_isp1(self):
+        """I verify synthetic IDA3 prices correlate with ISP1 mid-price."""
+        from data.create_unified_training_data import _synthesize_ida_prices, _generate_ou_process
+
+        # I create a simple DataFrame with known ISP1/DAM prices
+        n = 1000
+        dates = pd.date_range('2024-01-01', periods=n, freq='H')
+        np.random.seed(42)
+        dam = 80 + 20 * np.sin(2 * np.pi * np.arange(n) / 24)
+        # I make ISP1 diverge from DAM to test correlation
+        isp1_mid = dam + 15 * np.sin(2 * np.pi * np.arange(n) / 48) + np.random.normal(0, 3, n)
+
+        df = pd.DataFrame({
+            'price': dam,
+            'isp1_price_up': isp1_mid + 5,
+            'isp1_price_down': isp1_mid - 5,
+        }, index=dates)
+        mask = df.index == df.index  # all True
+
+        df = _synthesize_ida_prices(df, mask, time_step_hours=1.0)
+
+        # I compute correlation between IDA3 and ISP1 mid (afternoon only)
+        ida3 = df['ida3_clearing_price'].values
+        afternoon = ~np.isnan(ida3)
+        if afternoon.sum() > 50:
+            from scipy.stats import pearsonr
+            r, p = pearsonr(isp1_mid[afternoon], ida3[afternoon])
+            assert r > 0.5, \
+                f"IDA3 should correlate with ISP1 mid (r={r:.3f}), got r < 0.5"
+            # I also check IDA1 (weaker correlation expected since alpha=0.85 toward DAM)
+            ida1 = df['ida1_clearing_price'].values
+            r1, _ = pearsonr(isp1_mid, ida1)
+            assert r1 > 0.3, \
+                f"IDA1 should have some correlation with ISP1 (r={r1:.3f})"
 
 
 if __name__ == "__main__":

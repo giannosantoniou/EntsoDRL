@@ -1484,26 +1484,52 @@ def _compute_hours_to_delivery(index):
 
 
 def _synthesize_ida_prices(df, mask, time_step_hours=0.25):
-    """I synthesize IDA1/2/3 clearing prices and XBID bid/ask."""
+    """I synthesize IDA1/2/3 clearing prices correlated with ISP1 mid-price.
+
+    IDA prices converge toward ISP1 as delivery approaches:
+      IDA1 (D-1 15:00): 85% DAM + 15% ISP1 + OU noise(σ=3)
+      IDA2 (D-1 22:00): 60% DAM + 40% ISP1 + OU noise(σ=4)
+      IDA3 (D+0 10:00): 30% DAM + 70% ISP1 + OU noise(σ=3)
+    Where ISP1 is NaN, I fall back to pure DAM + OU noise(σ=12/8/4).
+    """
     dam_prices = df.loc[mask, 'price'].values
     n = len(dam_prices)
     hours = df.loc[mask].index.hour.values
 
-    # IDA1 (D-1 15:00): largest forecast error, sigma=12 EUR
-    # IDA2 (D-1 22:00): better info, sigma=8 EUR
-    # IDA3 (D   10:00): close to delivery, sigma=4 EUR
-    ida1_noise = _generate_ou_process(n, theta=0.03, sigma=12.0, dt=time_step_hours)
-    ida2_noise = _generate_ou_process(n, theta=0.05, sigma=8.0, dt=time_step_hours)
-    ida3_noise = _generate_ou_process(n, theta=0.08, sigma=4.0, dt=time_step_hours)
+    # I compute ISP1 mid-price where available
+    isp1_up = df.loc[mask, 'isp1_price_up'].values if 'isp1_price_up' in df.columns else np.full(n, np.nan)
+    isp1_down = df.loc[mask, 'isp1_price_down'].values if 'isp1_price_down' in df.columns else np.full(n, np.nan)
+    isp1_mid = (isp1_up + isp1_down) / 2.0
+    has_isp1 = ~np.isnan(isp1_mid)
 
-    df.loc[mask, 'ida1_clearing_price'] = np.maximum(dam_prices + ida1_noise, 0.0)
-    df.loc[mask, 'ida2_clearing_price'] = np.maximum(dam_prices + ida2_noise, 0.0)
-    # IDA3 only covers hours 12-24
-    ida3_prices = np.where(hours >= 12, dam_prices + ida3_noise, np.nan)
-    df.loc[mask, 'ida3_clearing_price'] = ida3_prices
+    # I define blending weights: IDA converges toward ISP1 as delivery nears
+    # alpha = DAM weight, (1-alpha) = ISP1 weight
+    ida_config = {
+        1: {'alpha': 0.85, 'sigma': 3.0, 'theta': 0.03, 'fallback_sigma': 12.0},
+        2: {'alpha': 0.60, 'sigma': 4.0, 'theta': 0.05, 'fallback_sigma': 8.0},
+        3: {'alpha': 0.30, 'sigma': 3.0, 'theta': 0.08, 'fallback_sigma': 4.0},
+    }
 
-    # XBID: tighter spread near delivery
-    xbid_mid = dam_prices + ida3_noise * 0.5  # I track closest IDA
+    for ida_num, cfg in ida_config.items():
+        noise = _generate_ou_process(n, theta=cfg['theta'], sigma=cfg['sigma'], dt=time_step_hours)
+        # I blend DAM and ISP1 where ISP1 is available
+        blended = np.where(
+            has_isp1,
+            cfg['alpha'] * dam_prices + (1 - cfg['alpha']) * isp1_mid + noise,
+            dam_prices + _generate_ou_process(n, theta=cfg['theta'], sigma=cfg['fallback_sigma'], dt=time_step_hours)
+        )
+        blended = np.maximum(blended, 0.0)
+
+        if ida_num == 3:
+            # IDA3 only covers hours 12-24
+            blended = np.where(hours >= 12, blended, np.nan)
+
+        df.loc[mask, f'ida{ida_num}_clearing_price'] = blended
+
+    # XBID: I use IDA3-like blend for mid-price, tighter spread near delivery
+    ida3_blend = df.loc[mask, 'ida3_clearing_price'].values
+    # I use DAM as fallback for NaN (hours < 12)
+    xbid_mid = np.where(np.isnan(ida3_blend), dam_prices, ida3_blend)
     time_to_delivery = _compute_hours_to_delivery(df.loc[mask].index)
     spread_base = 2.0   # EUR at delivery
     spread_far = 8.0    # EUR far from delivery
@@ -1518,17 +1544,36 @@ def _synthesize_ida_prices(df, mask, time_step_hours=0.25):
 
 
 def _generate_ida_positions(df, max_power_mw=30.0):
-    """I generate IDA correction positions (like DAM but smaller)."""
+    """I generate IDA correction positions correlated with IDA-DAM spread.
+
+    Instead of random noise, I derive corrections from the IDA clearing price
+    vs DAM spread: positive spread → sell (positive correction), negative → buy.
+    This gives the agent a learnable signal.
+    """
     n = len(df)
     dam = df['dam_commitment'].values
+    dam_prices = df['price'].values
 
-    # I generate corrections based on price spread signals
-    ida1_corr = np.clip(np.random.normal(0, 2.0, n), -5.0, 5.0)
-    ida2_corr = np.clip(np.random.normal(0, 1.5, n), -3.0, 3.0)
+    # I compute IDA-DAM spreads where IDA prices are available
+    ida1_prices = df['ida1_clearing_price'].values if 'ida1_clearing_price' in df.columns else dam_prices
+    ida2_prices = df['ida2_clearing_price'].values if 'ida2_clearing_price' in df.columns else dam_prices
+    ida3_prices = df['ida3_clearing_price'].values if 'ida3_clearing_price' in df.columns else dam_prices
+
+    # I derive corrections proportional to IDA-DAM spread
+    # Positive spread → sell on IDA (positive correction)
+    # Negative spread → buy on IDA (negative correction)
+    ida1_spread = np.nan_to_num(ida1_prices - dam_prices, nan=0.0)
+    ida2_spread = np.nan_to_num(ida2_prices - dam_prices, nan=0.0)
+    ida3_spread = np.nan_to_num(ida3_prices - dam_prices, nan=0.0)
+
+    # I scale spread to MW correction: 1 EUR spread → 0.15 MW correction + small noise
+    ida1_corr = np.clip(ida1_spread * 0.15 + np.random.normal(0, 0.5, n), -5.0, 5.0)
+    ida2_corr = np.clip(ida2_spread * 0.10 + np.random.normal(0, 0.3, n), -3.0, 3.0)
     ida3_corr = np.zeros(n)
     afternoon_mask = df.index.hour >= 12
     ida3_corr[afternoon_mask] = np.clip(
-        np.random.normal(0, 1.0, afternoon_mask.sum()), -2.0, 2.0
+        ida3_spread[afternoon_mask] * 0.05 + np.random.normal(0, 0.2, afternoon_mask.sum()),
+        -2.0, 2.0
     )
 
     # I ensure total position doesn't exceed capacity
