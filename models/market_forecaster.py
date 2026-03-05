@@ -461,6 +461,294 @@ class IntraDaySubForecaster:
         return predictions
 
 
+class IDASubForecaster:
+    """
+    I forecast IDA clearing prices for each IntraDay Auction (IDA1/IDA2/IDA3).
+
+    IDA clearing prices are correlated with DAM but deviate due to updated
+    information (wind/solar forecast updates, demand changes, cross-border flows).
+    I predict the IDA-DAM spread rather than absolute prices, since the spread
+    is more stationary and easier to learn.
+
+    Architecture: One LightGBM model per IDA auction (3 total).
+    Each predicts hourly clearing prices for the delivery window:
+      - IDA1: 24 hours (00:00-24:00), gate D-1 15:00
+      - IDA2: 24 hours (00:00-24:00), gate D-1 22:00
+      - IDA3: 12 hours (12:00-24:00), gate D+0 10:00
+
+    Training target: synthetic IDA clearing prices (OU noise on DAM), since
+    real IDA clearing data is not available in sufficient quantity.
+    """
+
+    # I define IDA delivery windows and horizons
+    IDA_CONFIG = {
+        1: {'delivery_hours': list(range(24)), 'gate_hour': 15, 'name': 'IDA1'},
+        2: {'delivery_hours': list(range(24)), 'gate_hour': 22, 'name': 'IDA2'},
+        3: {'delivery_hours': list(range(12, 24)), 'gate_hour': 10, 'name': 'IDA3'},
+    }
+
+    def __init__(self):
+        self.models = {}  # I store one model per IDA number {1: model, 2: model, 3: model}
+        self.is_trained = False
+
+    def _synthesize_ida_prices(self, dam_prices: np.ndarray, ida_number: int,
+                                seed: int = None) -> np.ndarray:
+        """
+        I generate synthetic IDA clearing prices using Ornstein-Uhlenbeck noise on DAM.
+
+        IDA prices deviate from DAM due to updated forecasts:
+        - IDA1 (9-33h before delivery): σ=4 EUR/MWh (closest to DAM, least new info)
+        - IDA2 (2-26h before delivery): σ=8 EUR/MWh (more volatile, more forecast updates)
+        - IDA3 (2-14h before delivery): σ=12 EUR/MWh (most volatile, last correction)
+
+        I use OU process with mean-reversion to DAM (θ=0.3) so spreads don't drift.
+        """
+        rng = np.random.RandomState(seed)
+        n = len(dam_prices)
+
+        # I set volatility by IDA auction (later = more volatile)
+        sigma_map = {1: 4.0, 2: 8.0, 3: 12.0}
+        sigma = sigma_map.get(ida_number, 8.0)
+        theta = 0.3  # Mean-reversion speed to DAM
+
+        # I simulate OU process for spread
+        spread = np.zeros(n)
+        dt = 1.0  # hourly
+        for i in range(1, n):
+            spread[i] = (spread[i-1]
+                         - theta * spread[i-1] * dt
+                         + sigma * np.sqrt(dt) * rng.normal())
+
+        ida_prices = dam_prices + spread
+        # I ensure non-negative prices
+        ida_prices = np.maximum(ida_prices, 0.0)
+        return ida_prices
+
+    def build_features(self, df: pd.DataFrame, idx: int, ida_number: int) -> np.ndarray:
+        """
+        I build feature vector for IDA price prediction (~25 features).
+
+        Features are available at each IDA gate closure:
+        - DAM prices for delivery day (known at D-1 12:00)
+        - Historical IDA-DAM spread patterns (7-day rolling)
+        - Current ISP1 UP/DOWN prices (real market signal)
+        - Recent imbalance direction/magnitude
+        - aFRR capacity price (system stress indicator)
+        - Calendar features (hour, DoW, month)
+        """
+        row = df.iloc[idx]
+        ts = df.index[idx]
+        sph = max(1, int(round(1.0 / (df.index[1] - df.index[0]).total_seconds() * 3600))) if len(df) > 1 else 1
+
+        features = []
+
+        # I add DAM price statistics for the delivery day (5 features)
+        dam_price = row.get('price', 80.0)
+        features.append(dam_price / 100.0)
+
+        # I compute 24h DAM stats (known at gate closure)
+        w24 = 24 * sph
+        start = max(0, idx - w24)
+        recent_prices = df.iloc[start:idx]['price'].values
+        if len(recent_prices) > 0:
+            features.append(np.mean(recent_prices) / 100.0)
+            features.append(np.std(recent_prices) / 50.0 if len(recent_prices) > 1 else 0.2)
+            features.append(np.max(recent_prices) / 100.0)
+            features.append(np.min(recent_prices) / 100.0)
+        else:
+            features.extend([0.8, 0.2, 1.2, 0.6])
+
+        # I add ISP1 UP/DOWN prices (real, available at gate time) (3 features)
+        isp1_up = row.get('isp1_price_up', dam_price)
+        isp1_down = row.get('isp1_price_down', dam_price)
+        features.append(isp1_up / 100.0)
+        features.append(isp1_down / 100.0)
+        features.append((isp1_up - isp1_down) / 100.0)  # ISP1 bid-ask spread
+
+        # I add imbalance features (3 features)
+        net_imb = row.get('net_imbalance_mw_lag_1h', row.get('net_imbalance_mw', 0.0))
+        features.append(np.sign(net_imb))
+        features.append(min(abs(net_imb) / 500.0, 1.0))
+        imb_price = row.get('imbalance_price_lag_1h', dam_price)
+        features.append((imb_price - dam_price) / 100.0)
+
+        # I add aFRR capacity price (system stress indicator) (1 feature)
+        features.append(row.get('afrr_cap_up_price', 20.0) / 50.0)
+
+        # I add mFRR spread (1 feature)
+        mfrr_up = row.get('mfrr_price_up_lag_1h', row.get('mfrr_price_up', 120.0))
+        mfrr_down = row.get('mfrr_price_down_lag_1h', row.get('mfrr_price_down', 60.0))
+        features.append((mfrr_up - mfrr_down) / 200.0)
+
+        # I add price lags for same hour (4 features)
+        for lag_days in [1, 2, 3, 7]:
+            lag_idx = idx - lag_days * 24 * sph
+            if 0 <= lag_idx < len(df):
+                features.append(df.iloc[lag_idx].get('price', dam_price) / 100.0)
+            else:
+                features.append(dam_price / 100.0)
+
+        # I add calendar features (6 features)
+        hour = ts.hour + ts.minute / 60.0
+        dow = ts.dayofweek
+        month = ts.month
+        features.append(np.sin(2 * np.pi * hour / 24))
+        features.append(np.cos(2 * np.pi * hour / 24))
+        features.append(np.sin(2 * np.pi * dow / 7))
+        features.append(np.cos(2 * np.pi * dow / 7))
+        features.append(np.sin(2 * np.pi * month / 12))
+        features.append(np.cos(2 * np.pi * month / 12))
+
+        # I add IDA-specific signal: which IDA this is (1 feature)
+        features.append(ida_number / 3.0)
+
+        # I add Serbia DAM spread (1 feature)
+        serbia = row.get('serbia_dam_price', np.nan)
+        if not np.isnan(serbia):
+            features.append((serbia - dam_price) / 100.0)
+        else:
+            features.append(0.0)
+
+        return np.array(features, dtype=np.float32)
+
+    def fit(
+        self,
+        df: pd.DataFrame,
+        train_end_idx: int,
+        val_end_idx: int
+    ) -> 'IDASubForecaster':
+        """I train one LightGBM model per IDA auction."""
+        try:
+            import lightgbm as lgb
+        except ImportError:
+            print("  WARNING: LightGBM not available, IDA forecaster will use DAM fallback")
+            return self
+
+        sph = max(1, int(round(1.0 / (df.index[1] - df.index[0]).total_seconds() * 3600))) if len(df) > 1 else 1
+
+        print("  Training IDA sub-forecaster (3 auction models)...")
+
+        for ida_num in [1, 2, 3]:
+            X_train, y_train = [], []
+            X_val, y_val = [], []
+
+            # I generate synthetic IDA prices for training targets
+            dam_prices = df['price'].values
+            ida_prices = self._synthesize_ida_prices(dam_prices, ida_num, seed=42 + ida_num)
+
+            for idx in range(48 * sph, len(df)):
+                features = self.build_features(df, idx, ida_num)
+                # I predict the IDA clearing price (target = synthetic IDA price)
+                target = ida_prices[idx]
+
+                if idx < train_end_idx:
+                    X_train.append(features)
+                    y_train.append(target)
+                elif idx < val_end_idx:
+                    X_val.append(features)
+                    y_val.append(target)
+
+            if len(X_train) < 100:
+                print(f"    IDA{ida_num}: insufficient training data ({len(X_train)} samples)")
+                continue
+
+            X_train = np.array(X_train)
+            y_train = np.array(y_train)
+
+            params = {
+                'objective': 'regression',
+                'metric': 'mae',
+                'max_depth': 6,
+                'n_estimators': 500,
+                'learning_rate': 0.05,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8,
+                'verbose': -1,
+            }
+
+            model = lgb.LGBMRegressor(**params)
+
+            if len(X_val) > 10:
+                X_v = np.array(X_val)
+                y_v = np.array(y_val)
+                model.fit(
+                    X_train, y_train,
+                    eval_set=[(X_v, y_v)],
+                    callbacks=[lgb.early_stopping(50, verbose=False)]
+                )
+            else:
+                model.fit(X_train, y_train)
+
+            self.models[ida_num] = model
+            print(f"    IDA{ida_num}: trained on {len(X_train)} samples")
+
+        self.is_trained = len(self.models) > 0
+        print(f"  IDA: trained {len(self.models)}/3 auction models")
+        return self
+
+    def predict(self, df: pd.DataFrame, idx: int, ida_number: int) -> np.ndarray:
+        """
+        I predict IDA clearing prices for the delivery window.
+
+        Returns:
+            Array of hourly clearing price predictions for the delivery period.
+            IDA1/IDA2: 24 values (hours 0-23)
+            IDA3: 12 values (hours 12-23)
+        """
+        config = self.IDA_CONFIG[ida_number]
+        delivery_hours = config['delivery_hours']
+        n_hours = len(delivery_hours)
+        predictions = np.zeros(n_hours)
+
+        sph = max(1, int(round(1.0 / (df.index[1] - df.index[0]).total_seconds() * 3600))) if len(df) > 1 else 1
+
+        if self.is_trained and ida_number in self.models:
+            # I predict for each hour in the delivery window
+            for h_idx, hour in enumerate(delivery_hours):
+                # I build features at the gate closure time (current idx)
+                features = self.build_features(df, idx, ida_number).reshape(1, -1)
+                predictions[h_idx] = self.models[ida_number].predict(features)[0]
+        else:
+            # I fall back to DAM prices with OU-noise for uncertainty
+            for h_idx, hour in enumerate(delivery_hours):
+                target_idx = idx + hour * sph
+                if 0 <= target_idx < len(df):
+                    dam_price = df.iloc[target_idx].get('price', 80.0)
+                else:
+                    dam_price = df.iloc[idx].get('price', 80.0)
+                # I add small noise to avoid oracle effect
+                noise_std = {1: 4.0, 2: 8.0, 3: 12.0}.get(ida_number, 8.0)
+                predictions[h_idx] = dam_price + np.random.normal(0, noise_std)
+
+        # I ensure non-negative prices
+        predictions = np.maximum(predictions, 0.0)
+        return predictions
+
+    def predict_mean_spread(self, df: pd.DataFrame, idx: int, ida_number: int) -> float:
+        """
+        I predict the mean IDA-DAM spread for the delivery window.
+
+        Positive spread means IDA > DAM (sell on IDA is profitable).
+        Negative spread means IDA < DAM (buy on IDA is profitable).
+        """
+        ida_prices = self.predict(df, idx, ida_number)
+        config = self.IDA_CONFIG[ida_number]
+        delivery_hours = config['delivery_hours']
+        sph = max(1, int(round(1.0 / (df.index[1] - df.index[0]).total_seconds() * 3600))) if len(df) > 1 else 1
+
+        dam_prices = []
+        for hour in delivery_hours:
+            target_idx = idx + hour * sph
+            if 0 <= target_idx < len(df):
+                dam_prices.append(df.iloc[target_idx].get('price', 80.0))
+            else:
+                dam_prices.append(df.iloc[idx].get('price', 80.0))
+
+        dam_prices = np.array(dam_prices)
+        spread = np.mean(ida_prices - dam_prices)
+        return float(spread)
+
+
 class ImbalanceSubForecaster:
     """
     I forecast system imbalance direction and magnitude for the next 4 hours.
@@ -1088,6 +1376,7 @@ class MarketForecaster:
         self.dam_forecaster = DAMSubForecaster()
         self.intraday_forecaster = IntraDaySubForecaster()
         self.imbalance_forecaster = ImbalanceSubForecaster()
+        self.ida_forecaster = IDASubForecaster()
 
     def fit(
         self,
@@ -1103,6 +1392,7 @@ class MarketForecaster:
         self.dam_forecaster.fit(df, train_end_idx, val_end_idx)
         self.intraday_forecaster.fit(df, train_end_idx, val_end_idx)
         self.imbalance_forecaster.fit(df, train_end_idx, val_end_idx)
+        self.ida_forecaster.fit(df, train_end_idx, val_end_idx)
 
         print("  All sub-forecasters trained.")
         return self
@@ -1116,16 +1406,27 @@ class MarketForecaster:
             'dam_forecast_std': array[24] — confidence (std)
             'id_forecast': dict {1: price, 2: price, 4: price, 8: price}
             'imbalance': dict {direction, magnitude, opportunity_score}
+            'ida_forecasts': dict {1: array[24], 2: array[24], 3: array[12]}
+            'ida_spreads': dict {1: float, 2: float, 3: float} — mean IDA-DAM spread
         """
         dam_preds, dam_stds = self.dam_forecaster.predict_with_confidence(df, idx, 24)
         id_preds = self.intraday_forecaster.predict(df, idx)
         imb_preds = self.imbalance_forecaster.predict(df, idx)
+
+        # I add IDA price forecasts for each auction
+        ida_forecasts = {}
+        ida_spreads = {}
+        for ida_num in [1, 2, 3]:
+            ida_forecasts[ida_num] = self.ida_forecaster.predict(df, idx, ida_num)
+            ida_spreads[ida_num] = self.ida_forecaster.predict_mean_spread(df, idx, ida_num)
 
         return {
             'dam_forecast_24h': dam_preds,
             'dam_forecast_std': dam_stds,
             'id_forecast': id_preds,
             'imbalance': imb_preds,
+            'ida_forecasts': ida_forecasts,
+            'ida_spreads': ida_spreads,
         }
 
     def batch_predict(
@@ -1224,6 +1525,7 @@ class MarketForecaster:
                 'dam': self.dam_forecaster,
                 'intraday': self.intraday_forecaster,
                 'imbalance': self.imbalance_forecaster,
+                'ida': self.ida_forecaster,
             }, f)
         print(f"MarketForecaster saved to {path}")
 
@@ -1237,4 +1539,6 @@ class MarketForecaster:
         forecaster.dam_forecaster = data['dam']
         forecaster.intraday_forecaster = data['intraday']
         forecaster.imbalance_forecaster = data['imbalance']
+        # I handle backward compatibility for older saved files without IDA
+        forecaster.ida_forecaster = data.get('ida', IDASubForecaster())
         return forecaster

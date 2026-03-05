@@ -3,7 +3,8 @@ Unified Multi-Market Battery Trading Environment
 
 I implement a single unified environment that handles ALL markets:
 - DAM (Day-Ahead Market) commitment tracking
-- IntraDay (XBID/HEnEx) energy trading — voluntary arbitrage
+- XBID continuous energy trading (ISP1 UP/DOWN bid-ask spread) — voluntary arbitrage
+- IDA1/IDA2/IDA3 auctions (rule-based, NN-forecast driven) — locked commitments
 - aFRR (automatic Frequency Restoration Reserve) capacity + energy
 - mFRR (manual Frequency Restoration Reserve) energy trading — balancing market
 
@@ -130,6 +131,10 @@ class BatteryEnvUnified(gym.Env):
         # Endogenous DAM (Phase 4: agent-decided commitments)
         enable_endogenous_dam: bool = False,
         dam_bidder_min_spread: float = 30.0,
+
+        # IDA schedule configuration
+        ida_min_spread: float = 5.0,  # Minimum IDA-DAM spread to act (EUR/MWh)
+        ida_forecaster: object = None,  # Optional IDASubForecaster instance
     ):
         super().__init__()
 
@@ -163,6 +168,10 @@ class BatteryEnvUnified(gym.Env):
         self.enable_endogenous_dam = enable_endogenous_dam
         self.dam_bidder_min_spread = dam_bidder_min_spread
         self.dam_schedule = None  # I store the 24h schedule generated at episode reset
+
+        # I store IDA schedule configuration
+        self.ida_min_spread = ida_min_spread
+        self.ida_forecaster = ida_forecaster
 
         # I store configuration
         self.df = df.copy()
@@ -341,6 +350,23 @@ class BatteryEnvUnified(gym.Env):
         df = df.fillna(method='ffill').fillna(method='bfill')
         self.df = df
 
+        # I precompute date-based mappings to avoid O(n) scans in _get_dam_commitment.
+        # Previously, each call did `self.df.index.date == current_day` which converted
+        # all 57k timestamps to dates — this was 90% of the step time.
+        dates = self.df.index.date
+        self._step_day_offset = np.zeros(len(self.df), dtype=np.int32)
+        self._step_day_id = np.zeros(len(self.df), dtype=np.int32)
+        current_date = None
+        day_id = -1
+        day_start = 0
+        for i, d in enumerate(dates):
+            if d != current_date:
+                current_date = d
+                day_id += 1
+                day_start = i
+            self._step_day_offset[i] = i - day_start
+            self._step_day_id[i] = day_id
+
         # I calculate step limits
         self.start_step = self.warmup_steps
         self.max_steps = len(self.df) - 1 - self.lookahead_steps
@@ -369,7 +395,7 @@ class BatteryEnvUnified(gym.Env):
             ])
 
         # I compute dynamic observation size based on enabled feature groups
-        n_obs = 66  # Base features (Groups 1-9) + cycles_remaining
+        n_obs = 68  # Base features (Groups 1-9) + predicted_soc_eod + dam_net_energy_ratio
         if self.enable_forecast:
             n_obs += 9   # IntraDay forecast + RES fundamentals
         if self.enable_market_forecast:
@@ -405,10 +431,25 @@ class BatteryEnvUnified(gym.Env):
 
         # I track full market mode profits
         self.ida_profit = 0.0
+        self.ida1_profit = 0.0
+        self.ida2_profit = 0.0
+        self.ida3_profit = 0.0
         self.xbid_profit = 0.0
         self.free_bid_profit = 0.0
         self.free_bid_activations = 0
         self.free_bid_submissions = 0
+
+        # I track IDA schedules (per-QH MW arrays, locked at gate closure)
+        self.ida1_schedule = None  # Per-QH MW locked at IDA1 gate (D-1 15:00)
+        self.ida2_schedule = None  # Per-QH MW locked at IDA2 gate (D-1 22:00)
+        self.ida3_schedule = None  # Per-QH MW locked at IDA3 gate (D 10:00)
+        self.ida1_locked_today = False
+        self.ida2_locked_today = False
+        self.ida3_locked_today = False
+
+        # I track IDA violations (like DAM violations)
+        self.episode_ida_violation_cost = 0.0
+        self.episode_ida_violation_steps = 0
 
         # I track cycling
         self.total_cycles = 0.0
@@ -451,6 +492,7 @@ class BatteryEnvUnified(gym.Env):
         # I generate endogenous DAM schedule if enabled (Phase 4)
         if self.enable_endogenous_dam:
             self.dam_schedule = self._generate_endogenous_dam_schedule()
+            self._dam_schedule_day_id = self._step_day_id[self.current_step]
 
         obs = self._build_observation()
         info = self._get_info()
@@ -463,14 +505,27 @@ class BatteryEnvUnified(gym.Env):
         return ts.dayofyear + ts.year * 1000
 
     def _check_day_reset(self):
-        """I reset daily cycling counter and regenerate DAM schedule at day boundaries."""
+        """I reset daily cycling counter, IDA schedules, and regenerate DAM schedule at day boundaries."""
         current_day = self._get_current_day()
         if self.current_day is None or current_day != self.current_day:
             self.current_day = current_day
             self.daily_cycles = 0.0
+            # I reset IDA schedules for the new day
+            self.ida1_schedule = None
+            self.ida2_schedule = None
+            self.ida3_schedule = None
+            self.ida1_locked_today = False
+            self.ida2_locked_today = False
+            self.ida3_locked_today = False
             # I regenerate endogenous DAM schedule for the new day
             if self.enable_endogenous_dam:
                 self.dam_schedule = self._generate_endogenous_dam_schedule()
+                self._dam_schedule_day_id = self._step_day_id[self.current_step]
+
+    def set_degradation_cost(self, cost: float):
+        """I allow the degradation curriculum callback to update the cost mid-training."""
+        if hasattr(self, 'reward_calculator'):
+            self.reward_calculator.degradation_cost = cost
 
     def action_masks(self) -> np.ndarray:
         """
@@ -692,11 +747,35 @@ class BatteryEnvUnified(gym.Env):
         self._check_day_reset()
 
         # =====================================================================
+        # STAGE 0: IDA GATE TRIGGERS (rule-based, NN-forecast driven)
+        # I check if we're at an IDA gate closure timestamp. If so, I generate
+        # and lock the IDA schedule before processing the agent's action.
+        # The agent's action dim[2] controls participation level during gate steps.
+        # =====================================================================
+        if self.enable_full_market:
+            ts_gate = self.df.index[self.current_step]
+            gate_hour = ts_gate.hour
+            gate_minute = ts_gate.minute
+
+            # I compute participation level from the IntraDay action (reused for IDA)
+            # At gate steps: 11 levels → [-100%, ..., 0, 0, 0, ..., +100%]
+            # I use abs() since direction is determined by the schedule generator
+            ida_action_raw = action[2]
+            ida_level = abs(self.INTRADAY_LEVELS[ida_action_raw])  # 0.0 to 1.0
+
+            if gate_hour == 15 and gate_minute == 0 and not self.ida1_locked_today:
+                self._trigger_ida_gate(ida_number=1, participation_level=ida_level)
+            elif gate_hour == 22 and gate_minute == 0 and not self.ida2_locked_today:
+                self._trigger_ida_gate(ida_number=2, participation_level=ida_level)
+            elif gate_hour == 10 and gate_minute == 0 and not self.ida3_locked_today:
+                self._trigger_ida_gate(ida_number=3, participation_level=ida_level)
+
+        # =====================================================================
         # STAGE 1: UNPACK ACTION
         # =====================================================================
         afrr_action = action[0]
         price_tier_action = action[1]
-        xbid_action = action[2]                    # Renamed from intraday_action
+        xbid_action = action[2]                    # XBID continuous / IDA participation
         mfrr_qty_action = action[3]                # mFRR qty (TSO-activated)
         freebid_qty_action = action[4] if self.enable_full_market else 5  # FreeBid qty (idle=5)
         freebid_price_action = action[5] if self.enable_full_market else 2  # FreeBid price (neutral=2)
@@ -871,30 +950,23 @@ class BatteryEnvUnified(gym.Env):
             remaining_after_afrr = remaining_capacity - abs(afrr_energy_delivered)
         else:
             self.steps_since_afrr_activation += 1
-            remaining_after_afrr = remaining_capacity
+            # I subtract aFRR committed MW even when not activated — the capacity
+            # is reserved for potential activation and must not be used for other
+            # markets. This matches the action mask logic (line 557).
+            remaining_after_afrr = max(0, remaining_capacity - self.afrr_commitment_mw)
 
         # =====================================================================
         # STAGE 6: EXECUTE IDA POSITIONS (locked, mandatory like DAM)
-        # I time-gate IDA positions per real market rules:
-        #   IDA1: delivers all ISPs (00:00-24:00), results from D-1 15:00
-        #   IDA2: delivers all ISPs (00:00-24:00), results from D-1 22:00
-        #   IDA3: delivers only 14:00-24:00, results from D+0 10:00
+        # I execute locked IDA schedules generated at gate closure.
+        # IDA positions are mandatory — the agent must deliver them.
+        # IDA1/IDA2: deliver 00:00-24:00, IDA3: deliver 12:00-24:00
         # =====================================================================
         ida_energy_mw = 0.0
+        ida_revenue = 0.0
+        ida_shortfall_mw = 0.0
         if self.enable_full_market:
-            ts = self.df.index[self.current_step]
-            hour = ts.hour
-
-            # I compute time-gated IDA position
-            ida1_pos = row.get('ida1_position', 0.0)
-            ida2_pos = row.get('ida2_position', 0.0)
-            ida3_pos = row.get('ida3_position', 0.0)
-
-            # IDA3 only delivers for ISPs >= 14:00
-            if hour < 14:
-                ida3_pos = 0.0
-
-            net_ida = ida1_pos + ida2_pos + ida3_pos
+            # I get the locked IDA commitment for this step
+            net_ida = self._get_ida_commitment(self.current_step)
             net_ida = np.clip(net_ida, -remaining_after_afrr, remaining_after_afrr)
 
             if abs(net_ida) > 0.1:
@@ -902,7 +974,7 @@ class BatteryEnvUnified(gym.Env):
                 available_discharge_mwh_ida = (self.soc - self.min_soc) * self.capacity_mwh
                 available_charge_mwh_ida = (self.max_soc - self.soc) * self.capacity_mwh
 
-                if net_ida > 0:  # Discharge
+                if net_ida > 0:  # Discharge (sell)
                     max_ida = min(net_ida,
                                   available_discharge_mwh_ida * self.eff_sqrt / self.time_step_hours)
                     if max_ida > 0.1:
@@ -913,7 +985,9 @@ class BatteryEnvUnified(gym.Env):
                         cycle_fraction = energy_mwh / self.capacity_mwh
                         self.total_cycles += cycle_fraction
                         self.daily_cycles += cycle_fraction
-                else:  # Charge
+                    # I check for shortfall (committed but couldn't deliver)
+                    ida_shortfall_mw = max(0, net_ida - max_ida) if max_ida > 0.1 else net_ida
+                else:  # Charge (buy)
                     max_ida = min(abs(net_ida),
                                   available_charge_mwh_ida / self.eff_sqrt / self.time_step_hours)
                     if max_ida > 0.1:
@@ -924,28 +998,62 @@ class BatteryEnvUnified(gym.Env):
                         cycle_fraction = energy_mwh / self.capacity_mwh
                         self.total_cycles += cycle_fraction
                         self.daily_cycles += cycle_fraction
+                    # I check for shortfall
+                    ida_shortfall_mw = max(0, abs(net_ida) - max_ida) if max_ida > 0.1 else abs(net_ida)
 
                 actual_energy_mw += ida_energy_mw
                 remaining_after_afrr -= abs(ida_energy_mw)
 
-            # I compute IDA revenue from individual auction clearing prices
-            ida_revenue = 0.0
+            # I compute IDA revenue from individual schedule positions
+            ts_ida = self.df.index[self.current_step]
+            current_day_ida = ts_ida.date()
+            day_mask_ida = self.df.index.date == current_day_ida
+            day_indices_ida = np.where(day_mask_ida)[0]
+            day_offset_ida = self.current_step - day_indices_ida[0] if len(day_indices_ida) > 0 else 0
+
+            ida1_pos = 0.0
+            if self.ida1_schedule is not None and 0 <= day_offset_ida < len(self.ida1_schedule):
+                ida1_pos = self.ida1_schedule[day_offset_ida]
+            ida2_pos = 0.0
+            if self.ida2_schedule is not None and 0 <= day_offset_ida < len(self.ida2_schedule):
+                ida2_pos = self.ida2_schedule[day_offset_ida]
+            ida3_pos = 0.0
+            if (self.ida3_schedule is not None and ts_ida.hour >= 12
+                    and 0 <= day_offset_ida < len(self.ida3_schedule)):
+                ida3_pos = self.ida3_schedule[day_offset_ida]
+
+            # I compute revenue per IDA at its clearing price
             if abs(ida1_pos) > 0.01:
                 p1 = row.get('ida1_clearing_price', row.get('price', 100.0))
-                ida_revenue += ida1_pos * p1 * self.time_step_hours
+                r1 = ida1_pos * p1 * self.time_step_hours
+                ida_revenue += r1
+                self.ida1_profit += r1
             if abs(ida2_pos) > 0.01:
                 p2 = row.get('ida2_clearing_price', row.get('price', 100.0))
-                ida_revenue += ida2_pos * p2 * self.time_step_hours
+                r2 = ida2_pos * p2 * self.time_step_hours
+                ida_revenue += r2
+                self.ida2_profit += r2
             if abs(ida3_pos) > 0.01:
                 p3 = row.get('ida3_clearing_price', row.get('price', 100.0))
-                ida_revenue += ida3_pos * p3 * self.time_step_hours
+                r3 = ida3_pos * p3 * self.time_step_hours
+                ida_revenue += r3
+                self.ida3_profit += r3
 
             # I scale proportionally if execution was clipped by SoC/capacity limits
-            if abs(net_ida) > 0.1 and abs(ida_energy_mw) > 0.01:
-                execution_ratio = abs(ida_energy_mw) / abs(net_ida)
+            net_ida_committed = abs(ida1_pos) + abs(ida2_pos) + abs(ida3_pos)
+            if net_ida_committed > 0.1 and abs(ida_energy_mw) > 0.01:
+                execution_ratio = min(1.0, abs(ida_energy_mw) / net_ida_committed)
                 ida_revenue *= execution_ratio
 
             self.ida_profit += ida_revenue
+
+            # I track IDA violations
+            if ida_shortfall_mw > 0.1:
+                self.episode_ida_violation_steps += 1
+                # I compute violation cost (1.5x clearing price, lighter than DAM's 2x)
+                avg_ida_price = row.get('ida1_clearing_price', row.get('price', 100.0))
+                ida_violation_cost = ida_shortfall_mw * avg_ida_price * 1.5 * self.time_step_hours
+                self.episode_ida_violation_cost += ida_violation_cost
 
         remaining_after_ida = remaining_after_afrr
 
@@ -1137,7 +1245,12 @@ class BatteryEnvUnified(gym.Env):
                     self.daily_cycles += cycle_fraction
 
                     intraday_energy_mw = actual_intraday
-                    xbid_energy_mw = 0.0  # I no longer distinguish XBID
+                    # I track XBID vs IDA profit separately for diagnostics
+                    if active_market == 'isp1':
+                        xbid_energy_mw = actual_intraday
+                        self.xbid_profit += intraday_revenue
+                    else:
+                        xbid_energy_mw = 0.0
                     self.intraday_profit += intraday_revenue
                     actual_energy_mw += actual_intraday
 
@@ -1226,16 +1339,21 @@ class BatteryEnvUnified(gym.Env):
         # =====================================================================
         # STAGE 10: CALCULATE REWARD
         # =====================================================================
-        # I use ADMIE single imbalance price for IntraDay settlement (no bid-ask spread)
+        # I use ISP1 UP/DOWN for XBID settlement (real bid-ask spread)
+        isp1_up = row.get('isp1_price_up', np.nan)
+        isp1_down = row.get('isp1_price_down', np.nan)
         imbalance_price = row.get('imbalance_price', row.get('price', 100.0))
         if np.isnan(imbalance_price) or imbalance_price <= 0:
             imbalance_price = row.get('price', 100.0)
+        # I prefer ISP1 UP for sell, ISP1 DOWN for buy; fall back to imbalance_price
+        xbid_sell = isp1_up if (not np.isnan(isp1_up) and isp1_up > 0) else imbalance_price
+        xbid_buy = isp1_down if (not np.isnan(isp1_down) and isp1_down > 0) else imbalance_price
         market_state = UnifiedMarketState(
             dam_price=row.get('price', 100.0),
             dam_commitment=dam_commitment,
-            intraday_bid=imbalance_price,   # single pricing (was ISP1 UP)
-            intraday_ask=imbalance_price,   # single pricing (was ISP1 DOWN)
-            intraday_spread=0.0,            # no bid-ask spread in single pricing
+            intraday_bid=xbid_sell,    # ISP1 UP for sell-side
+            intraday_ask=xbid_buy,     # ISP1 DOWN for buy-side
+            intraday_spread=max(0.0, xbid_sell - xbid_buy),  # Real bid-ask spread
             afrr_cap_up_price=row.get('afrr_cap_up_price', 20.0),
             afrr_cap_down_price=row.get('afrr_cap_down_price', 30.0),
             afrr_energy_up_price=row.get('afrr_up', 80.0),
@@ -1249,8 +1367,8 @@ class BatteryEnvUnified(gym.Env):
             ida2_clearing_price=row.get('ida2_clearing_price', 0.0),
             ida3_clearing_price=row.get('ida3_clearing_price', 0.0) if not np.isnan(row.get('ida3_clearing_price', 0.0)) else 0.0,
             net_ida_position=row.get('net_ida_position', 0.0),
-            xbid_bid=self._get_intraday_sell_price(None, row),
-            xbid_ask=self._get_intraday_buy_price(None, row),
+            xbid_bid=xbid_sell,
+            xbid_ask=xbid_buy,
             free_bid_activated=free_bid_activated,
             free_bid_agent_price=agent_bid_price if self.enable_full_market else 0.0,
         )
@@ -1282,6 +1400,8 @@ class BatteryEnvUnified(gym.Env):
             ida_energy_mw=ida_energy_mw,
             xbid_energy_mw=xbid_energy_mw,
             free_bid_energy_mw=free_bid_energy_mw,
+            # I pass IDA shortfall for violation penalty
+            ida_shortfall_mw=ida_shortfall_mw if self.enable_full_market else 0.0,
             # I pass daily_cycles for super-linear cycle excess penalty
             daily_cycles=self.daily_cycles,
         )
@@ -1587,6 +1707,35 @@ class BatteryEnvUnified(gym.Env):
             scale = total_charge / (total_discharge * 1.1 + 1e-6)
             hourly_schedule[hourly_schedule > 0] *= scale
 
+        # I simulate SoC trajectory and cap commitments that exceed physical limits.
+        # This runs AFTER energy balance so both buys and sells are finalized
+        # before I check against SoC headroom.
+        simulated_soc = self.soc
+        for h in range(len(hourly_schedule)):
+            commitment = hourly_schedule[h]
+            if commitment < -0.1:  # Buy/charge
+                soc_delta = abs(commitment) * 1.0 * self.eff_sqrt / self.capacity_mwh
+                new_soc = simulated_soc + soc_delta
+                if new_soc > self.max_soc:
+                    # I cap: only charge what headroom allows
+                    headroom = (self.max_soc - simulated_soc) * self.capacity_mwh
+                    max_power = headroom / (1.0 * self.eff_sqrt)
+                    hourly_schedule[h] = -max(max_power, 0.0)
+                    simulated_soc = self.max_soc
+                else:
+                    simulated_soc = new_soc
+            elif commitment > 0.1:  # Sell/discharge
+                soc_delta = commitment * 1.0 / self.eff_sqrt / self.capacity_mwh
+                new_soc = simulated_soc - soc_delta
+                if new_soc < self.min_soc:
+                    # I cap: only discharge what stored energy allows
+                    available = (simulated_soc - self.min_soc) * self.capacity_mwh
+                    max_power = available * self.eff_sqrt / 1.0
+                    hourly_schedule[h] = max(max_power, 0.0)
+                    simulated_soc = self.min_soc
+                else:
+                    simulated_soc = new_soc
+
         # I expand hourly schedule to sub-hourly resolution (same value per quarter-hour)
         schedule = np.repeat(hourly_schedule, self._sph)[:len(day_indices)]
 
@@ -1595,29 +1744,371 @@ class BatteryEnvUnified(gym.Env):
 
         return schedule
 
+    def _generate_ida_schedule(self, ida_number: int, participation_level: float = 1.0) -> np.ndarray:
+        """
+        I generate an IDA correction schedule based on NN price forecasts.
+
+        At gate closure, I compare forecasted IDA clearing prices vs existing
+        DAM+IDA commitments. I bid where the spread is favorable or where
+        correction is needed for SoC feasibility.
+
+        Args:
+            ida_number: 1, 2, or 3
+            participation_level: 0.0-1.0 scaling factor (from agent action)
+
+        Returns:
+            Per-QH MW schedule for the delivery window (24*sph or 12*sph values).
+            Positive = sell/discharge, Negative = buy/charge.
+        """
+        ts = self.df.index[self.current_step]
+        current_day = ts.date()
+
+        # I determine delivery window for this IDA
+        if ida_number == 3:
+            delivery_hours = list(range(12, 24))
+        else:
+            delivery_hours = list(range(0, 24))
+        n_hours = len(delivery_hours)
+
+        # I get day indices for the delivery day
+        day_mask = self.df.index.date == current_day
+        day_indices = np.where(day_mask)[0]
+
+        if len(day_indices) < n_hours * self._sph:
+            return np.zeros(n_hours * self._sph)
+
+        # I get NN forecast for IDA clearing prices
+        if self.ida_forecaster is not None and hasattr(self.ida_forecaster, 'predict'):
+            forecast_prices = self.ida_forecaster.predict(
+                self.df, self.current_step, ida_number
+            )
+        elif self.market_forecaster is not None and hasattr(self.market_forecaster, 'ida_forecaster'):
+            forecast_prices = self.market_forecaster.ida_forecaster.predict(
+                self.df, self.current_step, ida_number
+            )
+        else:
+            # I use DAM prices with noise as fallback
+            forecast_prices = np.zeros(n_hours)
+            for h_idx, hour in enumerate(delivery_hours):
+                qh_idx = day_indices[0] + hour * self._sph
+                if qh_idx < len(self.df):
+                    forecast_prices[h_idx] = self.df.iloc[qh_idx].get('price', 80.0)
+                else:
+                    forecast_prices[h_idx] = 80.0
+            # I add noise to avoid oracle effect
+            noise_std = {1: 4.0, 2: 8.0, 3: 12.0}.get(ida_number, 8.0)
+            forecast_prices += np.random.normal(0, noise_std, n_hours)
+            forecast_prices = np.maximum(forecast_prices, 0.0)
+
+        # I get existing committed schedule (DAM + prior IDAs)
+        existing_schedule = self._get_total_committed_schedule(delivery_hours, day_indices)
+
+        # I simulate SoC trajectory under existing commitments
+        soc_trajectory = self._simulate_soc_trajectory_for_ida(existing_schedule, delivery_hours, day_indices)
+
+        # I compute remaining capacity for each QH
+        ida_schedule = np.zeros(n_hours * self._sph)
+
+        for h_idx, hour in enumerate(delivery_hours):
+            # I get DAM price for this hour (known at gate closure)
+            qh_idx = day_indices[0] + hour * self._sph
+            if qh_idx < len(self.df):
+                dam_price = self.df.iloc[qh_idx].get('price', 80.0)
+            else:
+                dam_price = 80.0
+
+            ida_price = forecast_prices[h_idx]
+            committed_mw = existing_schedule[h_idx * self._sph] if h_idx * self._sph < len(existing_schedule) else 0.0
+            predicted_soc = soc_trajectory[h_idx] if h_idx < len(soc_trajectory) else 0.5
+
+            # I compute remaining capacity after existing commitments
+            remaining = self.max_power_mw - abs(committed_mw) - self.afrr_commitment_mw
+            remaining = max(0, remaining)
+
+            correction_mw = 0.0
+
+            # CASE 1: SoC correction needed (safety override)
+            if predicted_soc > 0.88 and committed_mw < -0.1:
+                # I am overcharging — reduce charging or add sell position
+                correction_mw = min(abs(committed_mw) * 0.5, remaining)
+
+            elif predicted_soc < 0.12 and committed_mw > 0.1:
+                # I am over-discharging — reduce discharge or add buy position
+                correction_mw = -min(committed_mw * 0.5, remaining)
+
+            # CASE 2: Arbitrage opportunity (spread exceeds threshold)
+            elif ida_price > dam_price + self.ida_min_spread:
+                # I sell on IDA (higher price than DAM commitment)
+                power = remaining * min(1.0, (ida_price - dam_price) / 50.0)
+                correction_mw = power * np.random.uniform(0.5, 1.0)
+
+            elif ida_price < dam_price - self.ida_min_spread:
+                # I buy on IDA (lower price than DAM commitment)
+                power = remaining * min(1.0, (dam_price - ida_price) / 50.0)
+                correction_mw = -power * np.random.uniform(0.5, 1.0)
+
+            # I apply to all QHs within this hour
+            for qh in range(self._sph):
+                slot = h_idx * self._sph + qh
+                if slot < len(ida_schedule):
+                    ida_schedule[slot] = correction_mw
+
+        # I apply SoC trajectory simulation to cap infeasible positions
+        ida_schedule = self._soc_cap_ida_schedule(ida_schedule, existing_schedule,
+                                                   delivery_hours, day_indices)
+
+        # I scale by agent's participation level
+        ida_schedule *= participation_level
+
+        # I clip to inverter limits
+        ida_schedule = np.clip(ida_schedule, -self.max_power_mw, self.max_power_mw)
+
+        return ida_schedule
+
+    def _get_total_committed_schedule(self, delivery_hours: list,
+                                       day_indices: np.ndarray) -> np.ndarray:
+        """
+        I return the total committed MW schedule (DAM + prior IDAs) for the delivery window.
+
+        Returns per-QH MW array (positive = sell, negative = buy).
+        """
+        n_qh = len(delivery_hours) * self._sph
+        schedule = np.zeros(n_qh)
+
+        for h_idx, hour in enumerate(delivery_hours):
+            for qh in range(self._sph):
+                slot = h_idx * self._sph + qh
+                qh_idx = day_indices[0] + hour * self._sph + qh
+                if qh_idx < len(self.df):
+                    # I get DAM commitment
+                    dam = self._get_dam_commitment(qh_idx)
+                    schedule[slot] = dam
+
+                    # I add prior IDA commitments
+                    if self.ida1_schedule is not None and qh_idx - day_indices[0] < len(self.ida1_schedule):
+                        schedule[slot] += self.ida1_schedule[qh_idx - day_indices[0]]
+                    if self.ida2_schedule is not None and qh_idx - day_indices[0] < len(self.ida2_schedule):
+                        schedule[slot] += self.ida2_schedule[qh_idx - day_indices[0]]
+                    # I don't add IDA3 here because IDA3 is the current one being generated
+                    # (or not yet generated)
+
+        return schedule
+
+    def _simulate_soc_trajectory_for_ida(self, committed_schedule: np.ndarray,
+                                          delivery_hours: list,
+                                          day_indices: np.ndarray) -> np.ndarray:
+        """
+        I simulate SoC trajectory under existing commitments for the delivery window.
+
+        Returns per-hour SoC array (one value per delivery hour).
+        """
+        soc = self.soc
+        trajectory = np.zeros(len(delivery_hours))
+
+        for h_idx, hour in enumerate(delivery_hours):
+            # I sum MW across all QHs in this hour
+            total_mw = 0.0
+            for qh in range(self._sph):
+                slot = h_idx * self._sph + qh
+                if slot < len(committed_schedule):
+                    total_mw += committed_schedule[slot]
+            avg_mw = total_mw / self._sph if self._sph > 0 else 0.0
+
+            # I update SoC
+            if avg_mw > 0.1:  # Sell/discharge
+                energy = avg_mw * 1.0 / self.eff_sqrt
+                soc = max(self.min_soc, soc - energy / self.capacity_mwh)
+            elif avg_mw < -0.1:  # Buy/charge
+                energy = abs(avg_mw) * 1.0 * self.eff_sqrt
+                soc = min(self.max_soc, soc + energy / self.capacity_mwh)
+
+            trajectory[h_idx] = soc
+
+        return trajectory
+
+    def _soc_cap_ida_schedule(self, ida_schedule: np.ndarray,
+                               existing_schedule: np.ndarray,
+                               delivery_hours: list,
+                               day_indices: np.ndarray) -> np.ndarray:
+        """
+        I cap IDA schedule positions that would violate SoC limits.
+
+        I simulate the combined trajectory (existing + IDA) and reduce
+        IDA positions where SoC would breach min/max limits.
+        """
+        soc = self.soc
+        capped = ida_schedule.copy()
+
+        for h_idx, hour in enumerate(delivery_hours):
+            for qh in range(self._sph):
+                slot = h_idx * self._sph + qh
+                if slot >= len(capped):
+                    break
+
+                # I combine existing + proposed IDA
+                existing_mw = existing_schedule[slot] if slot < len(existing_schedule) else 0.0
+                total_mw = existing_mw + capped[slot]
+
+                if total_mw > 0.1:  # Net sell/discharge
+                    energy = total_mw * self.time_step_hours / self.eff_sqrt
+                    new_soc = soc - energy / self.capacity_mwh
+                    if new_soc < self.min_soc:
+                        # I reduce the IDA sell position
+                        available = max(0, (soc - self.min_soc) * self.capacity_mwh * self.eff_sqrt / self.time_step_hours)
+                        max_ida_sell = max(0, available - existing_mw) if existing_mw > 0 else available
+                        capped[slot] = min(capped[slot], max_ida_sell)
+                        total_mw = existing_mw + capped[slot]
+                    soc = max(self.min_soc, soc - total_mw * self.time_step_hours / self.eff_sqrt / self.capacity_mwh)
+
+                elif total_mw < -0.1:  # Net buy/charge
+                    energy = abs(total_mw) * self.time_step_hours * self.eff_sqrt
+                    new_soc = soc + energy / self.capacity_mwh
+                    if new_soc > self.max_soc:
+                        # I reduce the IDA buy position
+                        headroom = max(0, (self.max_soc - soc) * self.capacity_mwh / self.eff_sqrt / self.time_step_hours)
+                        max_ida_buy = max(0, headroom - abs(existing_mw)) if existing_mw < 0 else headroom
+                        capped[slot] = max(capped[slot], -max_ida_buy)
+                        total_mw = existing_mw + capped[slot]
+                    soc = min(self.max_soc, soc + abs(total_mw) * self.time_step_hours * self.eff_sqrt / self.capacity_mwh)
+
+        return capped
+
+    def _trigger_ida_gate(self, ida_number: int, participation_level: float):
+        """
+        I trigger IDA gate closure: generate and lock the IDA schedule.
+
+        This is called at the gate closure timestamp for each IDA auction.
+        The generated schedule becomes a mandatory commitment (like DAM).
+        """
+        schedule = self._generate_ida_schedule(ida_number, participation_level)
+
+        ts = self.df.index[self.current_step]
+        current_day = ts.date()
+        day_mask = self.df.index.date == current_day
+        day_indices = np.where(day_mask)[0]
+        n_qh_day = len(day_indices)
+
+        if ida_number == 1:
+            # IDA1 delivers all QHs (00:00-24:00)
+            self.ida1_schedule = np.zeros(n_qh_day)
+            # I map schedule to full-day indices
+            for h_idx, hour in enumerate(range(0, 24)):
+                for qh in range(self._sph):
+                    slot = h_idx * self._sph + qh
+                    day_slot = hour * self._sph + qh
+                    if slot < len(schedule) and day_slot < n_qh_day:
+                        self.ida1_schedule[day_slot] = schedule[slot]
+            self.ida1_locked_today = True
+        elif ida_number == 2:
+            self.ida2_schedule = np.zeros(n_qh_day)
+            for h_idx, hour in enumerate(range(0, 24)):
+                for qh in range(self._sph):
+                    slot = h_idx * self._sph + qh
+                    day_slot = hour * self._sph + qh
+                    if slot < len(schedule) and day_slot < n_qh_day:
+                        self.ida2_schedule[day_slot] = schedule[slot]
+            self.ida2_locked_today = True
+        elif ida_number == 3:
+            self.ida3_schedule = np.zeros(n_qh_day)
+            # IDA3 delivers only 12:00-24:00
+            for h_idx, hour in enumerate(range(12, 24)):
+                for qh in range(self._sph):
+                    slot = h_idx * self._sph + qh
+                    day_slot = hour * self._sph + qh
+                    if slot < len(schedule) and day_slot < n_qh_day:
+                        self.ida3_schedule[day_slot] = schedule[slot]
+            self.ida3_locked_today = True
+
+    def _get_ida_commitment(self, step_idx: int) -> float:
+        """
+        I return the total locked IDA commitment for a given step.
+
+        I sum IDA1 + IDA2 + IDA3 positions, respecting delivery windows.
+        """
+        total = 0.0
+        ts = self.df.index[step_idx]
+        hour = ts.hour
+
+        # I compute offset within the day
+        current_day = ts.date()
+        day_mask = self.df.index.date == current_day
+        day_indices = np.where(day_mask)[0]
+        if len(day_indices) == 0:
+            return 0.0
+
+        day_offset = step_idx - day_indices[0]
+
+        # I add IDA1 (delivers 00:00-24:00)
+        if self.ida1_schedule is not None and 0 <= day_offset < len(self.ida1_schedule):
+            total += self.ida1_schedule[day_offset]
+
+        # I add IDA2 (delivers 00:00-24:00)
+        if self.ida2_schedule is not None and 0 <= day_offset < len(self.ida2_schedule):
+            total += self.ida2_schedule[day_offset]
+
+        # I add IDA3 (delivers 12:00-24:00 only)
+        if self.ida3_schedule is not None and hour >= 12 and 0 <= day_offset < len(self.ida3_schedule):
+            total += self.ida3_schedule[day_offset]
+
+        return total
+
     def _get_dam_commitment(self, step_idx: int) -> float:
         """
         I return the DAM commitment for a given step, using endogenous
         schedule if available, otherwise falling back to CSV data.
+
+        I use precomputed _step_day_id and _step_day_offset arrays for O(1)
+        lookup instead of the old O(n) `self.df.index.date == current_day` scan
+        that was converting 57k timestamps to dates on every call.
         """
         if self.enable_endogenous_dam and self.dam_schedule is not None:
-            # I compute the offset within the current day
-            ts = self.df.index[step_idx]
-            current_day = ts.date()
-            day_mask = self.df.index.date == current_day
-            day_indices = np.where(day_mask)[0]
-
-            if len(day_indices) > 0 and step_idx in day_indices:
-                local_idx = np.searchsorted(day_indices, step_idx)
-                if local_idx < len(self.dam_schedule):
-                    return float(self.dam_schedule[local_idx])
+            # I check if step_idx is in the same day as the current schedule
+            if (step_idx < len(self._step_day_id)
+                    and self._step_day_id[step_idx] == self._dam_schedule_day_id):
+                day_offset = self._step_day_offset[step_idx]
+                if day_offset < len(self.dam_schedule):
+                    return float(self.dam_schedule[day_offset])
 
         # I fall back to CSV data
         return float(self.df.iloc[step_idx].get('dam_commitment', 0.0))
 
+    def _predict_dam_soc(self) -> tuple:
+        """
+        I predict end-of-day SoC by simulating remaining DAM commitments.
+
+        I walk through remaining DAM commitments from current_step to end of
+        day, applying efficiency to compute SoC trajectory. This helps the
+        agent plan IntraDay/mFRR trades around the mandatory DAM schedule.
+
+        Returns:
+            (predicted_soc_eod, net_energy_mwh): Predicted SoC at end of day
+            and net energy direction of remaining schedule.
+        """
+        simulated_soc = self.soc
+        net_energy_mwh = 0.0
+
+        ts = self.df.index[self.current_step]
+        current_day = ts.date()
+
+        # I walk from current step to end of day
+        step = self.current_step
+        while step < len(self.df) and self.df.index[step].date() == current_day:
+            commitment = self._get_dam_commitment(step)
+            if commitment < -0.1:  # Buy/charge
+                energy = abs(commitment) * self.time_step_hours * self.eff_sqrt
+                simulated_soc = min(self.max_soc, simulated_soc + energy / self.capacity_mwh)
+                net_energy_mwh -= abs(commitment) * self.time_step_hours  # Negative = buying
+            elif commitment > 0.1:  # Sell/discharge
+                energy = commitment * self.time_step_hours / self.eff_sqrt
+                simulated_soc = max(self.min_soc, simulated_soc - energy / self.capacity_mwh)
+                net_energy_mwh += commitment * self.time_step_hours  # Positive = selling
+            step += 1
+
+        return simulated_soc, net_energy_mwh
+
     def _build_observation(self) -> np.ndarray:
         """
-        I build the observation vector (64-85 features depending on flags).
+        I build the observation vector (68-89 features depending on flags).
 
         Feature Groups:
         1. Battery State (4): soc, max_discharge, max_charge, cycles_remaining
@@ -1626,7 +2117,7 @@ class BatteryEnvUnified(gym.Env):
         4. DAM Lookahead (13): current + 12h commitments
         5. Price Lookahead (12): 12h price forecasts
         6. aFRR State (8): cap_prices, activation, commitment, selection, signal, hours_since
-        7. Risk/Imbalance (4): dam_discharge_reserve, shortfall_risk, momentum, worthiness
+        7. Risk/Imbalance (6): dam_discharge_reserve, shortfall_risk, momentum, worthiness, predicted_soc_eod, dam_net_energy_ratio
         8. Market Phase (4): ida3_correction, system_stress, res_penetration, mfrr_direction
         9. Timing Signals (4): price_vs_typical, is_peak, is_solar, hours_to_max
         10. IntraDay Forecast + RES (9, enable_forecast): fc_1h-8h, correction, spread, solar, wind, res_dev
@@ -1671,9 +2162,9 @@ class BatteryEnvUnified(gym.Env):
         dam_price = row.get('price', 100.0)
         features.append(dam_price / 100.0)  # [3] DAM price
 
-        # I use single imbalance pricing — no bid/ask spread for non-IDA settlement.
-        # The ADMIE imbalance price is the single settlement price for deviations.
-        # Profit comes from timing (trade when imbalance_price ≠ DAM), not from spread.
+        # I use lagged imbalance pricing for the observation signal.
+        # XBID settlement uses ISP1 UP/DOWN (real bid-ask spread) but obs shows
+        # the lagged imbalance price as a market condition indicator.
         imb_price_lag = row.get('imbalance_price_lag_1h', dam_price)
         net_imb_lag = row.get('net_imbalance_mw_lag_1h',
                               row.get('net_imbalance_mw', 0.0))
@@ -1798,7 +2289,7 @@ class BatteryEnvUnified(gym.Env):
         features.append(1.0 if self.is_selected_for_afrr else 0.0)
 
         # =====================================================================
-        # 7. RISK/IMBALANCE (4 features)
+        # 7. RISK/IMBALANCE (6 features)
         # =====================================================================
         # DAM discharge reserve — how much SoC the mask is reserving for future sells
         dam_min_soc, dam_max_soc = self._calculate_dam_soc_reserve()
@@ -1817,6 +2308,16 @@ class BatteryEnvUnified(gym.Env):
         price_std = row.get('price_std_24h', 20.0)
         worthiness = min(price_std / 50.0, 1.0)
         features.append(worthiness)
+
+        # Predicted SoC at end of day — I simulate remaining DAM commitments
+        # so the agent knows its SoC trajectory and can plan counter-trades
+        predicted_soc_eod, net_energy_mwh = self._predict_dam_soc()
+        features.append(np.clip(predicted_soc_eod, 0.0, 1.0))
+
+        # DAM net energy ratio — direction of remaining schedule
+        # Positive = sell-heavy (SoC will fall), negative = buy-heavy (SoC will rise)
+        dam_net_energy_ratio = np.clip(net_energy_mwh / self.capacity_mwh, -1.0, 1.0)
+        features.append(dam_net_energy_ratio)
 
         # =====================================================================
         # 8. MARKET PHASE & SYSTEM STATE (4 features)
@@ -2041,34 +2542,53 @@ class BatteryEnvUnified(gym.Env):
         if self.enable_full_market:
             imbalance_fm = row.get('net_imbalance_mw', 0.0)
 
-            # Group 10: IDA State (63-69)
-            features.append(row.get('ida1_position', 0.0) / self.max_power_mw)    # [63]
-            features.append(row.get('ida2_position', 0.0) / self.max_power_mw)    # [64]
-            features.append(row.get('ida3_position', 0.0) / self.max_power_mw)    # [65]
-            # [66]: Lagged imbalance settlement price (single pricing)
-            features.append(row.get('imbalance_price_lag_1h', dam_price) / 100.0)   # [66]
-            # [67]: System direction signal (helps agent decide sell/buy timing)
-            features.append(np.sign(row.get('net_imbalance_mw_lag_1h',
-                                            row.get('net_imbalance_mw', 0.0))))     # [67]
-            features.append(row.get('net_ida_position', 0.0) / self.max_power_mw) # [68]
-            features.append(1.0 if self._is_intraday_open(row) else 0.0)          # [69]
+            # Group 13: IDA State (8 features) — replaces old Groups 10-12
+            # [0] IDA phase (0.0=pre-IDA1, 0.25=post-IDA1, 0.5=post-IDA2, 0.75=post-IDA3, 1.0=delivery)
+            features.append(self._get_ida_phase(row))
 
-            # Group 11: Free Bid State (70-72)
-            features.append(1.0 if abs(imbalance_fm) > self.mfrr_imbalance_threshold else 0.0)  # [70]
-            features.append(row.get('free_bid_activation_base', 0.3))              # [71]
-            features.append(row.get('free_bid_reference_price', 100.0) / 100.0)   # [72]
+            # [1] Hours to next IDA gate closure (normalized 0-1)
+            features.append(self._get_hours_to_next_ida_gate() / 24.0)
 
-            # Group 12: ISP Cascade Quality (73-74)
-            # [73]: Lagged cascade spread (yesterday's ISP3-ISP1) — no future info
-            features.append(row.get('isp_cascade_spread_up_lag_24h', 0.0) / 100.0)  # [73]
-            features.append(self._get_time_to_delivery(row) / 24.0)               # [74]
+            # [2] IDA net commitment (total locked IDA MW / max_power)
+            ida_net = self._get_ida_commitment(self.current_step)
+            features.append(np.clip(ida_net / self.max_power_mw, -1.0, 1.0))
+
+            # [3] Total net commitment (DAM + IDA net) / max_power
+            total_net = dam_commitment + ida_net
+            features.append(np.clip(total_net / self.max_power_mw, -1.0, 1.0))
+
+            # [4] IDA forecast vs DAM spread (next IDA, clipped -1 to 1)
+            ida_fc_spread = self._get_ida_forecast_vs_dam_spread(row)
+            features.append(np.clip(ida_fc_spread / 50.0, -1.0, 1.0))
+
+            # [5] XBID spread (ISP1 UP - ISP1 DOWN, normalized)
+            isp1_up_obs = row.get('isp1_price_up', dam_price)
+            isp1_down_obs = row.get('isp1_price_down', dam_price)
+            xbid_spread = max(0, isp1_up_obs - isp1_down_obs)
+            features.append(min(xbid_spread / 50.0, 1.0))
+
+            # [6] SoC trajectory feasibility (1=feasible, 0=violation expected)
+            soc_feasible = 1.0 if self._check_soc_trajectory_feasible() else 0.0
+            features.append(soc_feasible)
+
+            # [7] IDA correction needed (signed magnitude)
+            correction_needed = self._get_ida_correction_signal()
+            features.append(np.clip(correction_needed, -1.0, 1.0))
+
+            # Free Bid State (3 features — preserved from old Group 11)
+            features.append(1.0 if abs(imbalance_fm) > self.mfrr_imbalance_threshold else 0.0)
+            features.append(row.get('free_bid_activation_base', 0.3))
+            features.append(row.get('free_bid_reference_price', 100.0) / 100.0)
+
+            # ISP Cascade Quality (1 feature — compressed from old Group 12)
+            features.append(row.get('isp_cascade_spread_up_lag_24h', 0.0) / 100.0)
 
         # =====================================================================
         # VALIDATION
         # =====================================================================
         obs = np.array(features, dtype=np.float32)
 
-        expected_features = 66  # Base features (Groups 1-9) including cycles_remaining
+        expected_features = 68  # Base features (Groups 1-9) + predicted_soc_eod + dam_net_energy_ratio
         if self.enable_forecast:
             expected_features += 9
         if self.enable_market_forecast:
@@ -2081,6 +2601,111 @@ class BatteryEnvUnified(gym.Env):
         obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
 
         return obs
+
+    def _get_hours_to_next_ida_gate(self) -> float:
+        """I return hours until the next IDA gate closure."""
+        ts = self.df.index[self.current_step]
+        hour = ts.hour + ts.minute / 60.0
+
+        # IDA gate closures: D-1 15:00 (IDA1), D-1 22:00 (IDA2), D+0 10:00 (IDA3)
+        # I compute distance to the next gate within the current day
+        if hour < 10:
+            return 10.0 - hour  # Next: IDA3 at 10:00
+        elif hour < 15:
+            return 15.0 - hour  # Next: IDA1 at 15:00 (for next day)
+        elif hour < 22:
+            return 22.0 - hour  # Next: IDA2 at 22:00
+        else:
+            return 24.0 - hour + 10.0  # Next: IDA3 at 10:00 tomorrow
+
+    def _get_ida_forecast_vs_dam_spread(self, row) -> float:
+        """I return the mean forecast IDA-DAM spread for the next upcoming IDA."""
+        ts = self.df.index[self.current_step]
+        hour = ts.hour
+
+        # I determine which IDA gate is next
+        if hour < 10:
+            next_ida = 3
+        elif hour < 15:
+            next_ida = 1
+        elif hour < 22:
+            next_ida = 2
+        else:
+            next_ida = 3  # Tomorrow's IDA3
+
+        # I try to get forecast spread
+        if self.ida_forecaster is not None and hasattr(self.ida_forecaster, 'predict_mean_spread'):
+            try:
+                return self.ida_forecaster.predict_mean_spread(
+                    self.df, self.current_step, next_ida
+                )
+            except Exception:
+                pass
+
+        if (self.market_forecaster is not None
+                and hasattr(self.market_forecaster, 'ida_forecaster')):
+            try:
+                return self.market_forecaster.ida_forecaster.predict_mean_spread(
+                    self.df, self.current_step, next_ida
+                )
+            except Exception:
+                pass
+
+        # I fall back to pre-computed column or zero
+        return row.get(f'ida{next_ida}_forecast_vs_dam', 0.0)
+
+    def _check_soc_trajectory_feasible(self) -> bool:
+        """
+        I check if the current DAM+IDA schedule can execute without SoC violation.
+
+        I simulate the combined trajectory through end of day and check
+        if SoC stays within [min_soc, max_soc] bounds.
+        """
+        soc = self.soc
+        ts = self.df.index[self.current_step]
+        current_day = ts.date()
+
+        step = self.current_step
+        while step < len(self.df) and self.df.index[step].date() == current_day:
+            dam = self._get_dam_commitment(step)
+            ida = self._get_ida_commitment(step)
+            total = dam + ida
+
+            if total > 0.1:  # Sell/discharge
+                energy = total * self.time_step_hours / self.eff_sqrt
+                soc -= energy / self.capacity_mwh
+                if soc < self.min_soc - 0.01:
+                    return False
+            elif total < -0.1:  # Buy/charge
+                energy = abs(total) * self.time_step_hours * self.eff_sqrt
+                soc += energy / self.capacity_mwh
+                if soc > self.max_soc + 0.01:
+                    return False
+            step += 1
+
+        return True
+
+    def _get_ida_correction_signal(self) -> float:
+        """
+        I compute the signed magnitude of SoC correction needed.
+
+        Positive = I need to reduce discharge (buy more / sell less)
+        Negative = I need to reduce charge (sell more / buy less)
+        """
+        predicted_soc, _ = self._predict_dam_soc()
+
+        # I also account for IDA commitments
+        ida_total = self._get_ida_commitment(self.current_step)
+
+        # I compute how far the predicted SoC is from the safe zone
+        if predicted_soc < 0.15:
+            # I am going too low — need positive correction (buy more)
+            return (0.15 - predicted_soc) / 0.15  # 0 to 1.0
+        elif predicted_soc > 0.85:
+            # I am going too high — need negative correction (sell more)
+            return -(predicted_soc - 0.85) / 0.15  # -1.0 to 0
+        else:
+            return 0.0  # No correction needed
 
     def _get_intraday_market(self, row):
         """I determine which ISP session price to use. No XBID.
@@ -2113,7 +2738,8 @@ class BatteryEnvUnified(gym.Env):
     def _is_intraday_open(self, row):
         """I check if any IntraDay market (IDA or XBID) is open for trading.
 
-        I open IntraDay for all hours 00:00-22:59 (covers IDA1/2/3 + XBID).
+        I close XBID at hour >= 23 (gate closure ~1h before delivery end).
+        IDA auctions have their own gate closures handled by _get_intraday_market().
         aFRR and IntraDay execute in parallel — no blocking needed.
         """
         ts = self.df.index[self.current_step]
@@ -2150,13 +2776,12 @@ class BatteryEnvUnified(gym.Env):
             return 0.0    # Before any IDA results
 
     def _get_intraday_sell_price(self, active_market, row):
-        """I return the sell (discharge) price for IntraDay settlement.
+        """I return the sell (discharge) price for IntraDay/XBID settlement.
 
-        I use ADMIE single imbalance pricing for non-IDA hours.
-        In the Greek market, all deviations settle at one imbalance_price —
-        there is no separate UP/DOWN bid-ask spread. Profit comes from timing
-        (trade when imbalance_price ≠ DAM), not from a guaranteed spread.
-        For IDA auctions, I still use the IDA clearing price.
+        For IDA auctions: I use the IDA clearing price (pay-as-cleared).
+        For XBID continuous: I use ISP1 UP price (sell-side of the bid-ask spread).
+        ISP1 UP > ISP1 DOWN creates a real spread — profit comes from both
+        timing AND the buy/sell differential, not just imbalance deviations.
         """
         if active_market in ('ida1', 'ida2', 'ida3'):
             # IDA auctions: single clearing price (same for buy/sell)
@@ -2167,20 +2792,24 @@ class BatteryEnvUnified(gym.Env):
                 if ts.hour < 14:
                     id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
             return id_price
-        # I use ADMIE single imbalance price for both buy AND sell
+        # I use ISP1 UP for selling (XBID continuous) — this is the sell-side
+        # clearing price from the first ISP session, available ~18h before delivery
+        isp1_up = row.get('isp1_price_up', np.nan)
+        if not np.isnan(isp1_up) and isp1_up > 0:
+            return isp1_up
+        # I fall back to imbalance_price, then DAM
         imb = row.get('imbalance_price', np.nan)
         if not np.isnan(imb) and imb > 0:
             return imb
-        return row.get('price', 100.0)  # DAM fallback
+        return row.get('price', 100.0)
 
     def _get_intraday_buy_price(self, active_market, row):
-        """I return the buy (charge) price for IntraDay settlement.
+        """I return the buy (charge) price for IntraDay/XBID settlement.
 
-        I use ADMIE single imbalance pricing for non-IDA hours.
-        In the Greek market, all deviations settle at one imbalance_price —
-        there is no separate UP/DOWN bid-ask spread. The price already encodes
-        system direction: HIGH during deficit, LOW during surplus.
-        For IDA auctions, I still use the IDA clearing price.
+        For IDA auctions: I use the IDA clearing price (pay-as-cleared).
+        For XBID continuous: I use ISP1 DOWN price (buy-side of the bid-ask spread).
+        ISP1 DOWN < ISP1 UP — buying at the lower price and selling at the
+        higher price creates arbitrage opportunity when spread > degradation cost.
         """
         if active_market in ('ida1', 'ida2', 'ida3'):
             # IDA auctions: single clearing price (same for buy/sell)
@@ -2191,11 +2820,16 @@ class BatteryEnvUnified(gym.Env):
                 if ts.hour < 14:
                     id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
             return id_price
-        # I use ADMIE single imbalance price for both buy AND sell
+        # I use ISP1 DOWN for buying (XBID continuous) — this is the buy-side
+        # clearing price from the first ISP session
+        isp1_down = row.get('isp1_price_down', np.nan)
+        if not np.isnan(isp1_down) and isp1_down > 0:
+            return isp1_down
+        # I fall back to imbalance_price, then DAM
         imb = row.get('imbalance_price', np.nan)
         if not np.isnan(imb) and imb > 0:
             return imb
-        return row.get('price', 100.0)  # DAM fallback
+        return row.get('price', 100.0)
 
     def _simulate_free_bid_activation(self, bid_price, ref_price, imbalance, row):
         """I simulate merit-order based Free Bid activation."""
@@ -2264,11 +2898,16 @@ class BatteryEnvUnified(gym.Env):
         if self.enable_full_market:
             info.update({
                 'ida_profit': self.ida_profit,
+                'ida1_profit': self.ida1_profit,
+                'ida2_profit': self.ida2_profit,
+                'ida3_profit': self.ida3_profit,
                 'xbid_profit': self.xbid_profit,
                 'free_bid_profit': self.free_bid_profit,
                 'free_bid_activation_rate': (
                     self.free_bid_activations / max(1, self.free_bid_submissions)
                 ),
+                'episode_ida_violation_cost': self.episode_ida_violation_cost,
+                'episode_ida_violation_steps': self.episode_ida_violation_steps,
             })
         return info
 

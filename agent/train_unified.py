@@ -30,7 +30,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import gymnasium as gym
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import (
     EvalCallback, CheckpointCallback, CallbackList, BaseCallback
 )
@@ -76,6 +76,41 @@ class EntropyAnnealingCallback(BaseCallback):
         return True
 
 
+class VecNormalizeSaveCallback(BaseCallback):
+    """
+    I save VecNormalize stats alongside best model and checkpoints.
+
+    Without this, mid-training evaluation cannot load VecNormalize
+    and the model receives un-normalized observations (garbage output).
+    I piggyback on EvalCallback's best_model detection: whenever
+    the best model file is newer than our last save, I save a copy.
+    """
+
+    def __init__(self, save_dir: str, save_freq: int = 50_000, verbose: int = 0):
+        super().__init__(verbose)
+        self.save_dir = Path(save_dir)
+        self.save_freq = save_freq
+        self._last_best_mtime = 0.0
+
+    def _on_step(self) -> bool:
+        # I save VecNormalize at checkpoint frequency
+        if self.num_timesteps % self.save_freq == 0:
+            vec_path = self.save_dir / "vec_normalize_unified.pkl"
+            self.training_env.save(str(vec_path))
+
+        # I also save alongside best model when it's updated
+        best_path = self.save_dir / "best" / "best_model.zip"
+        if best_path.exists():
+            mtime = best_path.stat().st_mtime
+            if mtime > self._last_best_mtime:
+                self._last_best_mtime = mtime
+                vec_best = self.save_dir / "best" / "vec_normalize_unified.pkl"
+                self.training_env.save(str(vec_best))
+                if self.verbose > 0:
+                    print(f"  VecNormalize saved alongside best model")
+        return True
+
+
 class DegradationCurriculumCallback(BaseCallback):
     """
     I implement curriculum learning for degradation cost.
@@ -105,11 +140,12 @@ class DegradationCurriculumCallback(BaseCallback):
         progress = min(1.0, self.num_timesteps / self.warmup_steps)
         self.current_degradation = progress * self.target_degradation
 
-        # I update the environment's reward calculator
-        if hasattr(self.training_env, 'envs'):
-            for env in self.training_env.envs:
-                if hasattr(env, 'reward_calculator'):
-                    env.reward_calculator.degradation_cost = self.current_degradation
+        # I update the environment's reward calculator via env_method,
+        # which works for both DummyVecEnv and SubprocVecEnv
+        try:
+            self.training_env.env_method("set_degradation_cost", self.current_degradation)
+        except AttributeError:
+            pass
 
         # I monitor explained_variance during the ramp phase (250k-750k)
         if (not self._warned_ev_drop
@@ -261,8 +297,11 @@ class TensorboardLoggingCallback(BaseCallback):
             if len(self.episode_lengths) > 0:
                 recent_lengths = self.episode_lengths[-100:]
                 recent_cycles = self.episode_cycles[-len(recent_lengths):]
-                # I get time_step_hours from the training env
-                time_step_h = getattr(self.training_env.envs[0].unwrapped, 'time_step_hours', 0.25)
+                # I get time_step_hours from the training env (works for both VecEnv types)
+                try:
+                    time_step_h = self.training_env.get_attr('time_step_hours', indices=[0])[0]
+                except (AttributeError, IndexError):
+                    time_step_h = 0.25
                 avg_ep_days = np.mean(recent_lengths) * time_step_h / 24.0
                 if avg_ep_days > 0:
                     self.logger.record('custom/cycles_per_day', np.mean(recent_cycles) / avg_ep_days)
@@ -355,6 +394,20 @@ class MaskableVecEnv(DummyVecEnv):
         return np.array([env.action_masks() for env in self.envs])
 
 
+class MaskableSubprocVecEnv(SubprocVecEnv):
+    """
+    I extend SubprocVecEnv to support action masking with MaskablePPO.
+
+    Each env runs in its own subprocess for true CPU parallelism.
+    On a 104-core workstation this gives ~8x speedup over DummyVecEnv
+    for the compute-heavy BatteryEnvUnified step() + action_masks() calls.
+    """
+
+    def action_masks(self):
+        """I collect action masks from all subprocess environments."""
+        return np.array(self.env_method("action_masks"))
+
+
 def create_training_env(
     data_path: str,
     battery_params: Optional[Dict] = None,
@@ -380,7 +433,7 @@ def create_training_env(
     # reward_scale raised from 0.001 to 0.01 for stronger NN signal.
     if reward_config is None:
         reward_config = {
-            'degradation_cost': 12.0,
+            'degradation_cost': degradation_cost,
             'dam_violation_penalty': 800.0,
             'afrr_nonresponse_penalty': 500.0,
             'soc_penalty_coeff': 0.005,
@@ -466,7 +519,9 @@ def train_unified_model(
     enable_endogenous_dam: bool = True,  # I enable forecast-powered DAM bidding by default
     dam_bidder_min_spread: float = 30.0,
     mfrr_activation_rate: float = 0.35,
-    mfrr_price_cap: float = 1000.0
+    mfrr_price_cap: float = 1000.0,
+    degradation_cost: float = 0.0,  # I default to 0 — let the agent decide cycling freely
+    use_subproc: bool = False,  # I default to DummyVecEnv; SubprocVecEnv has high IPC overhead on Windows
 ) -> str:
     """
     I train the unified multi-market model.
@@ -558,8 +613,16 @@ def train_unified_model(
             return env
         return _init
 
-    # I create vectorized environment with multiple parallel envs
-    train_env = MaskableVecEnv([make_train_env(i) for i in range(n_envs)])
+    # I create vectorized environment with multiple parallel envs.
+    # SubprocVecEnv runs each env in its own process for true CPU parallelism
+    # (8x speedup on multi-core machines vs sequential DummyVecEnv).
+    env_fns = [make_train_env(i) for i in range(n_envs)]
+    if use_subproc and n_envs > 1:
+        print(f"  Using SubprocVecEnv ({n_envs} processes for CPU parallelism)")
+        train_env = MaskableSubprocVecEnv(env_fns, start_method='spawn')
+    else:
+        print(f"  Using DummyVecEnv (sequential, single-process)")
+        train_env = MaskableVecEnv(env_fns)
 
     # I add VecNormalize for observation normalization only.
     # I disabled norm_reward because the reward_scale (0.01) in the
@@ -623,7 +686,7 @@ def train_unified_model(
     )
 
     curriculum_callback = DegradationCurriculumCallback(
-        target_degradation=12.0,  # I use 12 EUR/MWh — realistic LFP BESS cost at 8000+ cycles
+        target_degradation=degradation_cost,
         warmup_steps=min(500_000, total_timesteps // 5)
     )
 
@@ -634,12 +697,19 @@ def train_unified_model(
         end_ent=0.005         # I decay to 0.005 by end of training
     )
 
+    vec_save_callback = VecNormalizeSaveCallback(
+        save_dir=str(model_dir),
+        save_freq=50_000,     # I save every 50k steps (same as eval_freq)
+        verbose=1
+    )
+
     callbacks = CallbackList([
         eval_callback,
         checkpoint_callback,
         curriculum_callback,
         entropy_callback,
-        logging_callback
+        logging_callback,
+        vec_save_callback
     ])
 
     # I create or load the model
@@ -755,7 +825,7 @@ def train_unified_model(
         'dam_bidder_min_spread': dam_bidder_min_spread,
         'mfrr_activation_rate': mfrr_activation_rate,
         'mfrr_price_cap': mfrr_price_cap,
-        'degradation_cost': 12.0,
+        'degradation_cost': degradation_cost,
         'soc_penalty_coeff': 0.005,
         'timestamp': timestamp
     }
@@ -776,7 +846,7 @@ def train_unified_model(
         model.learn(
             total_timesteps=total_timesteps,
             callback=callbacks,
-            progress_bar=True,
+            progress_bar=False,
             reset_num_timesteps=reset_timesteps
         )
     except KeyboardInterrupt:
@@ -938,8 +1008,19 @@ def evaluate_model(
     # ----------------------------------------------------------------
     # 5. I load VecNormalize stats and wrap the eval env
     # ----------------------------------------------------------------
-    vec_path = model_dir / "vec_normalize_unified.pkl"
-    if vec_path.exists():
+    # I search for VecNormalize in multiple locations:
+    # 1. model_dir (root), 2. same dir as model file, 3. best/ subdir
+    vec_path = None
+    for candidate in [
+        model_dir / "vec_normalize_unified.pkl",
+        Path(model_path).parent / "vec_normalize_unified.pkl",
+        model_dir / "best" / "vec_normalize_unified.pkl",
+    ]:
+        if candidate.exists():
+            vec_path = candidate
+            break
+
+    if vec_path is not None:
         eval_vec = VecNormalize.load(str(vec_path), eval_vec)
         eval_vec.training = False
         eval_vec.norm_reward = False
@@ -1070,7 +1151,7 @@ def evaluate_model(
                     'cycle_excess_cost': round(info.get('cycle_excess_cost', 0), 2),
                     'calendar_aging_cost': round(info.get('calendar_aging_cost', 0), 2),
                     'dam_bonus': round(info.get('dam_bonus', 0), 2),
-                    'net_profit': round(step_net_profit, 2),
+                    'net_profit': round(step_trading_pnl, 2),
                     'reward': round(float(reward[0]), 6),
                     'cumulative_profit': round(info.get('total_profit', 0), 2),
                     'ida_energy_mw': round(info.get('ida_energy_mw', 0), 3),
@@ -1252,11 +1333,15 @@ if __name__ == "__main__":
                         help="mFRR bid activation probability (default: 0.35)")
     parser.add_argument("--mfrr-price-cap", type=float, default=1000.0,
                         help="mFRR settlement price cap EUR/MWh (default: 1000)")
+    parser.add_argument("--degradation-cost", type=float, default=0.0,
+                        help="Degradation cost EUR/MWh (default: 0 = no penalty)")
     parser.add_argument("--trace", type=str, default=None,
                         help="Path to write per-step CSV trace during evaluation "
                              "(e.g. eval_trace.csv)")
     parser.add_argument("--n-eval-episodes", type=int, default=10,
                         help="Number of evaluation episodes (default: 10)")
+    parser.add_argument("--subproc", action='store_true',
+                        help="Use SubprocVecEnv for multi-process parallelism (high IPC overhead on Windows)")
 
     args = parser.parse_args()
 
@@ -1289,7 +1374,9 @@ if __name__ == "__main__":
             enable_endogenous_dam=args.enable_endogenous_dam,
             dam_bidder_min_spread=args.dam_bidder_min_spread,
             mfrr_activation_rate=args.mfrr_activation_rate,
-            mfrr_price_cap=args.mfrr_price_cap
+            mfrr_price_cap=args.mfrr_price_cap,
+            degradation_cost=args.degradation_cost,
+            use_subproc=args.subproc
         )
 
         # I run evaluation on trained model

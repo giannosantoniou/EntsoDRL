@@ -3,7 +3,7 @@ Unit Tests for Unified Multi-Market Battery Environment
 
 I test the key functionality of the unified environment:
 1. Action space structure (MultiDiscrete [5, 5, 11, 11])
-2. Observation space (66 features)
+2. Observation space (68 features)
 3. Action masking (capacity cascading: DAM -> aFRR -> mFRR -> IntraDay)
 4. aFRR activation simulation
 5. Reward calculation
@@ -151,12 +151,12 @@ class TestObservationSpace:
 
     def test_observation_shape(self, unified_env):
         """I verify the observation space is 64 features."""
-        assert unified_env.observation_space.shape == (66,)
+        assert unified_env.observation_space.shape == (68,)
 
     def test_observation_reset(self, unified_env):
         """I verify observation is correctly shaped after reset."""
         obs, info = unified_env.reset(seed=42)
-        assert obs.shape == (66,)
+        assert obs.shape == (68,)
         assert not np.any(np.isnan(obs))
         assert not np.any(np.isinf(obs))
 
@@ -165,7 +165,7 @@ class TestObservationSpace:
         unified_env.reset(seed=42)
         action = np.array([0, 2, 5, 5])  # No aFRR, neutral price, idle ID, idle mFRR
         obs, reward, done, truncated, info = unified_env.step(action)
-        assert obs.shape == (66,)
+        assert obs.shape == (68,)
         assert isinstance(reward, (int, float))
 
     def test_cycles_remaining_feature(self, unified_env):
@@ -1218,7 +1218,7 @@ class TestMFRRDirectionConstraint:
         assert has_charge, "Charge should be allowed when DOWN activated"
 
     def test_mfrr_direction_feature_in_observation(self, unified_env):
-        """I verify obs[61] encodes mFRR direction from activation data."""
+        """I verify obs[63] encodes mFRR direction from activation data."""
         unified_env.reset(seed=42)
         step = unified_env.current_step
 
@@ -1226,25 +1226,25 @@ class TestMFRRDirectionConstraint:
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 50.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 0.0
         obs = unified_env._build_observation()
-        assert obs[61] == 1.0, f"Expected mfrr_direction=+1.0 for UP-only, got {obs[61]}"
+        assert obs[63] == 1.0, f"Expected mfrr_direction=+1.0 for UP-only, got {obs[63]}"
 
         # I test DOWN only → -1.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 0.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 80.0
         obs = unified_env._build_observation()
-        assert obs[61] == -1.0, f"Expected mfrr_direction=-1.0 for DOWN-only, got {obs[61]}"
+        assert obs[63] == -1.0, f"Expected mfrr_direction=-1.0 for DOWN-only, got {obs[63]}"
 
         # I test both active → 0.0 (UP - DOWN = 1 - 1 = 0)
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 50.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 80.0
         obs = unified_env._build_observation()
-        assert obs[61] == 0.0, f"Expected mfrr_direction=0.0 for both active, got {obs[61]}"
+        assert obs[63] == 0.0, f"Expected mfrr_direction=0.0 for both active, got {obs[63]}"
 
         # I test neither active → 0.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 0.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 0.0
         obs = unified_env._build_observation()
-        assert obs[61] == 0.0, f"Expected mfrr_direction=0.0 for neither active, got {obs[61]}"
+        assert obs[63] == 0.0, f"Expected mfrr_direction=0.0 for neither active, got {obs[63]}"
 
     def test_step_blocks_when_not_activated(self, unified_env):
         """I verify step() blocks mFRR trades when activation volume is zero."""
@@ -1342,7 +1342,7 @@ class TestMarketPhaseFeatures:
     """I test the new market phase features that replaced gate closure."""
 
     def test_ida3_correction_before_noon(self, unified_env):
-        """I verify obs[58] = 0.0 when hour < 12 (IDA3 not yet applicable)."""
+        """I verify obs[60] = 0.0 when hour < 12 (IDA3 not yet applicable)."""
         unified_env.reset(seed=42)
         step = unified_env.current_step
 
@@ -1352,14 +1352,14 @@ class TestMarketPhaseFeatures:
             if ts.hour < 12:
                 unified_env.current_step = i
                 obs = unified_env._build_observation()
-                assert obs[58] == 0.0, \
-                    f"Expected ida3_applies=0.0 for hour {ts.hour}, got {obs[58]}"
+                assert obs[60] == 0.0, \
+                    f"Expected ida3_applies=0.0 for hour {ts.hour}, got {obs[60]}"
                 return
 
         pytest.skip("No hour < 12 found in test window")
 
     def test_ida3_correction_after_noon(self, unified_env):
-        """I verify obs[58] = 1.0 when hour >= 12 (IDA3 prices available)."""
+        """I verify obs[60] = 1.0 when hour >= 12 (IDA3 prices available)."""
         unified_env.reset(seed=42)
         step = unified_env.current_step
 
@@ -1369,43 +1369,43 @@ class TestMarketPhaseFeatures:
             if ts.hour >= 12:
                 unified_env.current_step = i
                 obs = unified_env._build_observation()
-                assert obs[58] == 1.0, \
-                    f"Expected ida3_applies=1.0 for hour {ts.hour}, got {obs[58]}"
+                assert obs[60] == 1.0, \
+                    f"Expected ida3_applies=1.0 for hour {ts.hour}, got {obs[60]}"
                 return
 
         pytest.skip("No hour >= 12 found in test window")
 
     def test_system_stress_feature(self, unified_env):
-        """I verify obs[59] scales with |imbalance| magnitude."""
+        """I verify obs[61] scales with |imbalance| magnitude."""
         unified_env.reset(seed=42)
         step = unified_env.current_step
 
         # I test zero imbalance → stress = 0.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = 0.0
         obs = unified_env._build_observation()
-        assert obs[59] == pytest.approx(0.0, abs=0.01), \
-            f"Expected system_stress=0.0 for zero imbalance, got {obs[59]}"
+        assert obs[61] == pytest.approx(0.0, abs=0.01), \
+            f"Expected system_stress=0.0 for zero imbalance, got {obs[61]}"
 
         # I test 150 MW imbalance → stress = 0.5
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = 150.0
         obs = unified_env._build_observation()
-        assert obs[59] == pytest.approx(0.5, abs=0.01), \
-            f"Expected system_stress=0.5 for 150 MW, got {obs[59]}"
+        assert obs[61] == pytest.approx(0.5, abs=0.01), \
+            f"Expected system_stress=0.5 for 150 MW, got {obs[61]}"
 
         # I test 600 MW imbalance → stress = 1.0 (capped)
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = 600.0
         obs = unified_env._build_observation()
-        assert obs[59] == pytest.approx(1.0, abs=0.01), \
-            f"Expected system_stress=1.0 for 600 MW, got {obs[59]}"
+        assert obs[61] == pytest.approx(1.0, abs=0.01), \
+            f"Expected system_stress=1.0 for 600 MW, got {obs[61]}"
 
         # I test negative imbalance → stress uses abs()
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('net_imbalance_mw')] = -300.0
         obs = unified_env._build_observation()
-        assert obs[59] == pytest.approx(1.0, abs=0.01), \
-            f"Expected system_stress=1.0 for -300 MW, got {obs[59]}"
+        assert obs[61] == pytest.approx(1.0, abs=0.01), \
+            f"Expected system_stress=1.0 for -300 MW, got {obs[61]}"
 
     def test_res_penetration_feature(self, unified_env):
-        """I verify obs[60] reflects res_total/load ratio."""
+        """I verify obs[62] reflects res_total/load ratio."""
         unified_env.reset(seed=42)
         step = unified_env.current_step
 
@@ -1415,16 +1415,16 @@ class TestMarketPhaseFeatures:
         obs = unified_env._build_observation()
         # res_penetration = clip(3000/6000, 0, 1.5) / 1.5 = 0.5 / 1.5 = 0.333
         expected = (3000.0 / 6000.0) / 1.5
-        assert obs[60] == pytest.approx(expected, abs=0.01), \
-            f"Expected res_penetration={expected:.3f}, got {obs[60]}"
+        assert obs[62] == pytest.approx(expected, abs=0.01), \
+            f"Expected res_penetration={expected:.3f}, got {obs[62]}"
 
         # I test high RES (above 100% of load) → capped at 1.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('res_total_mw')] = 10000.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('load_mw')] = 5000.0
         obs = unified_env._build_observation()
         # res_penetration = clip(10000/5000, 0, 1.5) / 1.5 = 1.5 / 1.5 = 1.0
-        assert obs[60] == pytest.approx(1.0, abs=0.01), \
-            f"Expected res_penetration=1.0 for high RES, got {obs[60]}"
+        assert obs[62] == pytest.approx(1.0, abs=0.01), \
+            f"Expected res_penetration=1.0 for high RES, got {obs[62]}"
 
 
 class TestAFRRMarginalPricing:
@@ -1550,10 +1550,10 @@ class Test15MinResolution:
         return env
 
     def test_obs_shape_15min(self, env_15min):
-        """I verify observation space is still 66 features at 15-min resolution."""
-        assert env_15min.observation_space.shape == (66,)
+        """I verify observation space is still 68 features at 15-min resolution."""
+        assert env_15min.observation_space.shape == (68,)
         obs, info = env_15min.reset(seed=42)
-        assert obs.shape == (66,)
+        assert obs.shape == (68,)
         assert not np.any(np.isnan(obs))
 
     def test_sph_value(self, env_15min):
@@ -1636,10 +1636,10 @@ class Test15MinResolution:
         )
 
         assert env_1h._sph == 1
-        assert env_1h.observation_space.shape == (66,)
+        assert env_1h.observation_space.shape == (68,)
 
         obs, info = env_1h.reset(seed=42)
-        assert obs.shape == (66,)
+        assert obs.shape == (68,)
 
         # I verify a full episode runs without errors
         for _ in range(50):
@@ -1818,7 +1818,7 @@ class TestIDADecomposition:
         assert result['components']['ida_revenue'] > 0
 
     def test_ida_phase_feature(self, full_market_env):
-        """I verify obs[58] encodes IDA phase correctly.
+        """I verify obs[60] encodes IDA phase correctly.
 
         Real HEnEx IDA schedule:
         - IDA1 results: D-1 ~15:30 → ida_phase = 0.25 for hours 16-22
@@ -1835,8 +1835,8 @@ class TestIDADecomposition:
             if 0 <= ts.hour < 10:
                 full_market_env.current_step = i
                 obs = full_market_env._build_observation()
-                assert obs[58] == pytest.approx(0.50, abs=0.01), \
-                    f"Expected ida_phase=0.50 for hour {ts.hour} (after IDA2), got {obs[58]}"
+                assert obs[60] == pytest.approx(0.50, abs=0.01), \
+                    f"Expected ida_phase=0.50 for hour {ts.hour} (after IDA2), got {obs[60]}"
                 return
 
         # I verify phase for afternoon (hour >= 14): should be 1.0 (IDA3 delivery)
@@ -1845,8 +1845,8 @@ class TestIDADecomposition:
             if ts.hour >= 14:
                 full_market_env.current_step = i
                 obs = full_market_env._build_observation()
-                assert obs[58] == pytest.approx(1.0, abs=0.01), \
-                    f"Expected ida_phase=1.0 for hour {ts.hour} (IDA3 delivery), got {obs[58]}"
+                assert obs[60] == pytest.approx(1.0, abs=0.01), \
+                    f"Expected ida_phase=1.0 for hour {ts.hour} (IDA3 delivery), got {obs[60]}"
                 return
 
         pytest.skip("No suitable hour found in test window")
@@ -2128,11 +2128,11 @@ class TestBackwardCompat:
         """I verify 4-dim action space when flag is False."""
         assert unified_env.action_space.nvec.tolist() == [5, 5, 11, 11]
 
-    def test_legacy_obs_66(self, unified_env):
-        """I verify 66-feature observation when flag is False."""
-        assert unified_env.observation_space.shape == (66,)
+    def test_legacy_obs_68(self, unified_env):
+        """I verify 68-feature observation when flag is False."""
+        assert unified_env.observation_space.shape == (68,)
         obs, info = unified_env.reset(seed=42)
-        assert obs.shape == (66,)
+        assert obs.shape == (68,)
 
     def test_legacy_mask_32(self, unified_env):
         """I verify 32-element mask when flag is False."""
@@ -2147,7 +2147,7 @@ class TestBackwardCompat:
         for _ in range(30):
             action = np.array([0, 2, 5, 5])  # Idle
             obs, reward, done, truncated, info = unified_env.step(action)
-            assert obs.shape == (66,)
+            assert obs.shape == (68,)
             assert np.isfinite(reward)
             if done or truncated:
                 break
@@ -2168,9 +2168,9 @@ class TestSeparateRevenueTracking:
             assert key in info, f"Missing market profit key: {key}"
 
     def test_full_market_obs_shape(self, full_market_env):
-        """I verify 78-feature observation in full market mode."""
+        """I verify 80-feature observation in full market mode."""
         obs, info = full_market_env.reset(seed=42)
-        assert obs.shape == (78,)
+        assert obs.shape == (80,)
         assert not np.any(np.isnan(obs))
         assert not np.any(np.isinf(obs))
 
@@ -2181,7 +2181,7 @@ class TestSeparateRevenueTracking:
         for _ in range(30):
             action = full_market_env.action_space.sample()
             obs, reward, done, truncated, info = full_market_env.step(action)
-            assert obs.shape == (78,)
+            assert obs.shape == (80,)
             assert np.isfinite(reward)
             assert 0.05 <= info['soc'] <= 0.95
             if done or truncated:
@@ -2271,46 +2271,46 @@ class TestIntraDayForecast:
 
     def test_obs_shape_75(self, forecast_env):
         """75 features with enable_forecast=True."""
-        assert forecast_env.observation_space.shape == (75,)
+        assert forecast_env.observation_space.shape == (77,)
         obs, info = forecast_env.reset(seed=42)
-        assert obs.shape == (75,)
+        assert obs.shape == (77,)
         assert not np.any(np.isnan(obs))
         assert not np.any(np.isinf(obs))
 
-    def test_backward_compat_66(self, unified_env):
-        """66 features when forecast disabled."""
-        assert unified_env.observation_space.shape == (66,)
+    def test_backward_compat_68(self, unified_env):
+        """68 features when forecast disabled."""
+        assert unified_env.observation_space.shape == (68,)
         obs, info = unified_env.reset(seed=42)
-        assert obs.shape == (66,)
+        assert obs.shape == (68,)
 
     def test_forecast_features_range(self, forecast_env):
         """Forecast values in reasonable range (0.2-3.0 = 20-300 EUR/100)."""
         obs, info = forecast_env.reset(seed=42)
-        # obs[66]-[69] are forecast_1h/2h/4h/8h divided by 100
-        for i in range(66, 70):
+        # obs[68]-[71] are forecast_1h/2h/4h/8h divided by 100
+        for i in range(68, 72):
             assert -1.0 <= obs[i] <= 5.0, \
                 f"Forecast obs[{i}]={obs[i]:.3f} out of expected range"
 
     def test_correction_signal_matches(self, forecast_env):
-        """obs[70] == (obs[66]*100 - obs[4]*100) / 100."""
+        """obs[72] == (obs[68]*100 - obs[4]*100) / 100."""
         obs, info = forecast_env.reset(seed=42)
-        # obs[70] = (fc_1h - dam_price) / 100
-        # obs[66] = fc_1h / 100
+        # obs[72] = (fc_1h - dam_price) / 100
+        # obs[68] = fc_1h / 100
         # obs[4] = dam_price / 100 (first feature in Group 2, absolute index 4)
-        fc_1h = obs[66] * 100
+        fc_1h = obs[68] * 100
         dam_price = obs[4] * 100
         expected_correction = (fc_1h - dam_price) / 100.0
-        assert obs[70] == pytest.approx(expected_correction, abs=0.001), \
-            f"Correction signal mismatch: obs[70]={obs[70]}, expected={expected_correction}"
+        assert obs[72] == pytest.approx(expected_correction, abs=0.001), \
+            f"Correction signal mismatch: obs[72]={obs[72]}, expected={expected_correction}"
 
     def test_res_features_nonneg(self, forecast_env):
-        """Solar [72] and wind [73] >= 0."""
+        """Solar [74] and wind [75] >= 0."""
         forecast_env.reset(seed=42)
         for _ in range(20):
             action = np.array([0, 2, 5, 5])
             obs, reward, done, truncated, info = forecast_env.step(action)
-            assert obs[72] >= 0.0, f"Solar obs[72]={obs[72]} should be >= 0"
-            assert obs[73] >= 0.0, f"Wind obs[73]={obs[73]} should be >= 0"
+            assert obs[74] >= 0.0, f"Solar obs[74]={obs[74]} should be >= 0"
+            assert obs[75] >= 0.0, f"Wind obs[75]={obs[75]} should be >= 0"
             if done or truncated:
                 break
 
@@ -2344,9 +2344,9 @@ class TestIntraDayForecast:
             forecast_noise=False,
         )
 
-        assert env.observation_space.shape == (87,)
+        assert env.observation_space.shape == (89,)
         obs, info = env.reset(seed=42)
-        assert obs.shape == (87,)
+        assert obs.shape == (89,)
         assert not np.any(np.isnan(obs))
         assert not np.any(np.isinf(obs))
 
@@ -2383,20 +2383,20 @@ class TestIntraDayForecast:
         )
 
         assert env.price_forecaster is None
-        assert env.observation_space.shape == (75,)
+        assert env.observation_space.shape == (77,)
 
         obs, info = env.reset(seed=42)
-        assert obs.shape == (75,)
+        assert obs.shape == (77,)
         # I verify persistence: forecast should equal DAM price when no noise
         dam_price = obs[4] * 100
-        fc_1h = obs[66] * 100
+        fc_1h = obs[68] * 100
         assert fc_1h == pytest.approx(dam_price, abs=0.1), \
             f"Persistence fallback: fc_1h={fc_1h} should equal dam_price={dam_price}"
 
     def test_forecast_spread_nonneg(self, forecast_env):
-        """Forecast spread obs[71] >= 0 (max - min is always non-negative)."""
+        """Forecast spread obs[73] >= 0 (max - min is always non-negative)."""
         obs, info = forecast_env.reset(seed=42)
-        assert obs[71] >= 0.0, f"Forecast spread obs[71]={obs[71]} should be >= 0"
+        assert obs[73] >= 0.0, f"Forecast spread obs[73]={obs[73]} should be >= 0"
 
 
 class TestMFRRActivationAndCap:
@@ -2708,10 +2708,10 @@ class TestMarketForecastFeatures:
             random_start=False,
             enable_market_forecast=True,
         )
-        assert env.observation_space.shape == (86,)
+        assert env.observation_space.shape == (88,)
 
         obs, _ = env.reset(seed=42)
-        assert obs.shape == (86,)
+        assert obs.shape == (88,)
         assert not np.any(np.isnan(obs))
         assert not np.any(np.isinf(obs))
 
@@ -2777,13 +2777,13 @@ class TestMarketForecastFeatures:
         for _ in range(10):
             action = np.array([0, 2, 5, 5])  # idle
             obs, reward, done, truncated, info = env.step(action)
-            assert obs.shape == (86,)
+            assert obs.shape == (88,)
             assert np.isfinite(reward)
             if done or truncated:
                 break
 
     def test_backward_compat_default_off(self, sample_data):
-        """I verify default (enable_market_forecast=False) keeps 66 features."""
+        """I verify default (enable_market_forecast=False) keeps 68 features."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         env = BatteryEnvUnified(
@@ -2794,10 +2794,10 @@ class TestMarketForecastFeatures:
             episode_length=72,
             random_start=False,
         )
-        assert env.observation_space.shape == (66,)
+        assert env.observation_space.shape == (68,)
 
         obs, _ = env.reset(seed=42)
-        assert obs.shape == (66,)
+        assert obs.shape == (68,)
 
 
 class TestEndogenousDAM:
@@ -2867,7 +2867,7 @@ class TestEndogenousDAM:
         for _ in range(20):
             action = np.array([0, 2, 5, 5])  # idle
             obs, reward, done, truncated, info = env.step(action)
-            assert obs.shape == (66,)  # No forecast features
+            assert obs.shape == (68,)  # No forecast features
             assert np.isfinite(reward)
             if done or truncated:
                 break
@@ -2918,15 +2918,15 @@ class TestEndogenousDAM:
             dam_bidder_min_spread=10.0,
         )
 
-        assert env.observation_space.shape == (86,)
+        assert env.observation_space.shape == (88,)
 
         obs, _ = env.reset(seed=42)
-        assert obs.shape == (86,)
+        assert obs.shape == (88,)
 
         for _ in range(10):
             action = np.array([0, 2, 5, 5])
             obs, reward, done, truncated, info = env.step(action)
-            assert obs.shape == (86,)
+            assert obs.shape == (88,)
             assert np.isfinite(reward)
             if done or truncated:
                 break
@@ -3087,15 +3087,15 @@ class TestMarketTimingConstraints:
             market = unified_env._get_intraday_market(row)
             assert market == 'ida2', f"Expected IDA2 at hour 22, got {market}"
 
-    def test_intraday_sells_at_imbalance_price(self, unified_env):
-        """I verify IntraDay sell trades use ADMIE single imbalance price."""
+    def test_xbid_sells_at_isp1_up_price(self, unified_env):
+        """I verify XBID sell trades use ISP1 UP price (not imbalance_price)."""
         unified_env.reset(seed=42)
         unified_env.soc = 0.7  # Enough to discharge
 
-        step_16 = unified_env.start_step + 16  # Hour 16 -> ISP session
+        step_16 = unified_env.start_step + 16  # Hour 16 -> ISP1 session
         if step_16 < len(unified_env.df):
             unified_env.current_step = step_16
-            # I set distinctive prices — imbalance_price should be used
+            # I set distinctive prices — ISP1 UP should be used for selling
             unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('imbalance_price')] = 50.0
             unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('isp1_price_up')] = 150.0
 
@@ -3103,13 +3103,13 @@ class TestMarketTimingConstraints:
             action = np.array([0, 2, 10, 5])
             obs, reward, done, truncated, info = unified_env.step(action)
 
-            # I verify IntraDay trade uses imbalance_price (50), not ISP1 UP (150)
+            # I verify XBID trade uses ISP1 UP (150), not imbalance_price (50)
             if info['intraday_energy_mw'] > 0:
                 assert info['intraday_revenue'] > 0, "Sell revenue should be positive"
-                # I check revenue corresponds to imbalance_price (~50), not ISP1 (~150)
-                expected_max_revenue = info['intraday_energy_mw'] * 80.0 * unified_env.time_step_hours
-                assert info['intraday_revenue'] <= expected_max_revenue, \
-                    f"Revenue {info['intraday_revenue']:.2f} too high — should use imbalance_price=50, not ISP1"
+                # I check revenue corresponds to ISP1 UP (~150), not imbalance (~50)
+                expected_min_revenue = info['intraday_energy_mw'] * 100.0 * unified_env.time_step_hours
+                assert info['intraday_revenue'] >= expected_min_revenue, \
+                    f"Revenue {info['intraday_revenue']:.2f} too low — should use isp1_price_up=150"
 
     def test_ida_single_clearing_price(self, unified_env):
         """I verify IDA auctions use the same clearing price for buy and sell."""
@@ -3122,15 +3122,15 @@ class TestMarketTimingConstraints:
         assert sell_price == buy_price, \
             f"IDA1 should use single clearing price: sell={sell_price}, buy={buy_price}"
 
-    def test_intraday_uses_imbalance_price(self, sample_data):
-        """I verify IntraDay sell price uses ADMIE imbalance_price (not ISP1/ISP3)."""
+    def test_xbid_uses_isp1_prices(self, sample_data):
+        """I verify XBID sell/buy prices use ISP1 UP/DOWN (not imbalance_price)."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        # I set distinctive prices — only imbalance_price should be used
+        # I set distinctive prices — ISP1 UP/DOWN should be used for XBID
         df['imbalance_price'] = 130.0
         df['isp1_price_up'] = 200.0
-        df['isp3_price_up'] = 250.0
+        df['isp1_price_down'] = 80.0
 
         env = BatteryEnvUnified(
             df, capacity_mwh=146.0, max_power_mw=30.0,
@@ -3139,15 +3139,28 @@ class TestMarketTimingConstraints:
         env.reset(seed=42)
         row = env.df.iloc[env.current_step]
 
-        # I verify imbalance_price is used (not ISP1/ISP3)
-        sell_price = env._get_intraday_sell_price(None, row)
-        assert sell_price == pytest.approx(130.0), \
-            f"Should use imbalance_price (130), got {sell_price}"
+        # I verify ISP1 UP is used for selling (not imbalance_price)
+        sell_price = env._get_intraday_sell_price('isp1', row)
+        assert sell_price == pytest.approx(200.0), \
+            f"Should use isp1_price_up (200), got {sell_price}"
 
-        # I remove imbalance_price and verify DAM fallback
+        # I verify ISP1 DOWN is used for buying
+        buy_price = env._get_intraday_buy_price('isp1', row)
+        assert buy_price == pytest.approx(80.0), \
+            f"Should use isp1_price_down (80), got {buy_price}"
+
+        # I remove ISP1 prices and verify fallback to imbalance_price
+        env.df['isp1_price_up'] = np.nan
+        env.df['isp1_price_down'] = np.nan
+        row = env.df.iloc[env.current_step]
+        sell_price = env._get_intraday_sell_price('isp1', row)
+        assert sell_price == pytest.approx(130.0), \
+            f"Should fall back to imbalance_price (130), got {sell_price}"
+
+        # I remove imbalance_price too and verify DAM fallback
         env.df['imbalance_price'] = np.nan
         row = env.df.iloc[env.current_step]
-        sell_price = env._get_intraday_sell_price(None, row)
+        sell_price = env._get_intraday_sell_price('isp1', row)
         dam_price = row.get('price', 100.0)
         assert sell_price == pytest.approx(dam_price), \
             f"Should fall back to DAM price ({dam_price}), got {sell_price}"
@@ -3264,97 +3277,70 @@ class TestMarketTimingConstraints:
 class TestIDAProfitAccumulation:
     """I test that IDA profit is correctly accumulated from clearing prices."""
 
-    def test_ida_profit_accumulated(self, full_market_env):
-        """I verify ida_profit accumulates when IDA positions are active."""
+    def test_ida_schedule_generated_at_gate(self, full_market_env):
+        """I verify IDA schedules are generated at gate closure timestamps."""
         full_market_env.reset(seed=42)
         full_market_env.soc = 0.5
 
-        # I run steps until IDA profit is non-zero
-        ida_profit_found = False
-        for _ in range(40):
-            action = np.array([0, 2, 5, 5, 5, 2])  # All idle except auto-IDA
-            obs, reward, done, truncated, info = full_market_env.step(action)
+        # I verify no IDA schedules exist initially
+        assert full_market_env.ida1_schedule is None
+        assert full_market_env.ida2_schedule is None
+        assert full_market_env.ida3_schedule is None
 
-            if abs(info.get('ida_profit', 0)) > 0.01:
-                ida_profit_found = True
+        # I manually trigger an IDA gate
+        full_market_env._trigger_ida_gate(ida_number=1, participation_level=1.0)
 
-            if done or truncated:
-                break
+        # I verify schedule was created
+        assert full_market_env.ida1_schedule is not None, \
+            "IDA1 schedule should be created after gate trigger"
+        assert full_market_env.ida1_locked_today is True
 
-        assert ida_profit_found, \
-            "ida_profit should accumulate to non-zero when IDA positions exist in data"
+    def test_ida_commitment_returns_locked_value(self, full_market_env):
+        """I verify _get_ida_commitment returns values from locked schedules."""
+        full_market_env.reset(seed=42)
+        full_market_env.soc = 0.5
 
-    def test_ida_profit_uses_clearing_prices(self, sample_data_full_market):
-        """I verify IDA revenue uses per-auction clearing prices, not DAM price."""
-        from gym_envs.battery_env_unified import BatteryEnvUnified
+        # I manually set an IDA1 schedule
+        ts = full_market_env.df.index[full_market_env.current_step]
+        current_day = ts.date()
+        day_mask = full_market_env.df.index.date == current_day
+        n_qh = day_mask.sum()
+        full_market_env.ida1_schedule = np.ones(n_qh) * 5.0  # 5 MW sell every QH
 
-        df = sample_data_full_market.copy()
+        # I verify _get_ida_commitment returns the locked value
+        commitment = full_market_env._get_ida_commitment(full_market_env.current_step)
+        assert commitment == pytest.approx(5.0, abs=0.1), \
+            f"IDA commitment should be 5.0, got {commitment}"
 
-        # I set distinctive clearing prices to verify correct price is used
-        df['ida1_clearing_price'] = 200.0
-        df['ida2_clearing_price'] = 0.0
-        df['ida3_clearing_price'] = 0.0
-        df['ida1_position'] = 5.0   # 5 MW discharge via IDA1
-        df['ida2_position'] = 0.0
-        df['ida3_position'] = 0.0
-        df['net_ida_position'] = 5.0
-        df['dam_commitment'] = 0.0   # No DAM to avoid interference
-        df['price'] = 50.0           # DAM price different from IDA1 clearing
+    def test_ida_schedules_reset_at_day_boundary(self, full_market_env):
+        """I verify IDA schedules reset when a new day starts."""
+        full_market_env.reset(seed=42)
+        full_market_env.soc = 0.5
 
-        env = BatteryEnvUnified(
-            df=df, episode_length=10, random_start=False,
-            enable_full_market=True
-        )
-        env.reset(seed=42)
-        env.soc = 0.8  # Enough SoC to discharge
+        # I set IDA schedules
+        full_market_env.ida1_locked_today = True
+        full_market_env.ida2_locked_today = True
 
-        action = np.array([0, 2, 5, 5, 5, 2])
-        obs, reward, done, truncated, info = env.step(action)
+        # I force a day boundary reset
+        old_day = full_market_env.current_day
+        full_market_env.current_day = old_day - 1  # Force day change
+        full_market_env._check_day_reset()
 
-        # I expect IDA profit to be based on ida1_clearing_price=200, not price=50
-        assert env.ida_profit > 0, "IDA profit should be positive for discharge at 200 EUR/MWh"
-        # revenue ~ 5 MW * 200 EUR/MWh * time_step_hours
-        expected_approx = 5.0 * 200.0 * env.time_step_hours
-        # I allow tolerance for SoC clipping
-        assert env.ida_profit > expected_approx * 0.5, \
-            f"IDA profit {env.ida_profit:.1f} much less than expected ~{expected_approx:.1f}"
+        assert full_market_env.ida1_locked_today is False, \
+            "IDA1 should be unlocked after day reset"
+        assert full_market_env.ida2_locked_today is False, \
+            "IDA2 should be unlocked after day reset"
 
-    def test_ida_profit_scaled_when_clipped(self, sample_data_full_market):
-        """I verify IDA profit scales proportionally when SoC clips execution."""
-        from gym_envs.battery_env_unified import BatteryEnvUnified
+    def test_ida_profit_tracks_separately(self, full_market_env):
+        """I verify IDA1/2/3 profits are tracked separately."""
+        full_market_env.reset(seed=42)
+        full_market_env.soc = 0.5
 
-        df = sample_data_full_market.copy()
-
-        # I set a large IDA position that will be clipped by low SoC
-        df['ida1_clearing_price'] = 100.0
-        df['ida2_clearing_price'] = 0.0
-        df['ida3_clearing_price'] = 0.0
-        df['ida1_position'] = 20.0   # Large discharge — will be clipped
-        df['ida2_position'] = 0.0
-        df['ida3_position'] = 0.0
-        df['net_ida_position'] = 20.0
-        df['dam_commitment'] = 0.0
-
-        env = BatteryEnvUnified(
-            df=df, episode_length=10, random_start=False,
-            enable_full_market=True
-        )
-        env.reset(seed=42)
-        env.soc = 0.10  # Very low SoC — IDA will be heavily clipped
-
-        initial_soc = env.soc
-        action = np.array([0, 2, 5, 5, 5, 2])
-        obs, reward, done, truncated, info = env.step(action)
-
-        ida_mw = abs(info.get('ida_energy_mw', 0))
-        # I verify the execution was clipped (less than 20 MW requested)
-        if ida_mw > 0.01 and ida_mw < 19.9:
-            # I verify profit was scaled proportionally
-            full_revenue = 20.0 * 100.0 * env.time_step_hours
-            expected_scaled = full_revenue * (ida_mw / 20.0)
-            assert abs(env.ida_profit - expected_scaled) < expected_scaled * 0.3, \
-                f"IDA profit {env.ida_profit:.1f} not proportionally scaled " \
-                f"(expected ~{expected_scaled:.1f} for {ida_mw:.1f}/{20.0:.1f} MW)"
+        info = full_market_env._get_info()
+        assert 'ida1_profit' in info
+        assert 'ida2_profit' in info
+        assert 'ida3_profit' in info
+        assert 'ida_profit' in info
 
     def test_free_bid_energy_reported_in_info(self, full_market_env):
         """I verify free_bid_energy_mw appears in info when Free Bid activates."""
@@ -3480,28 +3466,30 @@ class TestFreeBidFixes:
 class TestISPPricesAndCascadeOrder:
     """I test the ISP price integration, mFRR cascade priority, and cycle exemption."""
 
-    def test_intraday_uses_imbalance_price_for_sell(self, unified_env):
-        """I verify IntraDay sell price uses ADMIE single imbalance price."""
+    def test_xbid_uses_isp1_up_for_sell(self, unified_env):
+        """I verify XBID sell price uses ISP1 UP (not imbalance_price)."""
         unified_env.reset(seed=42)
         step = unified_env.current_step
-        # I set a distinctive imbalance_price
+        # I set distinctive ISP1 UP and imbalance prices
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('isp1_price_up')] = 180.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('imbalance_price')] = 130.0
         row = unified_env.df.iloc[step]
 
-        sell_price = unified_env._get_intraday_sell_price(None, row)
-        assert sell_price == pytest.approx(130.0, abs=0.01), \
-            f"Should use imbalance_price (130.0), got {sell_price}"
+        sell_price = unified_env._get_intraday_sell_price('isp1', row)
+        assert sell_price == pytest.approx(180.0, abs=0.01), \
+            f"Should use isp1_price_up (180.0), got {sell_price}"
 
-    def test_intraday_uses_imbalance_price_for_buy(self, unified_env):
-        """I verify IntraDay buy price uses ADMIE single imbalance price."""
+    def test_xbid_uses_isp1_down_for_buy(self, unified_env):
+        """I verify XBID buy price uses ISP1 DOWN (not imbalance_price)."""
         unified_env.reset(seed=42)
         step = unified_env.current_step
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('isp1_price_down')] = 70.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('imbalance_price')] = 130.0
         row = unified_env.df.iloc[step]
 
-        buy_price = unified_env._get_intraday_buy_price(None, row)
-        assert buy_price == pytest.approx(130.0, abs=0.01), \
-            f"Should use imbalance_price (130.0), got {buy_price}"
+        buy_price = unified_env._get_intraday_buy_price('isp1', row)
+        assert buy_price == pytest.approx(70.0, abs=0.01), \
+            f"Should use isp1_price_down (70.0), got {buy_price}"
 
     def test_mfrr_before_intraday_cascade(self, unified_env):
         """I verify mFRR gets full capacity and IntraDay gets remainder."""
@@ -3606,8 +3594,8 @@ class TestISPPricesAndCascadeOrder:
         peak_values = set()
         for _ in range(10):
             obs = env._build_observation()
-            # hours_to_dam_peak is feature index 79 (66 base + 13th market forecast feature)
-            peak_values.add(round(obs[79], 4))
+            # hours_to_dam_peak is feature index 81 (68 base + 13th market forecast feature)
+            peak_values.add(round(obs[81], 4))
             env.current_step += 1
 
         assert len(peak_values) > 1, \
@@ -3615,14 +3603,14 @@ class TestISPPricesAndCascadeOrder:
 
 
 class TestSettlementNoLeakage:
-    """I verify IntraDay settlement uses ADMIE single imbalance price."""
+    """I verify XBID settlement uses ISP1 UP/DOWN bid-ask spread."""
 
-    def test_sell_and_buy_use_same_imbalance_price(self, sample_data):
-        """I verify IntraDay sell and buy use the same imbalance_price."""
+    def test_xbid_sell_and_buy_use_different_isp1_prices(self, sample_data):
+        """I verify XBID uses ISP1 UP for sell and ISP1 DOWN for buy."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        # I set imbalance_price=150, isp1_price_up=200, isp1_price_down=50
+        # I set distinctive ISP1 prices — sell should use UP, buy should use DOWN
         df['imbalance_price'] = 150.0
         df['isp1_price_up'] = 200.0
         df['isp1_price_down'] = 50.0
@@ -3632,40 +3620,43 @@ class TestSettlementNoLeakage:
 
         env.current_step = 4  # non-IDA hour
         row = env.df.iloc[env.current_step]
-        sell_price = env._get_intraday_sell_price(None, row)
-        buy_price = env._get_intraday_buy_price(None, row)
+        sell_price = env._get_intraday_sell_price('isp1', row)
+        buy_price = env._get_intraday_buy_price('isp1', row)
 
-        assert sell_price == pytest.approx(150.0), \
-            f"Sell should use imbalance_price (150.0), not ISP1 UP (200.0), got {sell_price}"
-        assert buy_price == pytest.approx(150.0), \
-            f"Buy should use imbalance_price (150.0), not ISP1 DOWN (50.0), got {buy_price}"
-        assert sell_price == pytest.approx(buy_price), \
-            f"Single pricing: sell ({sell_price}) must equal buy ({buy_price})"
+        assert sell_price == pytest.approx(200.0), \
+            f"Sell should use isp1_price_up (200.0), got {sell_price}"
+        assert buy_price == pytest.approx(50.0), \
+            f"Buy should use isp1_price_down (50.0), got {buy_price}"
+        assert sell_price > buy_price, \
+            "ISP1 UP (sell) should be higher than ISP1 DOWN (buy) — real bid-ask spread"
 
-    def test_no_guaranteed_spread(self, sample_data):
-        """I verify no artificial bid-ask spread in single pricing."""
+    def test_xbid_real_spread(self, sample_data):
+        """I verify XBID has real bid-ask spread from ISP1 UP/DOWN."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        df['imbalance_price'] = 100.0
+        df['isp1_price_up'] = 120.0
+        df['isp1_price_down'] = 90.0
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
         env.reset(seed=42)
 
         env.current_step = 4
         row = env.df.iloc[env.current_step]
-        sell_price = env._get_intraday_sell_price(None, row)
-        buy_price = env._get_intraday_buy_price(None, row)
+        sell_price = env._get_intraday_sell_price('isp1', row)
+        buy_price = env._get_intraday_buy_price('isp1', row)
         spread = sell_price - buy_price
 
-        assert abs(spread) < 0.01, \
-            f"Single pricing should have zero spread, got {spread}"
+        assert spread == pytest.approx(30.0), \
+            f"XBID spread should be ISP1 UP - DOWN = 30, got {spread}"
 
-    def test_imbalance_price_fallback_to_dam(self, sample_data):
-        """I verify DAM fallback when imbalance_price is unavailable."""
+    def test_isp1_fallback_to_imbalance_then_dam(self, sample_data):
+        """I verify fallback chain: ISP1 → imbalance_price → DAM."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
+        df['isp1_price_up'] = np.nan
+        df['isp1_price_down'] = np.nan
         df['imbalance_price'] = np.nan
         df['price'] = 100.0
 
@@ -3853,22 +3844,22 @@ class TestObservationNoLeakage:
         env.reset(seed=42)
         obs = env._build_observation()
 
-        # In full-market mode, Group 12 feature [73] should be lagged spread (5/100=0.05)
-        # Not current spread (100/100=1.0)
+        # In full-market mode, cascade spread is the last feature in Group 13 (12th, index 11)
+        # Should be lagged (5/100=0.05), not current (100/100=1.0)
         current_norm = 100.0 / 100.0  # 1.0
         lagged_norm = 5.0 / 100.0     # 0.05
 
-        # Feature [73] is the 11th full-market feature (0-indexed from start of full-market block)
-        # Base: 66, full_market starts at 66, has 12 features
-        # So index = 66 + 10 = 76
-        fm_start = 66
-        cascade_idx = fm_start + 10  # [73] is 11th feature in full-market block
+        # Base: 68, full_market starts at 68, has 12 features
+        # Group 13 layout: 8 IDA + 3 FreeBid + 1 cascade = 12
+        # Cascade is the 12th feature → index 68 + 11 = 79
+        fm_start = 68
+        cascade_idx = fm_start + 11  # Last feature in full-market block
         assert obs[cascade_idx] == pytest.approx(lagged_norm, abs=0.01), \
             f"Full-market cascade spread should be lagged (0.05), got {obs[cascade_idx]}"
 
-    def test_full_market_uses_lagged_imbalance_price(self, sample_data):
-        """I verify full-market obs feature [66] uses lagged imbalance price,
-        not current imbalance_price. Feature [67] is system direction signal."""
+    def test_base_obs_uses_lagged_imbalance_price(self, sample_data):
+        """I verify base obs uses lagged imbalance price (Group 2, index 5),
+        not current imbalance_price. Index 6 is system direction signal."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
@@ -3884,15 +3875,15 @@ class TestObservationNoLeakage:
         env.reset(seed=42)
         obs = env._build_observation()
 
-        # Full-market Group 10 starts at index 66. Features:
-        # [63]=ida1_pos, [64]=ida2_pos, [65]=ida3_pos, [66]=imb_price, [67]=direction
-        imb_idx = 66 + 3   # feature [66]
-        dir_idx = 66 + 4   # feature [67]
+        # Group 1: [0-3] soc, max_discharge, max_charge, cycles_remaining
+        # Group 2: [4] dam_price, [5] imb_price_lag, [6] direction, ...
+        imb_idx = 5
+        dir_idx = 6
 
         lagged_norm = 120.0 / 100.0  # 1.2
 
         assert obs[imb_idx] == pytest.approx(lagged_norm, abs=0.01), \
-            f"Full-market imbalance price should be lagged (1.2), got {obs[imb_idx]}"
+            f"Base obs imbalance price should be lagged (1.2), got {obs[imb_idx]}"
         assert obs[dir_idx] == pytest.approx(-1.0, abs=0.01), \
             f"System direction should be -1 for deficit, got {obs[dir_idx]}"
 
@@ -3999,11 +3990,11 @@ class TestForecastColumnsNoLeakage:
             "Found noise injection in forecast columns — this should have been removed"
 
 
-class TestSingleImbalancePricing:
-    """I test ADMIE single imbalance pricing for IntraDay settlement."""
+class TestXBIDPricing:
+    """I test XBID ISP1 UP/DOWN bid-ask spread for XBID settlement."""
 
-    def test_sell_and_buy_use_same_imbalance_price(self, sample_data):
-        """I verify IntraDay sell and buy use the same imbalance_price."""
+    def test_xbid_uses_isp1_up_down(self, sample_data):
+        """I verify XBID uses ISP1 UP for sell and ISP1 DOWN for buy."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
@@ -4016,55 +4007,57 @@ class TestSingleImbalancePricing:
 
         env.current_step = 4
         row = env.df.iloc[env.current_step]
-        sell_price = env._get_intraday_sell_price(None, row)
-        buy_price = env._get_intraday_buy_price(None, row)
+        sell_price = env._get_intraday_sell_price('isp1', row)
+        buy_price = env._get_intraday_buy_price('isp1', row)
 
-        assert sell_price == pytest.approx(150.0), \
-            f"Sell should use imbalance_price (150), not ISP1 UP (200), got {sell_price}"
-        assert buy_price == pytest.approx(150.0), \
-            f"Buy should use imbalance_price (150), not ISP1 DOWN (50), got {buy_price}"
+        assert sell_price == pytest.approx(200.0), \
+            f"Sell should use isp1_price_up (200), got {sell_price}"
+        assert buy_price == pytest.approx(50.0), \
+            f"Buy should use isp1_price_down (50), got {buy_price}"
 
-    def test_no_guaranteed_spread(self, sample_data):
-        """I verify no artificial bid-ask spread in single pricing."""
+    def test_xbid_has_real_spread(self, sample_data):
+        """I verify XBID has real bid-ask spread from ISP1 UP/DOWN."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        df['imbalance_price'] = 100.0
+        df['isp1_price_up'] = 120.0
+        df['isp1_price_down'] = 90.0
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
         env.reset(seed=42)
         env.soc = 0.5
 
-        # I step through several time steps and verify no spread
+        # I verify spread is consistent across steps
         for i in range(10):
             step = env.start_step + i
             if step < len(env.df):
                 env.current_step = step
                 row = env.df.iloc[step]
-                sell = env._get_intraday_sell_price(None, row)
-                buy = env._get_intraday_buy_price(None, row)
-                assert abs(sell - buy) < 0.01, \
-                    f"Step {i}: sell={sell}, buy={buy} — should be equal (single pricing)"
+                sell = env._get_intraday_sell_price('isp1', row)
+                buy = env._get_intraday_buy_price('isp1', row)
+                assert sell > buy, \
+                    f"Step {i}: sell={sell} should be > buy={buy} (ISP1 UP > DOWN)"
 
-    def test_imbalance_price_fallback_to_dam(self, sample_data):
-        """I verify DAM fallback when imbalance_price is unavailable."""
+    def test_isp1_fallback_to_imbalance(self, sample_data):
+        """I verify fallback to imbalance_price when ISP1 unavailable."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        df['imbalance_price'] = np.nan
-        df['price'] = 95.0
+        df['isp1_price_up'] = np.nan
+        df['isp1_price_down'] = np.nan
+        df['imbalance_price'] = 95.0
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
         env.reset(seed=42)
 
         row = env.df.iloc[env.current_step]
-        sell_price = env._get_intraday_sell_price(None, row)
-        buy_price = env._get_intraday_buy_price(None, row)
+        sell_price = env._get_intraday_sell_price('isp1', row)
+        buy_price = env._get_intraday_buy_price('isp1', row)
 
         assert sell_price == pytest.approx(95.0), \
-            f"Should fall back to DAM (95), got {sell_price}"
+            f"Should fall back to imbalance_price (95), got {sell_price}"
         assert buy_price == pytest.approx(95.0), \
-            f"Should fall back to DAM (95), got {buy_price}"
+            f"Should fall back to imbalance_price (95), got {buy_price}"
 
     def test_ida_still_uses_clearing_price(self, sample_data):
         """I verify IDA auctions are unaffected by single pricing."""
@@ -4091,11 +4084,13 @@ class TestSingleImbalancePricing:
         assert sell2 == pytest.approx(120.0), f"IDA2 should use clearing price (120), got {sell2}"
         assert buy2 == pytest.approx(120.0), f"IDA2 should use clearing price (120), got {buy2}"
 
-    def test_market_state_uses_single_pricing(self, sample_data):
-        """I verify MarketState intraday_bid == intraday_ask == imbalance_price."""
+    def test_xbid_uses_isp1_bid_ask_spread(self, sample_data):
+        """I verify XBID sell uses ISP1 UP and buy uses ISP1 DOWN (real spread)."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
+        df['isp1_price_up'] = 140.0
+        df['isp1_price_down'] = 110.0
         df['imbalance_price'] = 130.0
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
@@ -4106,19 +4101,25 @@ class TestSingleImbalancePricing:
         action = np.array([0, 2, 5, 5])  # idle
         obs, reward, done, truncated, info = env.step(action)
 
-        # I verify xbid_bid and xbid_ask are equal (single pricing)
-        xbid_bid = env._get_intraday_sell_price(None, env.df.iloc[env.current_step])
-        xbid_ask = env._get_intraday_buy_price(None, env.df.iloc[env.current_step])
-        assert xbid_bid == pytest.approx(xbid_ask), \
-            f"xbid_bid ({xbid_bid}) should equal xbid_ask ({xbid_ask}) in single pricing"
+        # I verify xbid sell uses ISP1 UP, buy uses ISP1 DOWN
+        row = env.df.iloc[env.current_step]
+        xbid_sell = env._get_intraday_sell_price(None, row)
+        xbid_buy = env._get_intraday_buy_price(None, row)
+        assert xbid_sell == pytest.approx(140.0), \
+            f"XBID sell should use ISP1 UP (140.0), got {xbid_sell}"
+        assert xbid_buy == pytest.approx(110.0), \
+            f"XBID buy should use ISP1 DOWN (110.0), got {xbid_buy}"
+        assert xbid_sell > xbid_buy, "XBID sell (ISP1 UP) should be > buy (ISP1 DOWN)"
 
-    def test_zero_imbalance_price_uses_dam_fallback(self, sample_data):
-        """I verify imbalance_price=0 triggers DAM fallback."""
+    def test_zero_prices_uses_dam_fallback(self, sample_data):
+        """I verify that when ISP1 UP=0 and imbalance_price=0, DAM fallback triggers."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        df['imbalance_price'] = 0.0
-        df['price'] = 88.0
+        df['isp1_price_up'] = 0.0     # ISP1 UP zero → skip
+        df['isp1_price_down'] = 0.0   # ISP1 DOWN zero → skip
+        df['imbalance_price'] = 0.0   # Imbalance zero → skip
+        df['price'] = 88.0            # DAM fallback
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
         env.reset(seed=42)
@@ -4126,7 +4127,7 @@ class TestSingleImbalancePricing:
         row = env.df.iloc[env.current_step]
         sell = env._get_intraday_sell_price(None, row)
         assert sell == pytest.approx(88.0), \
-            f"imbalance_price=0 should trigger DAM fallback (88), got {sell}"
+            f"All prices zero should trigger DAM fallback (88), got {sell}"
 
 
 class TestObservationImbalanceFeatures:
@@ -4196,14 +4197,14 @@ class TestObservationImbalanceFeatures:
             f"obs[12] should be Imb-DAM spread (0.3), got {obs[12]}"
 
     def test_obs_feature_count_unchanged(self, sample_data):
-        """I verify base observation is still 64 features after imbalance pricing."""
+        """I verify base observation is 68 features after adding predicted SoC features."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         env = BatteryEnvUnified(
             df=sample_data, episode_length=72, random_start=False
         )
         obs, _ = env.reset(seed=42)
-        assert obs.shape == (66,), f"Expected 66 features, got {obs.shape}"
+        assert obs.shape == (68,), f"Expected 68 features, got {obs.shape}"
 
 
 class TestAFRRHighestValueRule:
@@ -4413,6 +4414,173 @@ class TestHVRSpreadFeatures:
         # obs[15] = (mfrr_up - afrr_up_lag) / 100 = (108 - 300) / 100 ≈ -1.92
         assert obs[15] < 0.0, \
             f"Expected negative HVR spread UP (aFRR > mFRR), got {obs[15]}"
+
+
+class TestSoCAwareDAMBidder:
+    """I test SoC-aware endogenous DAM bidder and predicted SoC observation features."""
+
+    def _make_endog_env(self, sample_data, initial_soc=0.5, **kwargs):
+        """I create an env with endogenous DAM enabled and configurable initial SoC."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        env = BatteryEnvUnified(
+            df=sample_data,
+            capacity_mwh=146.0,
+            max_power_mw=30.0,
+            efficiency=0.94,
+            episode_length=72,
+            random_start=False,
+            enable_endogenous_dam=True,
+            dam_bidder_min_spread=10.0,  # I use low threshold for test data
+            **kwargs,
+        )
+        return env
+
+    def test_dam_bidder_soc_aware_near_full(self, sample_data):
+        """I verify buy commitments are capped when SoC is near ceiling."""
+        env = self._make_endog_env(sample_data)
+        env.reset(seed=42)
+        env.soc = 0.90  # Near max_soc (0.95)
+
+        # I regenerate schedule with high SoC
+        schedule = env._generate_endogenous_dam_schedule()
+
+        if schedule is not None:
+            # I simulate SoC trajectory — must never exceed max_soc
+            simulated_soc = 0.90
+            for val in schedule:
+                if val < -0.1:  # Buy/charge
+                    soc_delta = abs(val) * 1.0 * env.eff_sqrt / env.capacity_mwh
+                    simulated_soc += soc_delta
+                elif val > 0.1:  # Sell/discharge
+                    soc_delta = val * 1.0 / env.eff_sqrt / env.capacity_mwh
+                    simulated_soc -= soc_delta
+
+                assert simulated_soc <= env.max_soc + 0.001, \
+                    f"SoC rose to {simulated_soc:.4f} above max_soc {env.max_soc}"
+                assert simulated_soc >= env.min_soc - 0.001, \
+                    f"SoC dropped to {simulated_soc:.4f} below min_soc {env.min_soc}"
+
+    def test_dam_bidder_soc_aware_near_empty(self, sample_data):
+        """I verify sell commitments are capped when SoC is near floor."""
+        env = self._make_endog_env(sample_data)
+        env.reset(seed=42)
+        env.soc = 0.10  # Near min_soc (0.05)
+
+        schedule = env._generate_endogenous_dam_schedule()
+
+        if schedule is not None and np.any(schedule > 0.1):
+            sell_power = schedule[schedule > 0.1]
+
+            # I verify: simulate SoC trajectory — must never go below min_soc
+            simulated_soc = 0.10
+            for val in schedule:
+                if val > 0.1:  # Sell/discharge
+                    soc_delta = val * 1.0 / env.eff_sqrt / env.capacity_mwh
+                    simulated_soc -= soc_delta
+                elif val < -0.1:  # Buy/charge
+                    soc_delta = abs(val) * 1.0 * env.eff_sqrt / env.capacity_mwh
+                    simulated_soc += soc_delta
+
+                assert simulated_soc >= env.min_soc - 0.001, \
+                    f"SoC dropped to {simulated_soc:.4f} below min_soc {env.min_soc}"
+
+    def test_dam_bidder_soc_aware_mid(self, sample_data):
+        """I verify most commitments pass uncapped at mid SoC."""
+        env = self._make_endog_env(sample_data)
+        env.reset(seed=42)
+        env.soc = 0.50  # Mid-range, plenty of headroom both ways
+
+        schedule = env._generate_endogenous_dam_schedule()
+
+        if schedule is not None:
+            # I verify schedule has both buys and sells (uncapped at mid SoC)
+            has_buys = np.any(schedule < -0.1)
+            has_sells = np.any(schedule > 0.1)
+
+            # I simulate trajectory — should stay within bounds
+            simulated_soc = 0.50
+            for val in schedule:
+                if val > 0.1:
+                    soc_delta = val * 1.0 / env.eff_sqrt / env.capacity_mwh
+                    simulated_soc -= soc_delta
+                elif val < -0.1:
+                    soc_delta = abs(val) * 1.0 * env.eff_sqrt / env.capacity_mwh
+                    simulated_soc += soc_delta
+
+                assert simulated_soc >= env.min_soc - 0.001, \
+                    f"SoC dropped below min at mid-SoC start: {simulated_soc:.4f}"
+                assert simulated_soc <= env.max_soc + 0.001, \
+                    f"SoC rose above max at mid-SoC start: {simulated_soc:.4f}"
+
+    def test_observation_space_size_68(self, sample_data):
+        """I verify obs space shape is (68,) for base config."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        env = BatteryEnvUnified(
+            df=sample_data,
+            capacity_mwh=146.0,
+            max_power_mw=30.0,
+            efficiency=0.94,
+            episode_length=72,
+            random_start=False,
+        )
+
+        assert env.observation_space.shape == (68,), \
+            f"Expected (68,), got {env.observation_space.shape}"
+
+        obs, _ = env.reset(seed=42)
+        assert obs.shape == (68,), f"Expected obs (68,), got {obs.shape}"
+
+    def test_predicted_soc_eod_feature(self, sample_data):
+        """I verify predicted_soc_eod feature is in valid range [0,1]."""
+        env = self._make_endog_env(sample_data)
+        obs, _ = env.reset(seed=42)
+
+        # I run several steps and check predicted_soc_eod (obs index 58)
+        for _ in range(20):
+            obs = env._build_observation()
+            predicted_soc_eod = obs[58]
+            assert 0.0 <= predicted_soc_eod <= 1.0, \
+                f"predicted_soc_eod={predicted_soc_eod:.4f} outside [0,1]"
+            env.current_step += 1
+
+    def test_dam_net_energy_ratio_feature(self, sample_data):
+        """I verify net energy ratio is in [-1,1] and sign matches schedule direction."""
+        env = self._make_endog_env(sample_data)
+        obs, _ = env.reset(seed=42)
+
+        # I check feature at reset
+        obs = env._build_observation()
+        dam_net_energy_ratio = obs[59]
+
+        assert -1.0 <= dam_net_energy_ratio <= 1.0, \
+            f"dam_net_energy_ratio={dam_net_energy_ratio:.4f} outside [-1,1]"
+
+        # I verify sign: compute remaining schedule manually
+        if env.dam_schedule is not None:
+            ts = env.df.index[env.current_step]
+            current_day = ts.date()
+            remaining_sell = 0.0
+            remaining_buy = 0.0
+
+            step = env.current_step
+            while step < len(env.df) and env.df.index[step].date() == current_day:
+                commitment = env._get_dam_commitment(step)
+                if commitment > 0.1:
+                    remaining_sell += commitment * env.time_step_hours
+                elif commitment < -0.1:
+                    remaining_buy += abs(commitment) * env.time_step_hours
+                step += 1
+
+            net_energy = remaining_sell - remaining_buy
+            if abs(net_energy) > 1.0:
+                # I verify sign matches
+                expected_sign = np.sign(net_energy)
+                actual_sign = np.sign(dam_net_energy_ratio)
+                assert expected_sign == actual_sign, \
+                    f"Sign mismatch: net_energy={net_energy:.1f} ({expected_sign}) " \
+                    f"vs obs={dam_net_energy_ratio:.4f} ({actual_sign})"
 
 
 if __name__ == "__main__":

@@ -156,6 +156,9 @@ class UnifiedRewardCalculator:
         # I pass daily_cycles so the reward calculator can apply super-linear
         # penalty when cycling exceeds the target (1.5-2.0/day).
         daily_cycles: float = 0.0,
+
+        # IDA violation — shortfall when locked IDA positions can't execute
+        ida_shortfall_mw: float = 0.0,
     ) -> Dict:
         """
         I calculate the total reward for a unified multi-market step.
@@ -328,6 +331,18 @@ class UnifiedRewardCalculator:
         components['free_bid_revenue'] = free_bid_revenue
 
         # =====================================================================
+        # 5e. IDA VIOLATION PENALTY (locked positions not delivered)
+        # =====================================================================
+        ida_violation_cost = 0.0
+        if ida_shortfall_mw > 0.1:
+            # I apply 1.5x clearing price penalty (lower than DAM's 2x since
+            # IDA is a secondary market with lower regulatory consequences)
+            avg_ida_price = self._weighted_ida_price(market) if abs(market.net_ida_position) > 0.01 else market.dam_price
+            ida_violation_cost = ida_shortfall_mw * avg_ida_price * 1.5 * time_step_hours
+        components['ida_violation_cost'] = ida_violation_cost
+        components['ida_shortfall_mw'] = ida_shortfall_mw
+
+        # =====================================================================
         # 6. DEGRADATION COST
         # =====================================================================
         # I calculate degradation based on total energy cycled
@@ -390,7 +405,8 @@ class UnifiedRewardCalculator:
         )
         real_costs = (
             dam_violation_cost +
-            afrr_nonresponse_cost
+            afrr_nonresponse_cost +
+            ida_violation_cost
         )
         trading_pnl = market_revenue - real_costs
         components['trading_pnl'] = trading_pnl
