@@ -933,14 +933,24 @@ class ImbalanceSubForecaster:
             verbose=-1
         )
 
-        if len(X_val) > 20:
+        # I check that all 3 classes {0,1,2} exist in training — sklearn's
+        # LabelEncoder inside LGBMClassifier crashes if validation has unseen labels
+        train_classes = set(np.unique(y_dir_cls))
+        all_classes_present = train_classes == {0, 1, 2}
+
+        if len(X_val) > 20 and all_classes_present:
             X_v = np.array(X_val)
             y_dir_val_cls = (np.array(y_dir_val) + 1).astype(int)
-            self.direction_model.fit(
-                X_train, y_dir_cls,
-                eval_set=[(X_v, y_dir_val_cls)],
-                callbacks=[lgb.early_stopping(30, verbose=False)]
-            )
+            # I filter validation to only include classes seen in training
+            val_mask = np.isin(y_dir_val_cls, list(train_classes))
+            if val_mask.sum() > 10:
+                self.direction_model.fit(
+                    X_train, y_dir_cls,
+                    eval_set=[(X_v[val_mask], y_dir_val_cls[val_mask])],
+                    callbacks=[lgb.early_stopping(30, verbose=False)]
+                )
+            else:
+                self.direction_model.fit(X_train, y_dir_cls)
         else:
             self.direction_model.fit(X_train, y_dir_cls)
 
