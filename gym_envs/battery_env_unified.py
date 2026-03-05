@@ -359,17 +359,38 @@ class BatteryEnvUnified(gym.Env):
         current_date = None
         day_id = -1
         day_start = 0
+        day_starts = []   # I track where each day starts
         for i, d in enumerate(dates):
             if d != current_date:
                 current_date = d
                 day_id += 1
                 day_start = i
+                day_starts.append(i)
             self._step_day_offset[i] = i - day_start
             self._step_day_id[i] = day_id
+
+        # I precompute day start/length arrays for O(1) day_indices lookup
+        n_days = day_id + 1
+        self._day_start = np.array(day_starts, dtype=np.int32)
+        self._day_length = np.zeros(n_days, dtype=np.int32)
+        for d_id in range(n_days - 1):
+            self._day_length[d_id] = self._day_start[d_id + 1] - self._day_start[d_id]
+        self._day_length[n_days - 1] = len(self.df) - self._day_start[n_days - 1]
 
         # I calculate step limits
         self.start_step = self.warmup_steps
         self.max_steps = len(self.df) - 1 - self.lookahead_steps
+
+    def _get_day_indices_for_step(self, step_idx: int) -> np.ndarray:
+        """I return all step indices for the same day as step_idx in O(1).
+
+        Uses precomputed _day_start and _day_length arrays instead of the
+        slow `self.df.index.date == current_day` scan that converts all timestamps.
+        """
+        day_id = self._step_day_id[step_idx]
+        start = self._day_start[day_id]
+        length = self._day_length[day_id]
+        return np.arange(start, start + length)
 
     def _setup_spaces(self):
         """I define action and observation spaces."""
@@ -1005,11 +1026,7 @@ class BatteryEnvUnified(gym.Env):
                 remaining_after_afrr -= abs(ida_energy_mw)
 
             # I compute IDA revenue from individual schedule positions
-            ts_ida = self.df.index[self.current_step]
-            current_day_ida = ts_ida.date()
-            day_mask_ida = self.df.index.date == current_day_ida
-            day_indices_ida = np.where(day_mask_ida)[0]
-            day_offset_ida = self.current_step - day_indices_ida[0] if len(day_indices_ida) > 0 else 0
+            day_offset_ida = self._step_day_offset[self.current_step]
 
             ida1_pos = 0.0
             if self.ida1_schedule is not None and 0 <= day_offset_ida < len(self.ida1_schedule):
@@ -1018,7 +1035,7 @@ class BatteryEnvUnified(gym.Env):
             if self.ida2_schedule is not None and 0 <= day_offset_ida < len(self.ida2_schedule):
                 ida2_pos = self.ida2_schedule[day_offset_ida]
             ida3_pos = 0.0
-            if (self.ida3_schedule is not None and ts_ida.hour >= 12
+            if (self.ida3_schedule is not None and self.df.index[self.current_step].hour >= 12
                     and 0 <= day_offset_ida < len(self.ida3_schedule)):
                 ida3_pos = self.ida3_schedule[day_offset_ida]
 
@@ -1651,9 +1668,8 @@ class BatteryEnvUnified(gym.Env):
         ts = self.df.index[self.current_step]
         current_day = ts.date()
 
-        # I collect DAM prices for today (known if published) or forecast
-        day_mask = self.df.index.date == current_day
-        day_indices = np.where(day_mask)[0]
+        # I collect DAM prices for today using O(1) precomputed lookup
+        day_indices = self._get_day_indices_for_step(self.current_step)
 
         if len(day_indices) < 12 * self._sph:
             # I fall back to CSV commitments for short days
@@ -1770,9 +1786,8 @@ class BatteryEnvUnified(gym.Env):
             delivery_hours = list(range(0, 24))
         n_hours = len(delivery_hours)
 
-        # I get day indices for the delivery day
-        day_mask = self.df.index.date == current_day
-        day_indices = np.where(day_mask)[0]
+        # I get day indices using O(1) precomputed lookup
+        day_indices = self._get_day_indices_for_step(self.current_step)
 
         if len(day_indices) < n_hours * self._sph:
             return np.zeros(n_hours * self._sph)
@@ -1982,10 +1997,8 @@ class BatteryEnvUnified(gym.Env):
         """
         schedule = self._generate_ida_schedule(ida_number, participation_level)
 
-        ts = self.df.index[self.current_step]
-        current_day = ts.date()
-        day_mask = self.df.index.date == current_day
-        day_indices = np.where(day_mask)[0]
+        # I use O(1) precomputed lookup for day indices
+        day_indices = self._get_day_indices_for_step(self.current_step)
         n_qh_day = len(day_indices)
 
         if ida_number == 1:
@@ -2029,14 +2042,8 @@ class BatteryEnvUnified(gym.Env):
         ts = self.df.index[step_idx]
         hour = ts.hour
 
-        # I compute offset within the day
-        current_day = ts.date()
-        day_mask = self.df.index.date == current_day
-        day_indices = np.where(day_mask)[0]
-        if len(day_indices) == 0:
-            return 0.0
-
-        day_offset = step_idx - day_indices[0]
+        # I use O(1) precomputed day offset (avoids O(n) date scan)
+        day_offset = self._step_day_offset[step_idx]
 
         # I add IDA1 (delivers 00:00-24:00)
         if self.ida1_schedule is not None and 0 <= day_offset < len(self.ida1_schedule):
