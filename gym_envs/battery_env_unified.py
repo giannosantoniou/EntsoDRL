@@ -377,6 +377,12 @@ class BatteryEnvUnified(gym.Env):
             self._day_length[d_id] = self._day_start[d_id + 1] - self._day_start[d_id]
         self._day_length[n_days - 1] = len(self.df) - self._day_start[n_days - 1]
 
+        # I precompute dam_commitment as numpy view to avoid pandas iloc overhead.
+        # Previously, _get_dam_commitment() called self.df.iloc[step_idx].get('dam_commitment')
+        # which creates a full pandas Series per call — 80% of step time at 73k calls/500 steps.
+        # Using .values (not .astype) preserves the view — runtime df mutations auto-reflect.
+        self._dam_commitment_values = self.df['dam_commitment'].values
+
         # I calculate step limits
         self.start_step = self.warmup_steps
         self.max_steps = len(self.df) - 1 - self.lookahead_steps
@@ -2076,8 +2082,8 @@ class BatteryEnvUnified(gym.Env):
                 if day_offset < len(self.dam_schedule):
                     return float(self.dam_schedule[day_offset])
 
-        # I fall back to CSV data
-        return float(self.df.iloc[step_idx].get('dam_commitment', 0.0))
+        # I fall back to precomputed numpy array (avoids pandas iloc overhead)
+        return float(self._dam_commitment_values[step_idx])
 
     def _predict_dam_soc(self) -> tuple:
         """
@@ -2094,12 +2100,13 @@ class BatteryEnvUnified(gym.Env):
         simulated_soc = self.soc
         net_energy_mwh = 0.0
 
-        ts = self.df.index[self.current_step]
-        current_day = ts.date()
+        # I use precomputed day boundaries instead of per-step .date() calls
+        current_day_id = self._step_day_id[self.current_step]
+        day_start = self._day_start[current_day_id]
+        day_end = day_start + self._day_length[current_day_id]
 
         # I walk from current step to end of day
-        step = self.current_step
-        while step < len(self.df) and self.df.index[step].date() == current_day:
+        for step in range(self.current_step, min(day_end, len(self.df))):
             commitment = self._get_dam_commitment(step)
             if commitment < -0.1:  # Buy/charge
                 energy = abs(commitment) * self.time_step_hours * self.eff_sqrt
@@ -2109,7 +2116,6 @@ class BatteryEnvUnified(gym.Env):
                 energy = commitment * self.time_step_hours / self.eff_sqrt
                 simulated_soc = max(self.min_soc, simulated_soc - energy / self.capacity_mwh)
                 net_energy_mwh += commitment * self.time_step_hours  # Positive = selling
-            step += 1
 
         return simulated_soc, net_energy_mwh
 
