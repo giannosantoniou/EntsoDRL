@@ -1,0 +1,319 @@
+"""
+DAM (Day-Ahead Market) Executor
+
+I handle all DAM-related logic:
+- DAM commitment lookup (endogenous or CSV-based)
+- DAM schedule generation (endogenous, SoC-aware)
+- DAM execution (mandatory, priority 1 in cascade)
+- DAM SoC reserve calculation
+- DAM shortfall risk assessment
+- DAM SoC prediction (end-of-day)
+"""
+
+import numpy as np
+from typing import Tuple, Optional, TYPE_CHECKING
+
+from gym_envs.market_executors import MarketResult
+
+if TYPE_CHECKING:
+    from gym_envs.battery_env_unified import BatteryEnvUnified
+
+
+class DamExecutor:
+    """I execute DAM commitments and manage DAM-related state.
+
+    DAM is the highest priority market in the cascade. All other markets
+    operate within the capacity left over after DAM execution.
+    """
+
+    def __init__(self, env: 'BatteryEnvUnified'):
+        self._env = env
+
+    def execute(self, dam_commitment: float) -> MarketResult:
+        """I execute the mandatory DAM commitment for the current step.
+
+        Args:
+            dam_commitment: DAM commitment MW (positive=sell, negative=buy)
+
+        Returns:
+            MarketResult with DAM execution details
+        """
+        env = self._env
+        result = MarketResult()
+
+        if abs(dam_commitment) <= 0.1:
+            return result
+
+        available_discharge_mwh = (env.soc - env.min_soc) * env.capacity_mwh
+        available_charge_mwh = (env.max_soc - env.soc) * env.capacity_mwh
+
+        if dam_commitment > 0:  # Must discharge
+            max_dam_discharge = min(
+                abs(dam_commitment),
+                available_discharge_mwh * env.eff_sqrt / env.time_step_hours
+            )
+            dam_executed_mw = max_dam_discharge
+
+            energy_mwh = dam_executed_mw * env.time_step_hours
+            soc_delta = energy_mwh / env.eff_sqrt / env.capacity_mwh
+
+            result.energy_mw = dam_executed_mw
+            result.soc_delta = -soc_delta
+            result.cycle_fraction = energy_mwh / env.capacity_mwh
+            result.mwh_sold = energy_mwh
+            result.is_activated = True
+            result.direction = 'up'
+
+        else:  # Must charge (dam_commitment < 0)
+            max_dam_charge = min(
+                abs(dam_commitment),
+                available_charge_mwh / env.eff_sqrt / env.time_step_hours
+            )
+            dam_executed_mw = -max_dam_charge
+
+            energy_mwh = max_dam_charge * env.time_step_hours
+            soc_delta = energy_mwh * env.eff_sqrt / env.capacity_mwh
+
+            result.energy_mw = dam_executed_mw
+            result.soc_delta = soc_delta
+            result.cycle_fraction = energy_mwh / env.capacity_mwh
+            result.mwh_bought = energy_mwh
+            result.is_activated = True
+            result.direction = 'down'
+
+        row = env.df.iloc[env.current_step]
+        result.revenue = result.energy_mw * row.get('price', 100.0) * env.time_step_hours
+
+        return result
+
+    def get_commitment(self, step_idx: int) -> float:
+        """I return the DAM commitment for a given step.
+
+        I use endogenous schedule if available, otherwise CSV data.
+        Uses precomputed O(1) lookup arrays.
+        """
+        env = self._env
+        if env.enable_endogenous_dam and env.dam_schedule is not None:
+            if (step_idx < len(env._step_day_id)
+                    and env._step_day_id[step_idx] == env._dam_schedule_day_id):
+                day_offset = env._step_day_offset[step_idx]
+                if day_offset < len(env.dam_schedule):
+                    return float(env.dam_schedule[day_offset])
+
+        return float(env._dam_commitment_values[step_idx])
+
+    def calculate_soc_reserve(self) -> Tuple[float, float]:
+        """I calculate dynamic SoC reserves for future DAM commitment execution.
+
+        Returns:
+            (min_soc_reserve, max_soc_reserve): SoC bounds adjusted for future DAM
+        """
+        env = self._env
+        min_soc_reserve = env.min_soc
+        max_soc_reserve = env.max_soc
+
+        lookahead = min(4 * env._sph, env.max_steps - env.current_step)
+        if lookahead <= 0:
+            return min_soc_reserve, max_soc_reserve
+
+        commitments = []
+        for i in range(1, lookahead + 1):
+            future_idx = env.current_step + i
+            if future_idx >= len(env.df):
+                break
+            dam = np.clip(env._get_dam_commitment(future_idx),
+                          -env.max_power_mw, env.max_power_mw)
+            commitments.append((i, dam))
+
+        last_sell_pos = 0
+        last_buy_pos = 0
+        for pos, dam in commitments:
+            if dam > 0.1:
+                last_sell_pos = pos
+            elif dam < -0.1:
+                last_buy_pos = pos
+
+        sell_energy_needed = 0.0
+        buy_headroom_needed = 0.0
+        intermediate_charge_potential = 0.0
+        intermediate_discharge_potential = 0.0
+
+        for pos, dam in commitments:
+            if dam > 0.1:
+                energy_needed = dam * env.time_step_hours / env.eff_sqrt
+                sell_energy_needed += energy_needed
+            elif dam < -0.1:
+                energy_needed = abs(dam) * env.time_step_hours * env.eff_sqrt
+                buy_headroom_needed += energy_needed
+            else:
+                potential = env.max_power_mw * env.time_step_hours * 0.25
+                if pos < last_sell_pos:
+                    intermediate_charge_potential += potential * env.eff_sqrt
+                if pos < last_buy_pos:
+                    intermediate_discharge_potential += potential / env.eff_sqrt
+
+        net_sell_energy = max(0.0, sell_energy_needed - intermediate_charge_potential)
+        net_buy_headroom = max(0.0, buy_headroom_needed - intermediate_discharge_potential)
+
+        sell_soc_reserve = net_sell_energy / env.capacity_mwh
+        buy_soc_reserve = net_buy_headroom / env.capacity_mwh
+
+        buffer = 0.0
+        if sell_soc_reserve > 0 or buy_soc_reserve > 0:
+            buffer = env.max_power_mw * env.time_step_hours / env.capacity_mwh
+
+        min_soc_reserve = min(env.max_soc, env.min_soc + sell_soc_reserve + buffer)
+        max_soc_reserve = max(env.min_soc, env.max_soc - buy_soc_reserve - buffer)
+
+        if min_soc_reserve > max_soc_reserve:
+            midpoint = (min_soc_reserve + max_soc_reserve) / 2.0
+            min_soc_reserve = midpoint
+            max_soc_reserve = midpoint
+
+        return min_soc_reserve, max_soc_reserve
+
+    def calculate_shortfall_risk(self) -> float:
+        """I calculate risk of not meeting future DAM commitments."""
+        env = self._env
+        sell_risk = 0.0
+        buy_risk = 0.0
+        total_sell_commitment = 0.0
+        total_buy_commitment = 0.0
+
+        lookahead = min(4 * env._sph, env.max_steps - env.current_step)
+
+        for i in range(1, lookahead + 1):
+            future_idx = env.current_step + i
+            if future_idx >= len(env.df):
+                break
+            dam = np.clip(env._get_dam_commitment(future_idx),
+                          -env.max_power_mw, env.max_power_mw)
+            if dam > 0.1:
+                total_sell_commitment += dam
+            elif dam < -0.1:
+                total_buy_commitment += abs(dam)
+
+        if total_sell_commitment > 0:
+            available_energy = (env.soc - env.min_soc) * env.capacity_mwh
+            needed_energy = total_sell_commitment * env.time_step_hours / env.eff_sqrt
+            if available_energy < needed_energy:
+                sell_risk = (needed_energy - available_energy) / needed_energy
+                sell_risk = np.clip(sell_risk, 0, 1)
+
+        if total_buy_commitment > 0:
+            available_headroom = (env.max_soc - env.soc) * env.capacity_mwh
+            needed_headroom = total_buy_commitment * env.time_step_hours * env.eff_sqrt
+            if available_headroom < needed_headroom:
+                buy_risk = (needed_headroom - available_headroom) / needed_headroom
+                buy_risk = np.clip(buy_risk, 0, 1)
+
+        return max(sell_risk, buy_risk)
+
+    def predict_soc(self) -> Tuple[float, float]:
+        """I predict end-of-day SoC by simulating remaining DAM commitments.
+
+        Returns:
+            (predicted_soc_eod, net_energy_mwh)
+        """
+        env = self._env
+        simulated_soc = env.soc
+        net_energy_mwh = 0.0
+
+        current_day_id = env._step_day_id[env.current_step]
+        day_start = env._day_start[current_day_id]
+        day_end = day_start + env._day_length[current_day_id]
+
+        for step in range(env.current_step, min(day_end, len(env.df))):
+            commitment = env._get_dam_commitment(step)
+            if commitment < -0.1:
+                energy = abs(commitment) * env.time_step_hours * env.eff_sqrt
+                simulated_soc = min(env.max_soc, simulated_soc + energy / env.capacity_mwh)
+                net_energy_mwh -= abs(commitment) * env.time_step_hours
+            elif commitment > 0.1:
+                energy = commitment * env.time_step_hours / env.eff_sqrt
+                simulated_soc = max(env.min_soc, simulated_soc - energy / env.capacity_mwh)
+                net_energy_mwh += commitment * env.time_step_hours
+
+        return simulated_soc, net_energy_mwh
+
+    def generate_endogenous_schedule(self) -> Optional[np.ndarray]:
+        """I generate a DAM commitment schedule based on price forecasts.
+
+        Returns:
+            Per-step MW schedule or None if insufficient data
+        """
+        env = self._env
+        ts = env.df.index[env.current_step]
+
+        day_indices = env._get_day_indices_for_step(env.current_step)
+
+        if len(day_indices) < 12 * env._sph:
+            return None
+
+        # I get price forecasts
+        if env.market_forecaster is not None:
+            forecast = env.market_forecaster.dam_forecaster.predict(
+                env.df, env.current_step, 24
+            )
+        else:
+            hourly_indices = day_indices[::env._sph][:24]
+            forecast = np.array([env.df.iloc[i].get('price', 80.0) for i in hourly_indices])
+            noise = np.random.normal(env._dam_forecast_bias, 22.0, len(forecast))
+            forecast = forecast + noise
+
+        if len(forecast) < 12:
+            return None
+
+        p25 = np.percentile(forecast, 25)
+        p75 = np.percentile(forecast, 75)
+        daily_spread = p75 - p25
+
+        if daily_spread < env.dam_bidder_min_spread:
+            return np.zeros(len(day_indices))
+
+        spread_factor = np.clip(daily_spread / 80.0, 0.4, 1.0)
+        base_power = env.max_power_mw * spread_factor
+
+        hourly_schedule = np.zeros(len(forecast))
+        for h in range(len(forecast)):
+            if forecast[h] <= p25:
+                hourly_schedule[h] = -base_power * np.random.uniform(0.6, 1.0)
+            elif forecast[h] >= p75:
+                hourly_schedule[h] = base_power * np.random.uniform(0.6, 1.0)
+
+        # I ensure energy balance
+        total_charge = abs(hourly_schedule[hourly_schedule < 0].sum())
+        total_discharge = hourly_schedule[hourly_schedule > 0].sum()
+        if total_charge < total_discharge * 1.1 and total_discharge > 0:
+            scale = total_charge / (total_discharge * 1.1 + 1e-6)
+            hourly_schedule[hourly_schedule > 0] *= scale
+
+        # I simulate SoC trajectory and cap commitments
+        simulated_soc = env.soc
+        for h in range(len(hourly_schedule)):
+            commitment = hourly_schedule[h]
+            if commitment < -0.1:
+                soc_delta = abs(commitment) * 1.0 * env.eff_sqrt / env.capacity_mwh
+                new_soc = simulated_soc + soc_delta
+                if new_soc > env.max_soc:
+                    headroom = (env.max_soc - simulated_soc) * env.capacity_mwh
+                    max_power = headroom / (1.0 * env.eff_sqrt)
+                    hourly_schedule[h] = -max(max_power, 0.0)
+                    simulated_soc = env.max_soc
+                else:
+                    simulated_soc = new_soc
+            elif commitment > 0.1:
+                soc_delta = commitment * 1.0 / env.eff_sqrt / env.capacity_mwh
+                new_soc = simulated_soc - soc_delta
+                if new_soc < env.min_soc:
+                    available = (simulated_soc - env.min_soc) * env.capacity_mwh
+                    max_power = available * env.eff_sqrt / 1.0
+                    hourly_schedule[h] = max(max_power, 0.0)
+                    simulated_soc = env.min_soc
+                else:
+                    simulated_soc = new_soc
+
+        schedule = np.repeat(hourly_schedule, env._sph)[:len(day_indices)]
+        schedule = np.clip(schedule, -env.max_power_mw, env.max_power_mw)
+
+        return schedule
