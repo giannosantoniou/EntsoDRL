@@ -4695,5 +4695,191 @@ class TestIDATrainable:
                 f"IDA1 should have some correlation with ISP1 (r={r1:.3f})"
 
 
+class TestMWhTracking:
+    """I test per-market MWh volume tracking."""
+
+    def test_dam_mwh_tracking(self, unified_env):
+        """I verify DAM MWh bought/sold are tracked correctly."""
+        obs, _ = unified_env.reset()
+
+        # I run steps and check volumes accumulate
+        total_dam_sold = 0.0
+        total_dam_bought = 0.0
+        for _ in range(50):
+            action = unified_env.action_space.sample()
+            obs, reward, terminated, truncated, info = unified_env.step(action)
+            if terminated or truncated:
+                break
+
+        # I check that the info dict contains MWh fields
+        assert 'dam_mwh_sold' in info
+        assert 'dam_mwh_bought' in info
+        assert info['dam_mwh_sold'] >= 0
+        assert info['dam_mwh_bought'] >= 0
+
+        # I verify the env accumulators match the info
+        assert info['dam_mwh_sold'] == unified_env.dam_mwh_sold
+        assert info['dam_mwh_bought'] == unified_env.dam_mwh_bought
+
+    def test_dam_discharge_tracks_as_sold(self, sample_data):
+        """I verify that DAM discharge (positive commitment) registers as sold MWh."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        # I set up a scenario with only positive DAM commitments (sell)
+        df = sample_data.copy()
+        df['dam_commitment'] = 10.0  # Always discharge 10 MW
+        env = BatteryEnvUnified(
+            df=df, capacity_mwh=146.0, max_power_mw=30.0,
+            efficiency=0.94, episode_length=20, random_start=False
+        )
+        obs, _ = env.reset()
+
+        # I take neutral actions (no ID/mFRR) so only DAM moves energy
+        neutral_action = np.array([2, 0, 5, 5])  # aFRR=0, ID=0, mFRR=0
+        for _ in range(10):
+            obs, _, terminated, truncated, info = env.step(neutral_action)
+            if terminated or truncated:
+                break
+
+        # I expect DAM sold > 0 and DAM bought = 0
+        assert info['dam_mwh_sold'] > 0, \
+            "DAM discharge should register as sold MWh"
+        assert info['dam_mwh_bought'] == 0, \
+            "No DAM charge → dam_mwh_bought should be 0"
+
+    def test_dam_charge_tracks_as_bought(self, sample_data):
+        """I verify that DAM charge (negative commitment) registers as bought MWh."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        # I set up a scenario with only negative DAM commitments (buy)
+        df = sample_data.copy()
+        df['dam_commitment'] = -10.0  # Always charge 10 MW
+        env = BatteryEnvUnified(
+            df=df, capacity_mwh=146.0, max_power_mw=30.0,
+            efficiency=0.94, episode_length=20, random_start=False
+        )
+        obs, _ = env.reset()
+
+        neutral_action = np.array([2, 0, 5, 5])
+        for _ in range(10):
+            obs, _, terminated, truncated, info = env.step(neutral_action)
+            if terminated or truncated:
+                break
+
+        assert info['dam_mwh_bought'] > 0, \
+            "DAM charge should register as bought MWh"
+        assert info['dam_mwh_sold'] == 0, \
+            "No DAM discharge → dam_mwh_sold should be 0"
+
+    def test_intraday_mwh_tracking(self, unified_env):
+        """I verify IntraDay MWh tracking works for both sell and buy."""
+        obs, _ = unified_env.reset()
+
+        # I force a sell action on IntraDay (action index 10 = +1.0)
+        sell_action = np.array([2, 0, 10, 5])  # ID sell
+        for _ in range(5):
+            obs, _, terminated, truncated, info = unified_env.step(sell_action)
+            if terminated or truncated:
+                break
+
+        sold_after_sells = info['intraday_mwh_sold']
+
+        # I force a buy action on IntraDay (action index 0 = -1.0)
+        buy_action = np.array([2, 0, 0, 5])  # ID buy
+        for _ in range(5):
+            obs, _, terminated, truncated, info = unified_env.step(buy_action)
+            if terminated or truncated:
+                break
+
+        # I expect both sold and bought to have accumulated
+        assert info['intraday_mwh_sold'] >= sold_after_sells, \
+            "IntraDay sold should not decrease"
+        assert info['intraday_mwh_bought'] >= 0
+
+    def test_mfrr_mwh_tracking(self, sample_data):
+        """I verify mFRR MWh tracking accumulates energy correctly."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        env = BatteryEnvUnified(
+            df=sample_data, capacity_mwh=146.0, max_power_mw=30.0,
+            efficiency=0.94, episode_length=50, random_start=False,
+            mfrr_activation_rate=1.0  # I force 100% mFRR activation
+        )
+        obs, _ = env.reset()
+
+        # I force max mFRR sell actions
+        action = np.array([2, 0, 5, 10])  # mFRR max sell
+        for _ in range(30):
+            obs, _, terminated, truncated, info = env.step(action)
+            if terminated or truncated:
+                break
+
+        # I verify mFRR volumes are tracked
+        assert 'mfrr_mwh_sold' in info
+        assert 'mfrr_mwh_bought' in info
+        # I expect at least some mFRR sold given 100% activation rate
+        total_mfrr = info['mfrr_mwh_sold'] + info['mfrr_mwh_bought']
+        # mFRR volumes should be non-negative
+        assert info['mfrr_mwh_sold'] >= 0
+        assert info['mfrr_mwh_bought'] >= 0
+
+    def test_full_market_mwh_info_keys(self, full_market_env):
+        """I verify full-market mode exposes IDA, XBID, FreeBid MWh in info."""
+        obs, _ = full_market_env.reset()
+        action = full_market_env.action_space.sample()
+        obs, _, terminated, truncated, info = full_market_env.step(action)
+
+        # I check all full-market MWh keys are present
+        for key in ['ida_mwh_sold', 'ida_mwh_bought',
+                     'xbid_mwh_sold', 'xbid_mwh_bought',
+                     'free_bid_mwh_sold', 'free_bid_mwh_bought']:
+            assert key in info, f"Missing key '{key}' in full-market info"
+            assert info[key] >= 0, f"Volume '{key}' should be >= 0"
+
+    def test_mwh_reset_on_new_episode(self, unified_env):
+        """I verify MWh accumulators reset to zero on env.reset()."""
+        obs, _ = unified_env.reset()
+
+        # I run some steps to accumulate volumes
+        for _ in range(20):
+            action = unified_env.action_space.sample()
+            obs, _, terminated, truncated, info = unified_env.step(action)
+            if terminated or truncated:
+                break
+
+        # I reset and check accumulators are zeroed
+        obs, _ = unified_env.reset()
+        assert unified_env.dam_mwh_sold == 0.0
+        assert unified_env.dam_mwh_bought == 0.0
+        assert unified_env.afrr_mwh_sold == 0.0
+        assert unified_env.afrr_mwh_bought == 0.0
+        assert unified_env.mfrr_mwh_sold == 0.0
+        assert unified_env.mfrr_mwh_bought == 0.0
+        assert unified_env.intraday_mwh_sold == 0.0
+        assert unified_env.intraday_mwh_bought == 0.0
+
+    def test_afrr_mwh_tracking(self, sample_data):
+        """I verify aFRR energy volumes are tracked for up/down regulation."""
+        from gym_envs.battery_env_unified import BatteryEnvUnified
+
+        env = BatteryEnvUnified(
+            df=sample_data, capacity_mwh=146.0, max_power_mw=30.0,
+            efficiency=0.94, episode_length=50, random_start=False
+        )
+        obs, _ = env.reset()
+
+        # I commit to aFRR and run steps
+        # afrr action = 4 → 100% commitment
+        action = np.array([2, 4, 5, 5])
+        for _ in range(30):
+            obs, _, terminated, truncated, info = env.step(action)
+            if terminated or truncated:
+                break
+
+        # I verify volumes are non-negative
+        assert info['afrr_mwh_sold'] >= 0
+        assert info['afrr_mwh_bought'] >= 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

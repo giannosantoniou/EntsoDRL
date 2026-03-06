@@ -186,6 +186,12 @@ class TensorboardLoggingCallback(BaseCallback):
         self.xbid_profits = []
         self.free_bid_profits = []
 
+        # I track per-market net MWh volumes for cross-market flow analysis
+        self.dam_net_mwh = []
+        self.mfrr_net_mwh = []
+        self.intraday_net_mwh = []
+        self.xbid_net_mwh = []
+
         # I track SoC extremes per episode
         self.episode_min_socs = []
         self.episode_max_socs = []
@@ -281,6 +287,16 @@ class TensorboardLoggingCallback(BaseCallback):
                 if 'free_bid_profit' in info:
                     self.free_bid_profits.append(info['free_bid_profit'])
 
+                # I track net MWh volumes (sold - bought) per market
+                self.dam_net_mwh.append(
+                    info.get('dam_mwh_sold', 0) - info.get('dam_mwh_bought', 0))
+                self.mfrr_net_mwh.append(
+                    info.get('mfrr_mwh_sold', 0) - info.get('mfrr_mwh_bought', 0))
+                self.intraday_net_mwh.append(
+                    info.get('intraday_mwh_sold', 0) - info.get('intraday_mwh_bought', 0))
+                self.xbid_net_mwh.append(
+                    info.get('xbid_mwh_sold', 0) - info.get('xbid_mwh_bought', 0))
+
         # I log periodically
         if self.num_timesteps % 10000 == 0 and len(self.episode_profits) > 0:
             # I log overall metrics
@@ -343,6 +359,16 @@ class TensorboardLoggingCallback(BaseCallback):
                 self.logger.record('markets/xbid_profit', np.mean(self.xbid_profits[-100:]))
             if self.free_bid_profits:
                 self.logger.record('markets/free_bid_profit', np.mean(self.free_bid_profits[-100:]))
+
+            # I log net MWh volumes per market for cross-market flow analysis
+            if self.dam_net_mwh:
+                self.logger.record('volumes/dam_net_mwh', np.mean(self.dam_net_mwh[-100:]))
+            if self.mfrr_net_mwh:
+                self.logger.record('volumes/mfrr_net_mwh', np.mean(self.mfrr_net_mwh[-100:]))
+            if self.intraday_net_mwh:
+                self.logger.record('volumes/intraday_net_mwh', np.mean(self.intraday_net_mwh[-100:]))
+            if self.xbid_net_mwh:
+                self.logger.record('volumes/xbid_net_mwh', np.mean(self.xbid_net_mwh[-100:]))
 
             # I log participation rates
             if self.step_count > 0:
@@ -1228,6 +1254,21 @@ def evaluate_model(
             'intraday': last_info.get('intraday_profit', 0),
             'ida': last_info.get('ida_profit', 0),
             'free_bid': last_info.get('free_bid_profit', 0),
+            # I include per-market MWh volumes for cross-market flow analysis
+            'dam_mwh_sold': last_info.get('dam_mwh_sold', 0),
+            'dam_mwh_bought': last_info.get('dam_mwh_bought', 0),
+            'afrr_mwh_sold': last_info.get('afrr_mwh_sold', 0),
+            'afrr_mwh_bought': last_info.get('afrr_mwh_bought', 0),
+            'mfrr_mwh_sold': last_info.get('mfrr_mwh_sold', 0),
+            'mfrr_mwh_bought': last_info.get('mfrr_mwh_bought', 0),
+            'intraday_mwh_sold': last_info.get('intraday_mwh_sold', 0),
+            'intraday_mwh_bought': last_info.get('intraday_mwh_bought', 0),
+            'ida_mwh_sold': last_info.get('ida_mwh_sold', 0),
+            'ida_mwh_bought': last_info.get('ida_mwh_bought', 0),
+            'xbid_mwh_sold': last_info.get('xbid_mwh_sold', 0),
+            'xbid_mwh_bought': last_info.get('xbid_mwh_bought', 0),
+            'free_bid_mwh_sold': last_info.get('free_bid_mwh_sold', 0),
+            'free_bid_mwh_bought': last_info.get('free_bid_mwh_bought', 0),
         }
         results['per_market'].append(market_summary)
 
@@ -1239,12 +1280,23 @@ def evaluate_model(
               f"Shaped={shaped_profit:,.0f} EUR, "
               f"Cycles={episode_cycles:.2f}, "
               f"Gross={gross_sum:,.0f}")
-        print(f"  Markets: DAM={market_summary['dam']:,.0f}, "
-              f"aFRR_cap={market_summary['afrr_cap']:,.0f}, "
-              f"aFRR_e={market_summary['afrr_energy']:,.0f}, "
-              f"mFRR={market_summary['mfrr']:,.0f}, "
-              f"ID={market_summary['intraday']:,.0f}, "
-              f"FreeBid={market_summary['free_bid']:,.0f}")
+        print(f"  Markets: "
+              f"DAM={market_summary['dam']:,.0f} "
+              f"(s:{market_summary['dam_mwh_sold']:.0f} b:{market_summary['dam_mwh_bought']:.0f} MWh), "
+              f"aFRR_e={market_summary['afrr_energy']:,.0f} "
+              f"(s:{market_summary['afrr_mwh_sold']:.0f} b:{market_summary['afrr_mwh_bought']:.0f}), "
+              f"mFRR={market_summary['mfrr']:,.0f} "
+              f"(s:{market_summary['mfrr_mwh_sold']:.0f} b:{market_summary['mfrr_mwh_bought']:.0f}), "
+              f"ID={market_summary['intraday']:,.0f} "
+              f"(s:{market_summary['intraday_mwh_sold']:.0f} b:{market_summary['intraday_mwh_bought']:.0f})")
+        if market_summary.get('ida_mwh_sold', 0) > 0 or market_summary.get('free_bid_mwh_sold', 0) > 0:
+            print(f"          "
+                  f"IDA={market_summary['ida']:,.0f} "
+                  f"(s:{market_summary['ida_mwh_sold']:.0f} b:{market_summary['ida_mwh_bought']:.0f}), "
+                  f"XBID "
+                  f"(s:{market_summary['xbid_mwh_sold']:.0f} b:{market_summary['xbid_mwh_bought']:.0f}), "
+                  f"FreeBid={market_summary['free_bid']:,.0f} "
+                  f"(s:{market_summary['free_bid_mwh_sold']:.0f} b:{market_summary['free_bid_mwh_bought']:.0f})")
         print(f"  Costs: Degrad={episode_degradation:,.0f}, "
               f"DAM_viol={episode_dam_violation:,.0f}, "
               f"aFRR_nr={episode_afrr_nonresponse:,.0f}, "
@@ -1280,6 +1332,20 @@ def evaluate_model(
                     'intraday', 'ida', 'free_bid']
     results['mean_per_market'] = {
         k: np.mean([m[k] for m in results['per_market']]) for k in market_keys
+    }
+
+    # I aggregate per-market MWh volume means
+    mwh_keys = [
+        'dam_mwh_sold', 'dam_mwh_bought',
+        'afrr_mwh_sold', 'afrr_mwh_bought',
+        'mfrr_mwh_sold', 'mfrr_mwh_bought',
+        'intraday_mwh_sold', 'intraday_mwh_bought',
+        'ida_mwh_sold', 'ida_mwh_bought',
+        'xbid_mwh_sold', 'xbid_mwh_bought',
+        'free_bid_mwh_sold', 'free_bid_mwh_bought',
+    ]
+    results['mean_volumes'] = {
+        k: np.mean([m.get(k, 0) for m in results['per_market']]) for k in mwh_keys
     }
 
     # I aggregate cost breakdown means
@@ -1320,6 +1386,31 @@ def evaluate_model(
     print(f"\nAccounting: Gross({mean_gross:,.0f}) - Costs({mean_total_costs:,.0f}) "
           f"+ Bonus({mean_bonuses:,.0f}) = {mean_gross - mean_total_costs + mean_bonuses:,.0f}")
     print(f"Reported Trading PnL:  {results['mean_profit']:,.0f} EUR")
+
+    # I print per-market volume table for cross-market flow analysis
+    vol = results['mean_volumes']
+    print(f"\nPer-Market Volume (mean MWh/episode):")
+    print(f"  {'Market':>12s}  {'Profit':>10s}  {'MWh_Sold':>10s}  {'MWh_Bought':>10s}  {'Net_MWh':>10s}  {'EUR/MWh_S':>10s}")
+    volume_rows = [
+        ('dam', 'dam'),
+        ('afrr_energy', 'afrr'),
+        ('mfrr', 'mfrr'),
+        ('intraday', 'intraday'),
+        ('ida', 'ida'),
+        ('free_bid', 'free_bid'),
+    ]
+    for profit_key, vol_prefix in volume_rows:
+        profit = results['mean_per_market'].get(profit_key, 0)
+        sold = vol.get(f'{vol_prefix}_mwh_sold', 0)
+        bought = vol.get(f'{vol_prefix}_mwh_bought', 0)
+        net = sold - bought
+        eur_per_mwh = profit / sold if sold > 0.1 else 0
+        print(f"  {profit_key:>12s}: {profit:>+10,.0f}  {sold:>10,.1f}  {bought:>10,.1f}  {net:>+10,.1f}  {eur_per_mwh:>10,.1f}")
+    # I add XBID sub-row (subset of intraday)
+    xbid_sold = vol.get('xbid_mwh_sold', 0)
+    xbid_bought = vol.get('xbid_mwh_bought', 0)
+    xbid_net = xbid_sold - xbid_bought
+    print(f"  {'  (xbid)':>12s}: {'':>10s}  {xbid_sold:>10,.1f}  {xbid_bought:>10,.1f}  {xbid_net:>+10,.1f}")
 
     return results
 

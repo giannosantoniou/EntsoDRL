@@ -466,6 +466,22 @@ class BatteryEnvUnified(gym.Env):
         self.free_bid_activations = 0
         self.free_bid_submissions = 0
 
+        # I track per-market energy volumes (MWh bought/sold)
+        self.dam_mwh_sold = 0.0
+        self.dam_mwh_bought = 0.0
+        self.afrr_mwh_sold = 0.0
+        self.afrr_mwh_bought = 0.0
+        self.mfrr_mwh_sold = 0.0
+        self.mfrr_mwh_bought = 0.0
+        self.intraday_mwh_sold = 0.0
+        self.intraday_mwh_bought = 0.0
+        self.ida_mwh_sold = 0.0
+        self.ida_mwh_bought = 0.0
+        self.xbid_mwh_sold = 0.0
+        self.xbid_mwh_bought = 0.0
+        self.free_bid_mwh_sold = 0.0
+        self.free_bid_mwh_bought = 0.0
+
         # I track IDA schedules (per-QH MW arrays, locked at gate closure)
         self.ida1_schedule = None  # Per-QH MW locked at IDA1 gate (D-1 15:00)
         self.ida2_schedule = None  # Per-QH MW locked at IDA2 gate (D-1 22:00)
@@ -905,6 +921,13 @@ class BatteryEnvUnified(gym.Env):
             actual_energy_mw = dam_executed_mw
             self.dam_profit += dam_executed_mw * row.get('price', 100.0) * self.time_step_hours
 
+            # I track DAM energy volumes
+            dam_mwh = abs(dam_executed_mw) * self.time_step_hours
+            if dam_executed_mw > 0:
+                self.dam_mwh_sold += dam_mwh
+            elif dam_executed_mw < 0:
+                self.dam_mwh_bought += dam_mwh
+
         # =====================================================================
         # STAGE 5: EXECUTE aFRR IF ACTIVATED (takes priority)
         # =====================================================================
@@ -973,6 +996,13 @@ class BatteryEnvUnified(gym.Env):
 
             self.afrr_energy_profit += afrr_energy_revenue
             actual_energy_mw += afrr_energy_delivered
+
+            # I track aFRR energy volumes (up = sold/discharge, down = bought/charge)
+            afrr_mwh = abs(afrr_energy_delivered) * self.time_step_hours
+            if afrr_energy_delivered > 0:
+                self.afrr_mwh_sold += afrr_mwh
+            elif afrr_energy_delivered < 0:
+                self.afrr_mwh_bought += afrr_mwh
 
             remaining_after_afrr = remaining_capacity - abs(afrr_energy_delivered)
         else:
@@ -1069,6 +1099,13 @@ class BatteryEnvUnified(gym.Env):
                 ida_revenue *= execution_ratio
 
             self.ida_profit += ida_revenue
+
+            # I track IDA energy volumes
+            ida_mwh_step = abs(ida_energy_mw) * self.time_step_hours
+            if ida_energy_mw > 0:
+                self.ida_mwh_sold += ida_mwh_step
+            elif ida_energy_mw < 0:
+                self.ida_mwh_bought += ida_mwh_step
 
             # I track IDA violations
             if ida_shortfall_mw > 0.1:
@@ -1200,6 +1237,13 @@ class BatteryEnvUnified(gym.Env):
                     self.mfrr_profit += mfrr_revenue
                     actual_energy_mw += actual_mfrr
 
+                    # I track mFRR energy volumes
+                    mfrr_mwh = abs(actual_mfrr) * self.time_step_hours
+                    if actual_mfrr > 0:
+                        self.mfrr_mwh_sold += mfrr_mwh
+                    else:
+                        self.mfrr_mwh_bought += mfrr_mwh
+
         # I calculate remaining capacity after mFRR for IntraDay
         remaining_after_mfrr = remaining_after_ida - abs(mfrr_energy_mw)
 
@@ -1276,6 +1320,17 @@ class BatteryEnvUnified(gym.Env):
                         xbid_energy_mw = 0.0
                     self.intraday_profit += intraday_revenue
                     actual_energy_mw += actual_intraday
+
+                    # I track IntraDay and XBID energy volumes
+                    id_mwh = abs(actual_intraday) * self.time_step_hours
+                    if actual_intraday > 0:
+                        self.intraday_mwh_sold += id_mwh
+                        if active_market == 'isp1':
+                            self.xbid_mwh_sold += id_mwh
+                    else:
+                        self.intraday_mwh_bought += id_mwh
+                        if active_market == 'isp1':
+                            self.xbid_mwh_bought += id_mwh
 
         # I calculate remaining after IntraDay for Free Bids
         remaining_after_intraday = remaining_after_mfrr - abs(intraday_energy_mw)
@@ -1358,6 +1413,13 @@ class BatteryEnvUnified(gym.Env):
                         self.free_bid_profit += free_bid_revenue
                         self.free_bid_activations += 1
                         actual_energy_mw += actual_freebid
+
+                        # I track Free Bid energy volumes
+                        fb_mwh = abs(actual_freebid) * self.time_step_hours
+                        if actual_freebid > 0:
+                            self.free_bid_mwh_sold += fb_mwh
+                        else:
+                            self.free_bid_mwh_bought += fb_mwh
 
         # =====================================================================
         # STAGE 10: CALCULATE REWARD
@@ -2910,6 +2972,15 @@ class BatteryEnvUnified(gym.Env):
             'episode_afrr_nonresponse_cost': self.episode_afrr_nonresponse_cost,
             'episode_dam_violation_count': self.episode_dam_violation_count,
             'episode_step': self.current_step - self.episode_start_step,
+            # I expose per-market energy volumes (MWh) for cross-market analysis
+            'dam_mwh_sold': self.dam_mwh_sold,
+            'dam_mwh_bought': self.dam_mwh_bought,
+            'afrr_mwh_sold': self.afrr_mwh_sold,
+            'afrr_mwh_bought': self.afrr_mwh_bought,
+            'mfrr_mwh_sold': self.mfrr_mwh_sold,
+            'mfrr_mwh_bought': self.mfrr_mwh_bought,
+            'intraday_mwh_sold': self.intraday_mwh_sold,
+            'intraday_mwh_bought': self.intraday_mwh_bought,
         }
         if self.enable_full_market:
             info.update({
@@ -2924,6 +2995,12 @@ class BatteryEnvUnified(gym.Env):
                 ),
                 'episode_ida_violation_cost': self.episode_ida_violation_cost,
                 'episode_ida_violation_steps': self.episode_ida_violation_steps,
+                'ida_mwh_sold': self.ida_mwh_sold,
+                'ida_mwh_bought': self.ida_mwh_bought,
+                'xbid_mwh_sold': self.xbid_mwh_sold,
+                'xbid_mwh_bought': self.xbid_mwh_bought,
+                'free_bid_mwh_sold': self.free_bid_mwh_sold,
+                'free_bid_mwh_bought': self.free_bid_mwh_bought,
             })
         return info
 
