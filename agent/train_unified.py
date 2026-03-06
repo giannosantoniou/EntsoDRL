@@ -608,7 +608,7 @@ def train_unified_model(
     dam_bidder_min_spread: float = 30.0,
     mfrr_activation_rate: float = 0.35,
     mfrr_price_cap: float = 1000.0,
-    degradation_cost: float = 0.0,  # I default to 0 — let the agent decide cycling freely
+    degradation_cost: float = 15.0,  # I default to 15 EUR/MWh — realistic battery wear cost
     use_subproc: bool = False,  # I default to DummyVecEnv; SubprocVecEnv has high IPC overhead on Windows
     enable_ida_forecast: bool = False,
     ida_forecaster_path: str = "models/market_forecaster.pkl",
@@ -1103,7 +1103,7 @@ def evaluate_model(
     eval_episode_steps = int(336 / time_step_hours)  # 2 weeks
 
     # I load degradation_cost from training config so evaluation uses the same cost
-    eval_degradation = train_cfg.get('degradation_cost', 25.0)
+    eval_degradation = train_cfg.get('degradation_cost', 15.0)
     eval_reward_config = {
         'degradation_cost': eval_degradation,
         'dam_violation_penalty': 800.0,
@@ -1535,8 +1535,8 @@ if __name__ == "__main__":
                         help="mFRR bid activation probability (default: 0.35)")
     parser.add_argument("--mfrr-price-cap", type=float, default=1000.0,
                         help="mFRR settlement price cap EUR/MWh (default: 1000)")
-    parser.add_argument("--degradation-cost", type=float, default=0.0,
-                        help="Degradation cost EUR/MWh (default: 0 = no penalty)")
+    parser.add_argument("--degradation-cost", type=float, default=15.0,
+                        help="Degradation cost EUR/MWh (default: 15 = realistic battery wear)")
     parser.add_argument("--trace", type=str, default=None,
                         help="Path to write per-step CSV trace during evaluation "
                              "(e.g. eval_trace.csv)")
