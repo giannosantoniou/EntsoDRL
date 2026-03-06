@@ -194,6 +194,22 @@ class TensorboardLoggingCallback(BaseCallback):
         self.intraday_net_mwh = []
         self.xbid_net_mwh = []
 
+        # I track per-market sold/bought MWh for detailed volume analysis
+        self.dam_mwh_sold = []
+        self.dam_mwh_bought = []
+        self.afrr_mwh_sold = []
+        self.afrr_mwh_bought = []
+        self.mfrr_mwh_sold = []
+        self.mfrr_mwh_bought = []
+        self.intraday_mwh_sold = []
+        self.intraday_mwh_bought = []
+        self.xbid_mwh_sold = []
+        self.xbid_mwh_bought = []
+        self.ida_mwh_sold = []
+        self.ida_mwh_bought = []
+        self.free_bid_mwh_sold = []
+        self.free_bid_mwh_bought = []
+
         # I track SoC extremes per episode
         self.episode_min_socs = []
         self.episode_max_socs = []
@@ -299,6 +315,22 @@ class TensorboardLoggingCallback(BaseCallback):
                 self.xbid_net_mwh.append(
                     info.get('xbid_mwh_sold', 0) - info.get('xbid_mwh_bought', 0))
 
+                # I track per-market sold/bought MWh individually
+                self.dam_mwh_sold.append(info.get('dam_mwh_sold', 0))
+                self.dam_mwh_bought.append(info.get('dam_mwh_bought', 0))
+                self.afrr_mwh_sold.append(info.get('afrr_mwh_sold', 0))
+                self.afrr_mwh_bought.append(info.get('afrr_mwh_bought', 0))
+                self.mfrr_mwh_sold.append(info.get('mfrr_mwh_sold', 0))
+                self.mfrr_mwh_bought.append(info.get('mfrr_mwh_bought', 0))
+                self.intraday_mwh_sold.append(info.get('intraday_mwh_sold', 0))
+                self.intraday_mwh_bought.append(info.get('intraday_mwh_bought', 0))
+                self.xbid_mwh_sold.append(info.get('xbid_mwh_sold', 0))
+                self.xbid_mwh_bought.append(info.get('xbid_mwh_bought', 0))
+                self.ida_mwh_sold.append(info.get('ida_mwh_sold', 0))
+                self.ida_mwh_bought.append(info.get('ida_mwh_bought', 0))
+                self.free_bid_mwh_sold.append(info.get('free_bid_mwh_sold', 0))
+                self.free_bid_mwh_bought.append(info.get('free_bid_mwh_bought', 0))
+
         # I log periodically
         if self.num_timesteps % 10000 == 0 and len(self.episode_profits) > 0:
             # I log overall metrics
@@ -371,6 +403,27 @@ class TensorboardLoggingCallback(BaseCallback):
                 self.logger.record('volumes/intraday_net_mwh', np.mean(self.intraday_net_mwh[-100:]))
             if self.xbid_net_mwh:
                 self.logger.record('volumes/xbid_net_mwh', np.mean(self.xbid_net_mwh[-100:]))
+
+            # I log per-market sold/bought MWh with avg/min/max
+            for market, sold_list, bought_list in [
+                ('dam', self.dam_mwh_sold, self.dam_mwh_bought),
+                ('afrr', self.afrr_mwh_sold, self.afrr_mwh_bought),
+                ('mfrr', self.mfrr_mwh_sold, self.mfrr_mwh_bought),
+                ('intraday', self.intraday_mwh_sold, self.intraday_mwh_bought),
+                ('xbid', self.xbid_mwh_sold, self.xbid_mwh_bought),
+                ('ida', self.ida_mwh_sold, self.ida_mwh_bought),
+                ('free_bid', self.free_bid_mwh_sold, self.free_bid_mwh_bought),
+            ]:
+                if sold_list:
+                    recent_sold = sold_list[-100:]
+                    self.logger.record(f'volumes/{market}_mwh_sold_avg', np.mean(recent_sold))
+                    self.logger.record(f'volumes/{market}_mwh_sold_min', np.min(recent_sold))
+                    self.logger.record(f'volumes/{market}_mwh_sold_max', np.max(recent_sold))
+                if bought_list:
+                    recent_bought = bought_list[-100:]
+                    self.logger.record(f'volumes/{market}_mwh_bought_avg', np.mean(recent_bought))
+                    self.logger.record(f'volumes/{market}_mwh_bought_min', np.min(recent_bought))
+                    self.logger.record(f'volumes/{market}_mwh_bought_max', np.max(recent_bought))
 
             # I log participation rates
             if self.step_count > 0:
