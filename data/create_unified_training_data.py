@@ -287,6 +287,13 @@ def create_unified_dataset_v2(
         print("  Run: python data/parse_isp_prices.py")
         print("  Falling back to synthetic IntraDay prices.")
 
+    # I synthesize realistic XBID continuous market prices AFTER ISP merge
+    # so ISP1 columns are available as signal inputs.
+    # XBID prices ≠ ISP1 balancing prices! XBID has tight spreads (2-6 EUR).
+    print("\nSynthesizing XBID continuous market prices...")
+    all_mask_xbid = pd.Series(True, index=base_df.index)
+    base_df = _synthesize_xbid_prices(base_df, all_mask_xbid, time_step_hours=0.25)
+
     # I merge Serbia DAM prices for cross-border signal
     serbia_filepath = data_dir / serbia_path
     if serbia_filepath.exists():
@@ -1672,6 +1679,93 @@ def _generate_forecast_driven_ida_positions(df, max_power_mw=30.0, min_deviation
     df['ida2_position'] = ida2_corr
     df['ida3_position'] = ida3_corr
     df['net_ida_position'] = ida1_corr + ida2_corr + ida3_corr
+    return df
+
+
+def _synthesize_xbid_prices(df, mask, time_step_hours=0.25):
+    """I synthesize realistic XBID continuous market prices.
+
+    XBID (Single Intraday Coupling) is a continuous intraday market with:
+    - Prices close to DAM (not ISP1 balancing prices!)
+    - Tight bid-ask spreads (2-6 EUR/MWh typical)
+    - Some ISP1 influence (balancing expectations shift XBID prices)
+    - OU deviation for independent market dynamics
+
+    ISP1 up/down prices remain as OBSERVATION features (balancing signal),
+    but XBID settlement uses these realistic continuous market prices.
+    """
+    dt = time_step_hours
+    dam_prices = df.loc[mask, 'price'].values
+    n = len(dam_prices)
+
+    # I get ISP1 mid-price where available (balancing market signal)
+    isp1_up = df.loc[mask, 'isp1_price_up'].values if 'isp1_price_up' in df.columns else np.full(n, np.nan)
+    isp1_down = df.loc[mask, 'isp1_price_down'].values if 'isp1_price_down' in df.columns else np.full(n, np.nan)
+    isp1_mid = (isp1_up + isp1_down) / 2.0
+
+    # I compute ISP1 signal: normalized deviation from DAM
+    # When ISP1 mid > DAM → balancing demand is high → XBID shifts up
+    # When ISP1 mid < DAM → balancing surplus → XBID shifts down
+    isp1_signal = np.where(
+        np.isnan(isp1_mid),
+        0.0,
+        np.clip((isp1_mid - dam_prices) / 100.0, -0.5, 0.5)
+    )
+
+    # I generate OU deviation process for independent XBID dynamics
+    # (RES forecast updates, cross-border flows, liquidity changes)
+    ou_deviation = np.zeros(n)
+    ou_theta = 0.08   # moderate mean reversion
+    ou_sigma = 5.0     # EUR volatility per sqrt(hour)
+    ou_deviation[0] = np.random.normal(0, ou_sigma * 0.5)
+    for i in range(1, n):
+        price_scale = max(dam_prices[i] / 100.0, 0.3)
+        sigma_i = ou_sigma * price_scale
+        ou_deviation[i] = (
+            ou_deviation[i - 1]
+            + ou_theta * dt * (0 - ou_deviation[i - 1])
+            + sigma_i * np.random.normal() * np.sqrt(dt)
+        )
+
+    # I compute XBID mid: DAM + small ISP1 influence + OU deviation
+    # 10% ISP1 weight — enough for the agent to use ISP1 as a signal,
+    # but XBID stays close to DAM (which is realistic)
+    xbid_mid = dam_prices + isp1_signal * 8.0 + ou_deviation
+
+    # I generate bid-ask spread with OU dynamics (tight, realistic)
+    spread_ou = np.zeros(n)
+    spread_mu = 3.0  # mean half-spread of 1.5 EUR each side
+    spread_ou[0] = spread_mu
+    for i in range(1, n):
+        spread_ou[i] = (
+            spread_ou[i - 1]
+            + 0.15 * dt * (spread_mu - spread_ou[i - 1])
+            + 0.8 * abs(np.random.normal()) * np.sqrt(dt)
+        )
+
+    # I modulate spread by time-of-day (tighter during liquid hours)
+    hours = df.loc[mask].index.hour.values if hasattr(df.index, 'hour') else np.zeros(n)
+    is_liquid = ((hours >= 8) & (hours <= 20)).astype(float)
+    liquidity_factor = np.where(is_liquid, 0.8, 1.4)
+
+    spread = np.abs(spread_ou) * liquidity_factor
+    spread = np.clip(spread, 1.0, 8.0)  # 1-8 EUR total spread
+
+    # I compute XBID bid (sell price, lower) and ask (buy price, higher)
+    # Convention: bid < ask, spread = ask - bid = cost of round-trip
+    df.loc[mask, 'xbid_price_bid'] = xbid_mid - spread / 2.0
+    df.loc[mask, 'xbid_price_ask'] = xbid_mid + spread / 2.0
+
+    # I report statistics
+    xbid_spread = df.loc[mask, 'xbid_price_ask'] - df.loc[mask, 'xbid_price_bid']
+    xbid_mid_series = (df.loc[mask, 'xbid_price_bid'] + df.loc[mask, 'xbid_price_ask']) / 2.0
+    dam_dev = xbid_mid_series - df.loc[mask, 'price']
+    print(f"  XBID prices synthesized: {n:,} rows")
+    print(f"  XBID spread: mean={xbid_spread.mean():.2f}, median={xbid_spread.median():.2f} EUR/MWh")
+    print(f"  XBID mid vs DAM deviation: mean={dam_dev.mean():.2f}, std={dam_dev.std():.2f}")
+    print(f"  XBID bid (sell): mean={df.loc[mask, 'xbid_price_bid'].mean():.2f}")
+    print(f"  XBID ask (buy):  mean={df.loc[mask, 'xbid_price_ask'].mean():.2f}")
+
     return df
 
 

@@ -1362,21 +1362,24 @@ class BatteryEnvUnified(gym.Env):
         # =====================================================================
         # STAGE 10: CALCULATE REWARD
         # =====================================================================
-        # I use ISP1 UP/DOWN for XBID settlement (real bid-ask spread)
-        isp1_up = row.get('isp1_price_up', np.nan)
-        isp1_down = row.get('isp1_price_down', np.nan)
-        imbalance_price = row.get('imbalance_price', row.get('price', 100.0))
-        if np.isnan(imbalance_price) or imbalance_price <= 0:
-            imbalance_price = row.get('price', 100.0)
-        # I prefer ISP1 UP for sell, ISP1 DOWN for buy; fall back to imbalance_price
-        xbid_sell = isp1_up if (not np.isnan(isp1_up) and isp1_up > 0) else imbalance_price
-        xbid_buy = isp1_down if (not np.isnan(isp1_down) and isp1_down > 0) else imbalance_price
+        # I use realistic XBID continuous market prices for settlement
+        # ISP1 up/down remain as observation features (balancing signal)
+        dam_price = row.get('price', 100.0)
+        xbid_bid = row.get('xbid_price_bid', np.nan)
+        xbid_ask = row.get('xbid_price_ask', np.nan)
+        # I fall back to DAM ± small spread when XBID columns missing
+        if np.isnan(xbid_bid) or xbid_bid <= 0:
+            xbid_bid = dam_price - 1.5
+        if np.isnan(xbid_ask) or xbid_ask <= 0:
+            xbid_ask = dam_price + 1.5
+        xbid_sell = xbid_bid   # sell at bid (lower)
+        xbid_buy = xbid_ask    # buy at ask (higher)
         market_state = UnifiedMarketState(
-            dam_price=row.get('price', 100.0),
+            dam_price=dam_price,
             dam_commitment=dam_commitment,
-            intraday_bid=xbid_sell,    # ISP1 UP for sell-side
-            intraday_ask=xbid_buy,     # ISP1 DOWN for buy-side
-            intraday_spread=max(0.0, xbid_sell - xbid_buy),  # Real bid-ask spread
+            intraday_bid=xbid_sell,    # XBID bid for sell-side
+            intraday_ask=xbid_buy,     # XBID ask for buy-side
+            intraday_spread=max(0.0, xbid_buy - xbid_sell),  # Correct: ask - bid
             afrr_cap_up_price=row.get('afrr_cap_up_price', 20.0),
             afrr_cap_down_price=row.get('afrr_cap_down_price', 30.0),
             afrr_energy_up_price=row.get('afrr_up', 80.0),
@@ -2575,11 +2578,13 @@ class BatteryEnvUnified(gym.Env):
             ida_fc_spread = self._get_ida_forecast_vs_dam_spread(row)
             features.append(np.clip(ida_fc_spread / 50.0, -1.0, 1.0))
 
-            # [5] XBID spread (ISP1 UP - ISP1 DOWN, normalized)
+            # [5] ISP1 balancing spread (UP - DOWN, normalized) — observation signal
+            # I keep ISP1 spread as a feature because it predicts XBID mid direction:
+            # high spread → high balancing demand → XBID mid tends above DAM
             isp1_up_obs = row.get('isp1_price_up', dam_price)
             isp1_down_obs = row.get('isp1_price_down', dam_price)
-            xbid_spread = max(0, isp1_up_obs - isp1_down_obs)
-            features.append(min(xbid_spread / 50.0, 1.0))
+            isp1_bal_spread = max(0, isp1_up_obs - isp1_down_obs)
+            features.append(min(isp1_bal_spread / 50.0, 1.0))
 
             # [6] SoC trajectory feasibility (1=feasible, 0=violation expected)
             soc_feasible = 1.0 if self._check_soc_trajectory_feasible() else 0.0
@@ -2798,9 +2803,9 @@ class BatteryEnvUnified(gym.Env):
         """I return the sell (discharge) price for IntraDay/XBID settlement.
 
         For IDA auctions: I use the IDA clearing price (pay-as-cleared).
-        For XBID continuous: I use ISP1 UP price (sell-side of the bid-ask spread).
-        ISP1 UP > ISP1 DOWN creates a real spread — profit comes from both
-        timing AND the buy/sell differential, not just imbalance deviations.
+        For XBID continuous: I use xbid_price_bid (realistic continuous market
+        sell price). This is close to DAM with tight spread, NOT the ISP1
+        balancing up-regulation price (which requires TSO activation).
         """
         if active_market in ('ida1', 'ida2', 'ida3'):
             # IDA auctions: single clearing price (same for buy/sell)
@@ -2811,24 +2816,20 @@ class BatteryEnvUnified(gym.Env):
                 if ts.hour < 14:
                     id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
             return id_price
-        # I use ISP1 UP for selling (XBID continuous) — this is the sell-side
-        # clearing price from the first ISP session, available ~18h before delivery
-        isp1_up = row.get('isp1_price_up', np.nan)
-        if not np.isnan(isp1_up) and isp1_up > 0:
-            return isp1_up
-        # I fall back to imbalance_price, then DAM
-        imb = row.get('imbalance_price', np.nan)
-        if not np.isnan(imb) and imb > 0:
-            return imb
-        return row.get('price', 100.0)
+        # I use XBID bid price for selling (continuous market)
+        xbid_bid = row.get('xbid_price_bid', np.nan)
+        if not np.isnan(xbid_bid) and xbid_bid > 0:
+            return xbid_bid
+        # I fall back to DAM price minus small spread
+        return row.get('price', 100.0) - 1.5
 
     def _get_intraday_buy_price(self, active_market, row):
         """I return the buy (charge) price for IntraDay/XBID settlement.
 
         For IDA auctions: I use the IDA clearing price (pay-as-cleared).
-        For XBID continuous: I use ISP1 DOWN price (buy-side of the bid-ask spread).
-        ISP1 DOWN < ISP1 UP — buying at the lower price and selling at the
-        higher price creates arbitrage opportunity when spread > degradation cost.
+        For XBID continuous: I use xbid_price_ask (realistic continuous market
+        buy price). This is close to DAM with tight spread, NOT the ISP1
+        balancing down-regulation price.
         """
         if active_market in ('ida1', 'ida2', 'ida3'):
             # IDA auctions: single clearing price (same for buy/sell)
@@ -2839,16 +2840,12 @@ class BatteryEnvUnified(gym.Env):
                 if ts.hour < 14:
                     id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
             return id_price
-        # I use ISP1 DOWN for buying (XBID continuous) — this is the buy-side
-        # clearing price from the first ISP session
-        isp1_down = row.get('isp1_price_down', np.nan)
-        if not np.isnan(isp1_down) and isp1_down > 0:
-            return isp1_down
-        # I fall back to imbalance_price, then DAM
-        imb = row.get('imbalance_price', np.nan)
-        if not np.isnan(imb) and imb > 0:
-            return imb
-        return row.get('price', 100.0)
+        # I use XBID ask price for buying (continuous market)
+        xbid_ask = row.get('xbid_price_ask', np.nan)
+        if not np.isnan(xbid_ask) and xbid_ask > 0:
+            return xbid_ask
+        # I fall back to DAM price plus small spread
+        return row.get('price', 100.0) + 1.5
 
     def _simulate_free_bid_activation(self, bid_price, ref_price, imbalance, row):
         """I simulate merit-order based Free Bid activation."""

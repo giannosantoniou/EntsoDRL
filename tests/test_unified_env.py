@@ -3087,29 +3087,32 @@ class TestMarketTimingConstraints:
             market = unified_env._get_intraday_market(row)
             assert market == 'ida2', f"Expected IDA2 at hour 22, got {market}"
 
-    def test_xbid_sells_at_isp1_up_price(self, unified_env):
-        """I verify XBID sell trades use ISP1 UP price (not imbalance_price)."""
+    def test_xbid_sells_at_xbid_bid_price(self, unified_env):
+        """I verify XBID sell trades use xbid_price_bid (not ISP1 balancing)."""
         unified_env.reset(seed=42)
         unified_env.soc = 0.7  # Enough to discharge
 
         step_16 = unified_env.start_step + 16  # Hour 16 -> ISP1 session
         if step_16 < len(unified_env.df):
             unified_env.current_step = step_16
-            # I set distinctive prices — ISP1 UP should be used for selling
-            unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('imbalance_price')] = 50.0
-            unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('isp1_price_up')] = 150.0
+            # I set distinctive prices — XBID bid should be used for selling
+            unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('isp1_price_up')] = 250.0
+            if 'xbid_price_bid' not in unified_env.df.columns:
+                unified_env.df['xbid_price_bid'] = 100.0
+                unified_env.df['xbid_price_ask'] = 106.0
+            unified_env.df.iloc[step_16, unified_env.df.columns.get_loc('xbid_price_bid')] = 105.0
 
             # I execute a sell action (action[2] = 10 = max sell)
             action = np.array([0, 2, 10, 5])
             obs, reward, done, truncated, info = unified_env.step(action)
 
-            # I verify XBID trade uses ISP1 UP (150), not imbalance_price (50)
+            # I verify XBID trade uses xbid_price_bid (~105), not ISP1 UP (250)
             if info['intraday_energy_mw'] > 0:
                 assert info['intraday_revenue'] > 0, "Sell revenue should be positive"
-                # I check revenue corresponds to ISP1 UP (~150), not imbalance (~50)
-                expected_min_revenue = info['intraday_energy_mw'] * 100.0 * unified_env.time_step_hours
-                assert info['intraday_revenue'] >= expected_min_revenue, \
-                    f"Revenue {info['intraday_revenue']:.2f} too low — should use isp1_price_up=150"
+                # I check revenue corresponds to xbid_price_bid (~105), not ISP1 UP (~250)
+                max_revenue = info['intraday_energy_mw'] * 150.0 * unified_env.time_step_hours
+                assert info['intraday_revenue'] <= max_revenue, \
+                    f"Revenue {info['intraday_revenue']:.2f} too high — should use xbid_price_bid=105, not isp1_price_up=250"
 
     def test_ida_single_clearing_price(self, unified_env):
         """I verify IDA auctions use the same clearing price for buy and sell."""
@@ -3122,15 +3125,16 @@ class TestMarketTimingConstraints:
         assert sell_price == buy_price, \
             f"IDA1 should use single clearing price: sell={sell_price}, buy={buy_price}"
 
-    def test_xbid_uses_isp1_prices(self, sample_data):
-        """I verify XBID sell/buy prices use ISP1 UP/DOWN (not imbalance_price)."""
+    def test_xbid_uses_xbid_columns(self, sample_data):
+        """I verify XBID sell/buy prices use xbid_price_bid/ask (not ISP1 balancing)."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        # I set distinctive prices — ISP1 UP/DOWN should be used for XBID
-        df['imbalance_price'] = 130.0
-        df['isp1_price_up'] = 200.0
-        df['isp1_price_down'] = 80.0
+        # I set distinctive prices — XBID columns should be used, NOT ISP1
+        df['isp1_price_up'] = 200.0    # balancing up-regulation (NOT for XBID)
+        df['isp1_price_down'] = 50.0   # balancing down-regulation (NOT for XBID)
+        df['xbid_price_bid'] = 98.0    # realistic XBID sell price
+        df['xbid_price_ask'] = 104.0   # realistic XBID buy price
 
         env = BatteryEnvUnified(
             df, capacity_mwh=146.0, max_power_mw=30.0,
@@ -3139,31 +3143,27 @@ class TestMarketTimingConstraints:
         env.reset(seed=42)
         row = env.df.iloc[env.current_step]
 
-        # I verify ISP1 UP is used for selling (not imbalance_price)
+        # I verify XBID bid is used for selling (not ISP1 UP)
         sell_price = env._get_intraday_sell_price('isp1', row)
-        assert sell_price == pytest.approx(200.0), \
-            f"Should use isp1_price_up (200), got {sell_price}"
+        assert sell_price == pytest.approx(98.0), \
+            f"Should use xbid_price_bid (98), got {sell_price}"
 
-        # I verify ISP1 DOWN is used for buying
+        # I verify XBID ask is used for buying (not ISP1 DOWN)
         buy_price = env._get_intraday_buy_price('isp1', row)
-        assert buy_price == pytest.approx(80.0), \
-            f"Should use isp1_price_down (80), got {buy_price}"
+        assert buy_price == pytest.approx(104.0), \
+            f"Should use xbid_price_ask (104), got {buy_price}"
 
-        # I remove ISP1 prices and verify fallback to imbalance_price
-        env.df['isp1_price_up'] = np.nan
-        env.df['isp1_price_down'] = np.nan
+        # I remove XBID columns and verify fallback to DAM ± spread
+        env.df['xbid_price_bid'] = np.nan
+        env.df['xbid_price_ask'] = np.nan
         row = env.df.iloc[env.current_step]
-        sell_price = env._get_intraday_sell_price('isp1', row)
-        assert sell_price == pytest.approx(130.0), \
-            f"Should fall back to imbalance_price (130), got {sell_price}"
-
-        # I remove imbalance_price too and verify DAM fallback
-        env.df['imbalance_price'] = np.nan
-        row = env.df.iloc[env.current_step]
-        sell_price = env._get_intraday_sell_price('isp1', row)
         dam_price = row.get('price', 100.0)
-        assert sell_price == pytest.approx(dam_price), \
-            f"Should fall back to DAM price ({dam_price}), got {sell_price}"
+        sell_price = env._get_intraday_sell_price('isp1', row)
+        assert sell_price == pytest.approx(dam_price - 1.5), \
+            f"Should fall back to DAM - 1.5 ({dam_price - 1.5}), got {sell_price}"
+        buy_price = env._get_intraday_buy_price('isp1', row)
+        assert buy_price == pytest.approx(dam_price + 1.5), \
+            f"Should fall back to DAM + 1.5 ({dam_price + 1.5}), got {buy_price}"
 
     def test_xbid_open_after_dam_results(self, unified_env):
         """I verify IntraDay trading opens at 14:00."""
@@ -3466,30 +3466,34 @@ class TestFreeBidFixes:
 class TestISPPricesAndCascadeOrder:
     """I test the ISP price integration, mFRR cascade priority, and cycle exemption."""
 
-    def test_xbid_uses_isp1_up_for_sell(self, unified_env):
-        """I verify XBID sell price uses ISP1 UP (not imbalance_price)."""
+    def test_xbid_uses_xbid_bid_for_sell(self, unified_env):
+        """I verify XBID sell price uses xbid_price_bid (not ISP1 balancing)."""
         unified_env.reset(seed=42)
         step = unified_env.current_step
-        # I set distinctive ISP1 UP and imbalance prices
-        unified_env.df.iloc[step, unified_env.df.columns.get_loc('isp1_price_up')] = 180.0
-        unified_env.df.iloc[step, unified_env.df.columns.get_loc('imbalance_price')] = 130.0
+        # I set distinctive XBID and ISP1 prices
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('isp1_price_up')] = 250.0
+        if 'xbid_price_bid' not in unified_env.df.columns:
+            unified_env.df['xbid_price_bid'] = 100.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('xbid_price_bid')] = 98.0
         row = unified_env.df.iloc[step]
 
         sell_price = unified_env._get_intraday_sell_price('isp1', row)
-        assert sell_price == pytest.approx(180.0, abs=0.01), \
-            f"Should use isp1_price_up (180.0), got {sell_price}"
+        assert sell_price == pytest.approx(98.0, abs=0.01), \
+            f"Should use xbid_price_bid (98.0), got {sell_price}"
 
-    def test_xbid_uses_isp1_down_for_buy(self, unified_env):
-        """I verify XBID buy price uses ISP1 DOWN (not imbalance_price)."""
+    def test_xbid_uses_xbid_ask_for_buy(self, unified_env):
+        """I verify XBID buy price uses xbid_price_ask (not ISP1 balancing)."""
         unified_env.reset(seed=42)
         step = unified_env.current_step
-        unified_env.df.iloc[step, unified_env.df.columns.get_loc('isp1_price_down')] = 70.0
-        unified_env.df.iloc[step, unified_env.df.columns.get_loc('imbalance_price')] = 130.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('isp1_price_down')] = 30.0
+        if 'xbid_price_ask' not in unified_env.df.columns:
+            unified_env.df['xbid_price_ask'] = 106.0
+        unified_env.df.iloc[step, unified_env.df.columns.get_loc('xbid_price_ask')] = 104.0
         row = unified_env.df.iloc[step]
 
         buy_price = unified_env._get_intraday_buy_price('isp1', row)
-        assert buy_price == pytest.approx(70.0, abs=0.01), \
-            f"Should use isp1_price_down (70.0), got {buy_price}"
+        assert buy_price == pytest.approx(104.0, abs=0.01), \
+            f"Should use xbid_price_ask (104.0), got {buy_price}"
 
     def test_mfrr_before_intraday_cascade(self, unified_env):
         """I verify mFRR gets full capacity and IntraDay gets remainder."""
@@ -3605,15 +3609,16 @@ class TestISPPricesAndCascadeOrder:
 class TestSettlementNoLeakage:
     """I verify XBID settlement uses ISP1 UP/DOWN bid-ask spread."""
 
-    def test_xbid_sell_and_buy_use_different_isp1_prices(self, sample_data):
-        """I verify XBID uses ISP1 UP for sell and ISP1 DOWN for buy."""
+    def test_xbid_sell_and_buy_use_xbid_columns(self, sample_data):
+        """I verify XBID uses xbid_price_bid/ask (not ISP1 balancing)."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        # I set distinctive ISP1 prices — sell should use UP, buy should use DOWN
-        df['imbalance_price'] = 150.0
-        df['isp1_price_up'] = 200.0
-        df['isp1_price_down'] = 50.0
+        # I set XBID columns — these should be used for settlement
+        df['isp1_price_up'] = 200.0    # balancing (NOT for XBID)
+        df['isp1_price_down'] = 50.0   # balancing (NOT for XBID)
+        df['xbid_price_bid'] = 97.0    # realistic sell price
+        df['xbid_price_ask'] = 103.0   # realistic buy price
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
         env.reset(seed=42)
@@ -3623,20 +3628,20 @@ class TestSettlementNoLeakage:
         sell_price = env._get_intraday_sell_price('isp1', row)
         buy_price = env._get_intraday_buy_price('isp1', row)
 
-        assert sell_price == pytest.approx(200.0), \
-            f"Sell should use isp1_price_up (200.0), got {sell_price}"
-        assert buy_price == pytest.approx(50.0), \
-            f"Buy should use isp1_price_down (50.0), got {buy_price}"
-        assert sell_price > buy_price, \
-            "ISP1 UP (sell) should be higher than ISP1 DOWN (buy) — real bid-ask spread"
+        assert sell_price == pytest.approx(97.0), \
+            f"Sell should use xbid_price_bid (97.0), got {sell_price}"
+        assert buy_price == pytest.approx(103.0), \
+            f"Buy should use xbid_price_ask (103.0), got {buy_price}"
+        assert buy_price > sell_price, \
+            "XBID ask (buy) should be higher than bid (sell) — realistic spread"
 
-    def test_xbid_real_spread(self, sample_data):
-        """I verify XBID has real bid-ask spread from ISP1 UP/DOWN."""
+    def test_xbid_realistic_spread(self, sample_data):
+        """I verify XBID has realistic tight spread (ask - bid)."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        df['isp1_price_up'] = 120.0
-        df['isp1_price_down'] = 90.0
+        df['xbid_price_bid'] = 98.0
+        df['xbid_price_ask'] = 104.0
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
         env.reset(seed=42)
@@ -3645,19 +3650,18 @@ class TestSettlementNoLeakage:
         row = env.df.iloc[env.current_step]
         sell_price = env._get_intraday_sell_price('isp1', row)
         buy_price = env._get_intraday_buy_price('isp1', row)
-        spread = sell_price - buy_price
+        spread = buy_price - sell_price
 
-        assert spread == pytest.approx(30.0), \
-            f"XBID spread should be ISP1 UP - DOWN = 30, got {spread}"
+        assert spread == pytest.approx(6.0), \
+            f"XBID spread should be ask - bid = 6, got {spread}"
 
-    def test_isp1_fallback_to_imbalance_then_dam(self, sample_data):
-        """I verify fallback chain: ISP1 → imbalance_price → DAM."""
+    def test_xbid_fallback_to_dam_spread(self, sample_data):
+        """I verify fallback: XBID columns NaN → DAM ± 1.5."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        df['isp1_price_up'] = np.nan
-        df['isp1_price_down'] = np.nan
-        df['imbalance_price'] = np.nan
+        df['xbid_price_bid'] = np.nan
+        df['xbid_price_ask'] = np.nan
         df['price'] = 100.0
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
@@ -3665,13 +3669,13 @@ class TestSettlementNoLeakage:
 
         env.current_step = 4
         row = env.df.iloc[env.current_step]
-        sell_price = env._get_intraday_sell_price(None, row)
-        buy_price = env._get_intraday_buy_price(None, row)
+        sell_price = env._get_intraday_sell_price('isp1', row)
+        buy_price = env._get_intraday_buy_price('isp1', row)
 
-        assert sell_price == pytest.approx(100.0), \
-            f"Should fall back to DAM (100.0) when imbalance_price=NaN, got {sell_price}"
-        assert buy_price == pytest.approx(100.0), \
-            f"Should fall back to DAM (100.0) when imbalance_price=NaN, got {buy_price}"
+        assert sell_price == pytest.approx(98.5), \
+            f"Should fall back to DAM - 1.5 (98.5), got {sell_price}"
+        assert buy_price == pytest.approx(101.5), \
+            f"Should fall back to DAM + 1.5 (101.5), got {buy_price}"
 
     def test_ida_still_uses_clearing_price(self, sample_data):
         """I verify IDA auctions are unaffected by single pricing."""
@@ -3993,14 +3997,15 @@ class TestForecastColumnsNoLeakage:
 class TestXBIDPricing:
     """I test XBID ISP1 UP/DOWN bid-ask spread for XBID settlement."""
 
-    def test_xbid_uses_isp1_up_down(self, sample_data):
-        """I verify XBID uses ISP1 UP for sell and ISP1 DOWN for buy."""
+    def test_xbid_uses_xbid_price_columns(self, sample_data):
+        """I verify XBID uses xbid_price_bid/ask (not ISP1 balancing)."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        df['imbalance_price'] = 150.0
-        df['isp1_price_up'] = 200.0
-        df['isp1_price_down'] = 50.0
+        df['isp1_price_up'] = 200.0    # balancing (NOT for XBID)
+        df['isp1_price_down'] = 50.0   # balancing (NOT for XBID)
+        df['xbid_price_bid'] = 97.0    # realistic sell price
+        df['xbid_price_ask'] = 103.0   # realistic buy price
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
         env.reset(seed=42)
@@ -4010,24 +4015,24 @@ class TestXBIDPricing:
         sell_price = env._get_intraday_sell_price('isp1', row)
         buy_price = env._get_intraday_buy_price('isp1', row)
 
-        assert sell_price == pytest.approx(200.0), \
-            f"Sell should use isp1_price_up (200), got {sell_price}"
-        assert buy_price == pytest.approx(50.0), \
-            f"Buy should use isp1_price_down (50), got {buy_price}"
+        assert sell_price == pytest.approx(97.0), \
+            f"Sell should use xbid_price_bid (97), got {sell_price}"
+        assert buy_price == pytest.approx(103.0), \
+            f"Buy should use xbid_price_ask (103), got {buy_price}"
 
-    def test_xbid_has_real_spread(self, sample_data):
-        """I verify XBID has real bid-ask spread from ISP1 UP/DOWN."""
+    def test_xbid_has_realistic_spread(self, sample_data):
+        """I verify XBID has realistic tight spread (ask > bid)."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        df['isp1_price_up'] = 120.0
-        df['isp1_price_down'] = 90.0
+        df['xbid_price_bid'] = 98.0
+        df['xbid_price_ask'] = 104.0
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
         env.reset(seed=42)
         env.soc = 0.5
 
-        # I verify spread is consistent across steps
+        # I verify ask > bid (realistic spread) across steps
         for i in range(10):
             step = env.start_step + i
             if step < len(env.df):
@@ -4035,17 +4040,17 @@ class TestXBIDPricing:
                 row = env.df.iloc[step]
                 sell = env._get_intraday_sell_price('isp1', row)
                 buy = env._get_intraday_buy_price('isp1', row)
-                assert sell > buy, \
-                    f"Step {i}: sell={sell} should be > buy={buy} (ISP1 UP > DOWN)"
+                assert buy > sell, \
+                    f"Step {i}: buy={buy} should be > sell={sell} (ask > bid)"
 
-    def test_isp1_fallback_to_imbalance(self, sample_data):
-        """I verify fallback to imbalance_price when ISP1 unavailable."""
+    def test_xbid_fallback_to_dam(self, sample_data):
+        """I verify fallback to DAM ± 1.5 when XBID columns unavailable."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        df['isp1_price_up'] = np.nan
-        df['isp1_price_down'] = np.nan
-        df['imbalance_price'] = 95.0
+        df['xbid_price_bid'] = np.nan
+        df['xbid_price_ask'] = np.nan
+        df['price'] = 100.0
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
         env.reset(seed=42)
@@ -4054,10 +4059,10 @@ class TestXBIDPricing:
         sell_price = env._get_intraday_sell_price('isp1', row)
         buy_price = env._get_intraday_buy_price('isp1', row)
 
-        assert sell_price == pytest.approx(95.0), \
-            f"Should fall back to imbalance_price (95), got {sell_price}"
-        assert buy_price == pytest.approx(95.0), \
-            f"Should fall back to imbalance_price (95), got {buy_price}"
+        assert sell_price == pytest.approx(98.5), \
+            f"Should fall back to DAM - 1.5 (98.5), got {sell_price}"
+        assert buy_price == pytest.approx(101.5), \
+            f"Should fall back to DAM + 1.5 (101.5), got {buy_price}"
 
     def test_ida_still_uses_clearing_price(self, sample_data):
         """I verify IDA auctions are unaffected by single pricing."""
@@ -4084,50 +4089,45 @@ class TestXBIDPricing:
         assert sell2 == pytest.approx(120.0), f"IDA2 should use clearing price (120), got {sell2}"
         assert buy2 == pytest.approx(120.0), f"IDA2 should use clearing price (120), got {buy2}"
 
-    def test_xbid_uses_isp1_bid_ask_spread(self, sample_data):
-        """I verify XBID sell uses ISP1 UP and buy uses ISP1 DOWN (real spread)."""
+    def test_xbid_settlement_uses_xbid_columns(self, sample_data):
+        """I verify XBID settlement uses xbid_price_bid/ask (not ISP1 balancing)."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        df['isp1_price_up'] = 140.0
-        df['isp1_price_down'] = 110.0
-        df['imbalance_price'] = 130.0
+        df['isp1_price_up'] = 200.0    # balancing (NOT for XBID settlement)
+        df['isp1_price_down'] = 50.0   # balancing (NOT for XBID settlement)
+        df['xbid_price_bid'] = 99.0    # realistic sell price
+        df['xbid_price_ask'] = 105.0   # realistic buy price
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
         env.reset(seed=42)
         env.soc = 0.5
 
-        # I step and capture the market state from reward info
-        action = np.array([0, 2, 5, 5])  # idle
-        obs, reward, done, truncated, info = env.step(action)
-
-        # I verify xbid sell uses ISP1 UP, buy uses ISP1 DOWN
         row = env.df.iloc[env.current_step]
-        xbid_sell = env._get_intraday_sell_price(None, row)
-        xbid_buy = env._get_intraday_buy_price(None, row)
-        assert xbid_sell == pytest.approx(140.0), \
-            f"XBID sell should use ISP1 UP (140.0), got {xbid_sell}"
-        assert xbid_buy == pytest.approx(110.0), \
-            f"XBID buy should use ISP1 DOWN (110.0), got {xbid_buy}"
-        assert xbid_sell > xbid_buy, "XBID sell (ISP1 UP) should be > buy (ISP1 DOWN)"
+        xbid_sell = env._get_intraday_sell_price('isp1', row)
+        xbid_buy = env._get_intraday_buy_price('isp1', row)
+        assert xbid_sell == pytest.approx(99.0), \
+            f"XBID sell should use xbid_price_bid (99.0), got {xbid_sell}"
+        assert xbid_buy == pytest.approx(105.0), \
+            f"XBID buy should use xbid_price_ask (105.0), got {xbid_buy}"
+        assert xbid_buy > xbid_sell, "XBID ask (buy) should be > bid (sell)"
 
-    def test_zero_prices_uses_dam_fallback(self, sample_data):
-        """I verify that when ISP1 UP=0 and imbalance_price=0, DAM fallback triggers."""
+    def test_zero_xbid_uses_dam_fallback(self, sample_data):
+        """I verify that when xbid_price_bid=0, DAM fallback triggers."""
         from gym_envs.battery_env_unified import BatteryEnvUnified
 
         df = sample_data.copy()
-        df['isp1_price_up'] = 0.0     # ISP1 UP zero → skip
-        df['isp1_price_down'] = 0.0   # ISP1 DOWN zero → skip
-        df['imbalance_price'] = 0.0   # Imbalance zero → skip
-        df['price'] = 88.0            # DAM fallback
+        df['xbid_price_bid'] = 0.0     # zero → skip
+        df['xbid_price_ask'] = 0.0     # zero → skip
+        df['price'] = 88.0             # DAM fallback
 
         env = BatteryEnvUnified(df=df, episode_length=72, random_start=False)
         env.reset(seed=42)
 
         row = env.df.iloc[env.current_step]
-        sell = env._get_intraday_sell_price(None, row)
-        assert sell == pytest.approx(88.0), \
-            f"All prices zero should trigger DAM fallback (88), got {sell}"
+        sell = env._get_intraday_sell_price('isp1', row)
+        assert sell == pytest.approx(86.5), \
+            f"Zero XBID should trigger DAM - 1.5 fallback (86.5), got {sell}"
 
 
 class TestObservationImbalanceFeatures:
