@@ -24,8 +24,8 @@ Action Space: MultiDiscrete([5, 5, 11, 11]) = 3,025 combinations (legacy)
 - [4] Free Bid Qty: 11 levels — agent-submitted, pay-as-bid (full market only)
 - [5] Free Bid Price Tier: 5 levels (full market only)
 
-Observation Space: 64-100 features (see _build_observation for details)
-  Base: 64 | +forecast: 9 | +market_forecast: 20 | +full_market: 12
+Observation Space: 70-102 features (see _build_observation for details)
+  Base: 70 | +forecast: 9 | +market_forecast: 20 | +full_market: 13
 """
 
 import gymnasium as gym
@@ -422,7 +422,7 @@ class BatteryEnvUnified(gym.Env):
             ])
 
         # I compute dynamic observation size based on enabled feature groups
-        n_obs = 68  # Base features (Groups 1-9) + predicted_soc_eod + dam_net_energy_ratio
+        n_obs = 70  # Base features (Groups 1-9) + situational awareness
         if self.enable_forecast:
             n_obs += 9   # IntraDay forecast + RES fundamentals
         if self.enable_market_forecast:
@@ -511,6 +511,12 @@ class BatteryEnvUnified(gym.Env):
         # I track SoC extremes over the episode
         self.episode_min_soc = 1.0
         self.episode_max_soc = 0.0
+
+        # I sample per-episode systematic bias for DAM forecast noise.
+        # Real forecasters have persistent biases during weather regime changes
+        # (e.g., consistently over-forecasting during cloudy weeks). This bias
+        # ensures the agent doesn't rely on a "noisy oracle" DAM schedule.
+        self._dam_forecast_bias = np.random.uniform(-12, 12)
 
     def reset(self, seed=None, options=None):
         """I reset the environment for a new episode."""
@@ -986,7 +992,7 @@ class BatteryEnvUnified(gym.Env):
 
                     # I apply ADMIE "highest value rule": max(aFRR, mFRR)
                     afrr_price = max(row.get('afrr_down', 80.0), row.get('mfrr_price_down', 0.0))
-                    afrr_energy_revenue = -actual_energy * afrr_price
+                    afrr_energy_revenue = actual_energy * afrr_price
 
                     cycle_fraction = actual_energy / self.capacity_mwh
                     self.total_cycles += cycle_fraction
@@ -1757,8 +1763,10 @@ class BatteryEnvUnified(gym.Env):
             hourly_indices = day_indices[::self._sph][:24]
             forecast = np.array([self.df.iloc[i].get('price', 80.0) for i in hourly_indices])
 
-            # I add forecast noise (MAE ~18 EUR) to avoid oracle effect
-            noise = np.random.normal(0, 18.0, len(forecast))
+            # I add forecast noise with per-episode systematic bias to avoid
+            # the "noisy oracle" effect. Real forecasters have persistent biases
+            # (e.g., +8 EUR during cloudy weeks, -5 EUR during heatwaves).
+            noise = np.random.normal(self._dam_forecast_bias, 22.0, len(forecast))
             forecast = forecast + noise
 
         if len(forecast) < 12:
@@ -2187,21 +2195,21 @@ class BatteryEnvUnified(gym.Env):
 
     def _build_observation(self) -> np.ndarray:
         """
-        I build the observation vector (68-89 features depending on flags).
+        I build the observation vector (70-102 features depending on flags).
 
         Feature Groups:
         1. Battery State (4): soc, max_discharge, max_charge, cycles_remaining
-        2. Market Prices (11): dam, id_bid, id_ask, id_spread, id_volume, mfrr_up, mfrr_down, mfrr_spread, id_dam_spread, mfrr_dam_premium, mfrr_id_spread
+        2. Market Prices (13): dam, imb_lag, sys_dir, imb_mag, volume, mfrr_up/down/spread, id_dam/mfrr_dam/mfrr_id spreads, hvr_up/down
         3. Time Encoding (4): hour_sin/cos, dow_sin/cos
         4. DAM Lookahead (13): current + 12h commitments
         5. Price Lookahead (12): 12h price forecasts
         6. aFRR State (8): cap_prices, activation, commitment, selection, signal, hours_since
-        7. Risk/Imbalance (6): dam_discharge_reserve, shortfall_risk, momentum, worthiness, predicted_soc_eod, dam_net_energy_ratio
+        7. Risk/Imbalance (8): dam_reserve, shortfall, momentum, worthiness, predicted_soc_eod, dam_net_energy_ratio, net_energy_position, vol_regime
         8. Market Phase (4): ida3_correction, system_stress, res_penetration, mfrr_direction
         9. Timing Signals (4): price_vs_typical, is_peak, is_solar, hours_to_max
         10. IntraDay Forecast + RES (9, enable_forecast): fc_1h-8h, correction, spread, solar, wind, res_dev
         10b. Market Forecasts (20, enable_market_forecast): dam_fc_4h, id_fc, imbalance, serbia, confidence, timing, isp_cascade
-        11-12. Full Market (12, enable_full_market): IDA/XBID/FreeBid state
+        11-12. Full Market (13, enable_full_market): IDA/XBID/FreeBid state
         """
         row = self.df.iloc[self.current_step]
         ts = self.df.index[self.current_step]
@@ -2397,6 +2405,33 @@ class BatteryEnvUnified(gym.Env):
         # Positive = sell-heavy (SoC will fall), negative = buy-heavy (SoC will rise)
         dam_net_energy_ratio = np.clip(net_energy_mwh / self.capacity_mwh, -1.0, 1.0)
         features.append(dam_net_energy_ratio)
+
+        # Net energy position today — I track whether the agent is net long/short
+        # across all markets (sold - bought) relative to capacity. Helps the agent
+        # balance its book and avoid one-sided exposure.
+        total_sold = (self.dam_mwh_sold + self.intraday_mwh_sold +
+                      self.afrr_mwh_sold + self.mfrr_mwh_sold +
+                      self.xbid_mwh_sold + self.free_bid_mwh_sold +
+                      self.ida_mwh_sold)
+        total_bought = (self.dam_mwh_bought + self.intraday_mwh_bought +
+                        self.afrr_mwh_bought + self.mfrr_mwh_bought +
+                        self.xbid_mwh_bought + self.free_bid_mwh_bought +
+                        self.ida_mwh_bought)
+        net_energy_position = np.clip(
+            (total_sold - total_bought) / self.capacity_mwh, -1.0, 1.0
+        )
+        features.append(net_energy_position)
+
+        # Price volatility regime — ratio of recent (6h) to longer-term (24h)
+        # volatility. >1 means volatility is increasing (more arbitrage opportunity),
+        # <1 means volatility is fading (time to reduce activity).
+        vol_24h = row.get('price_std_24h', 20.0)
+        vol_6h = row.get('price_std_6h', vol_24h)
+        if vol_24h > 0.1:
+            vol_regime = np.clip(vol_6h / vol_24h, 0.0, 3.0) / 3.0
+        else:
+            vol_regime = 0.5  # I default to neutral when volatility is near zero
+        features.append(vol_regime)
 
         # =====================================================================
         # 8. MARKET PHASE & SYSTEM STATE (4 features)
@@ -2674,7 +2709,7 @@ class BatteryEnvUnified(gym.Env):
         # =====================================================================
         obs = np.array(features, dtype=np.float32)
 
-        expected_features = 68  # Base features (Groups 1-9) + predicted_soc_eod + dam_net_energy_ratio
+        expected_features = 70  # Base features (Groups 1-9) + situational awareness
         if self.enable_forecast:
             expected_features += 9
         if self.enable_market_forecast:

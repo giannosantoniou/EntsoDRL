@@ -168,8 +168,10 @@ class DegradationCurriculumCallback(BaseCallback):
 class TensorboardLoggingCallback(BaseCallback):
     """I log additional metrics to Tensorboard including per-market statistics."""
 
-    def __init__(self, verbose: int = 0):
+    def __init__(self, eval_env=None, verbose: int = 0):
         super().__init__(verbose)
+        # I keep a reference to eval_env for periodic VecNormalize sync
+        self._eval_env = eval_env
         # I track episode-level metrics
         self.episode_profits = []
         self.episode_cycles = []
@@ -404,6 +406,13 @@ class TensorboardLoggingCallback(BaseCallback):
             self.step_free_bid_buys = 0
             self.step_count = 0
 
+            # I sync VecNormalize stats from training env to eval env every
+            # 10k steps so eval observations stay properly normalized as the
+            # running statistics evolve during training.
+            if self._eval_env is not None and hasattr(self.training_env, 'obs_rms'):
+                self._eval_env.obs_rms = self.training_env.obs_rms
+                self._eval_env.ret_rms = self.training_env.ret_rms
+
         return True
 
 
@@ -526,9 +535,9 @@ def train_unified_model(
     total_timesteps: int = 5_000_000,
     n_envs: int = 8,  # I use 8 parallel environments for speedup
     learning_rate: float = 1e-4,
-    n_steps: int = 2048,
+    n_steps: int = 4096,  # I doubled from 2048 for 2x sample diversity per update (buffer = n_steps * n_envs)
     batch_size: int = 256,
-    n_epochs: int = 5,  # I reduced from 10 to avoid overfitting on same rollout batch
+    n_epochs: int = 10,  # I raised from 5 — larger buffer (4096×8=32k) supports more epochs without overfitting
     gamma: float = 0.99,
     gae_lambda: float = 0.97,  # I raised from 0.95 to extend advantage horizon to ~18h (was ~12h)
     clip_range: float = 0.2,
@@ -711,6 +720,12 @@ def train_unified_model(
         training=False
     )
 
+    # I sync training VecNormalize statistics to eval env so that early
+    # evaluations don't use empty (mean=0, var=1) normalization — which
+    # produces garbage observations and unreliable "best model" selection.
+    eval_env.obs_rms = train_env.obs_rms
+    eval_env.ret_rms = train_env.ret_rms
+
     # I create callbacks
     print("Setting up callbacks...")
 
@@ -735,7 +750,7 @@ def train_unified_model(
         warmup_steps=min(500_000, total_timesteps // 5)
     )
 
-    logging_callback = TensorboardLoggingCallback()
+    logging_callback = TensorboardLoggingCallback(eval_env=eval_env)
 
     entropy_callback = EntropyAnnealingCallback(
         start_ent=ent_coef,   # I start from the user-specified ent_coef (default 0.03)
@@ -840,7 +855,7 @@ def train_unified_model(
             seed=seed,
             device=device,
             policy_kwargs={
-                "net_arch": dict(pi=[256, 256], vf=[256, 256])
+                "net_arch": dict(pi=[512, 256, 128], vf=[512, 256, 128])
             }
         )
 
@@ -1429,6 +1444,12 @@ if __name__ == "__main__":
                         help="Number of parallel environments (default: 8)")
     parser.add_argument("--lr", type=float, default=1e-4,
                         help="Learning rate")
+    parser.add_argument("--n-steps", type=int, default=4096,
+                        help="Rollout buffer steps per env (default: 4096)")
+    parser.add_argument("--n-epochs", type=int, default=10,
+                        help="PPO epochs per update (default: 10)")
+    parser.add_argument("--batch-size", type=int, default=256,
+                        help="Minibatch size (default: 256)")
     parser.add_argument("--ent_coef", type=float, default=0.03,
                         help="Entropy coefficient")
     parser.add_argument("--seed", type=int, default=42,
@@ -1494,6 +1515,9 @@ if __name__ == "__main__":
             total_timesteps=args.timesteps,
             n_envs=args.n_envs,
             learning_rate=args.lr,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            n_epochs=args.n_epochs,
             ent_coef=args.ent_coef,
             seed=args.seed,
             device=args.device,

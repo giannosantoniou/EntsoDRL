@@ -198,6 +198,7 @@ def create_unified_dataset_from_admie(
     # (IntraDay synthesis uses price_std_24h if available)
     unified['price_mean_24h'] = unified['price'].rolling(24, min_periods=1).mean()
     unified['price_std_24h'] = unified['price'].rolling(24, min_periods=1).std().fillna(10)
+    unified['price_std_6h'] = unified['price'].rolling(6, min_periods=1).std().fillna(10)
     unified['price_min_24h'] = unified['price'].rolling(24, min_periods=1).min()
     unified['price_max_24h'] = unified['price'].rolling(24, min_periods=1).max()
 
@@ -435,6 +436,8 @@ def _create_base_15min_dataset(dam_path, admie_path, forecast_path_name, data_di
     w24 = 24 * steps_per_hour
     unified['price_mean_24h'] = unified['price'].rolling(w24, min_periods=1).mean()
     unified['price_std_24h'] = unified['price'].rolling(w24, min_periods=1).std().fillna(10)
+    w6 = 6 * steps_per_hour
+    unified['price_std_6h'] = unified['price'].rolling(w6, min_periods=1).std().fillna(10)
     unified['price_min_24h'] = unified['price'].rolling(w24, min_periods=1).min()
     unified['price_max_24h'] = unified['price'].rolling(w24, min_periods=1).max()
 
@@ -903,6 +906,8 @@ def create_unified_dataset_from_admie_15min(
     window_24h = 24 * steps_per_hour  # 96 steps at 15-min
     unified['price_mean_24h'] = unified['price'].rolling(window_24h, min_periods=1).mean()
     unified['price_std_24h'] = unified['price'].rolling(window_24h, min_periods=1).std().fillna(10)
+    window_6h = 6 * steps_per_hour  # 24 steps at 15-min
+    unified['price_std_6h'] = unified['price'].rolling(window_6h, min_periods=1).std().fillna(10)
     unified['price_min_24h'] = unified['price'].rolling(window_24h, min_periods=1).min()
     unified['price_max_24h'] = unified['price'].rolling(window_24h, min_periods=1).max()
 
@@ -1715,7 +1720,7 @@ def _synthesize_xbid_prices(df, mask, time_step_hours=0.25):
     # I generate OU deviation process for independent XBID dynamics
     # (RES forecast updates, cross-border flows, liquidity changes)
     ou_deviation = np.zeros(n)
-    ou_theta = 0.08   # moderate mean reversion
+    ou_theta = 0.15   # I use faster mean reversion to prevent unrealistic XBID-DAM drift
     ou_sigma = 5.0     # EUR volatility per sqrt(hour)
     ou_deviation[0] = np.random.normal(0, ou_sigma * 0.5)
     for i in range(1, n):
@@ -1937,6 +1942,8 @@ def _add_derived_features(df: pd.DataFrame, steps_per_hour: int = 1) -> pd.DataF
     window_24h = 24 * sph
     df['price_mean_24h'] = df['price'].rolling(window_24h, min_periods=1).mean()
     df['price_std_24h'] = df['price'].rolling(window_24h, min_periods=1).std().fillna(10)
+    window_6h = 6 * sph
+    df['price_std_6h'] = df['price'].rolling(window_6h, min_periods=1).std().fillna(10)
     df['price_min_24h'] = df['price'].rolling(window_24h, min_periods=1).min()
     df['price_max_24h'] = df['price'].rolling(window_24h, min_periods=1).max()
 
