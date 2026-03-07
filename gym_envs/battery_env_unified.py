@@ -46,6 +46,11 @@ from gym_envs.market_executors.dam_executor import DamExecutor
 from gym_envs.market_executors.afrr_executor import AfrrExecutor
 from gym_envs.market_executors.ida_executor import IdaExecutor
 from gym_envs.market_executors.trading_executor import TradingExecutor
+from gym_envs.step_context import StepContext
+from gym_envs.market_stages import (
+    IdaGateStage, AfrrStage, DamStage,
+    IdaStage, MfrrStage, XbidStage, FreeBidStage
+)
 
 
 class BatteryEnvUnified(gym.Env):
@@ -248,6 +253,17 @@ class BatteryEnvUnified(gym.Env):
         self._afrr_executor = AfrrExecutor(self)
         self._ida_executor = IdaExecutor(self)
         self._trading_executor = TradingExecutor(self)
+
+        # I create pipeline stages for OCP-compliant step()
+        self._ida_gate_stage = IdaGateStage(self)
+        self._afrr_stage = AfrrStage(self)
+        self._dam_stage = DamStage(self)
+        self._energy_stages = [
+            IdaStage(self),
+            MfrrStage(self),
+            XbidStage(self),
+            FreeBidStage(self),
+        ]
 
         # I define action and observation spaces
         self._setup_spaces()
@@ -490,679 +506,103 @@ class BatteryEnvUnified(gym.Env):
         return self._mask_builder.build()
 
     def step(self, action) -> Tuple[np.ndarray, float, bool, bool, Dict]:
-        """I execute one step in the unified environment."""
+        """I execute one step via the market pipeline (OCP-compliant).
+
+        Adding a new market = creating a MarketStage + registering it in
+        self._energy_stages. Zero changes to this method needed.
+        """
         self._check_day_reset()
 
-        # =====================================================================
-        # STAGE 0: IDA GATE TRIGGERS (rule-based, NN-forecast driven)
-        # I check if we're at an IDA gate closure timestamp. If so, I generate
-        # and lock the IDA schedule before processing the agent's action.
-        # The agent's action dim[2] controls participation level during gate steps.
-        # =====================================================================
-        if self.enable_full_market:
-            ts_gate = self.df.index[self.current_step]
-            gate_hour = ts_gate.hour
-            gate_minute = ts_gate.minute
-
-            # I compute participation level from the IntraDay action (reused for IDA)
-            # At gate steps: 11 levels → [-100%, ..., 0, 0, 0, ..., +100%]
-            # Positive = follow generator direction, Negative = reverse direction
-            ida_action_raw = action[2]
-            ida_level = self.INTRADAY_LEVELS[ida_action_raw]  # -1.0 to +1.0
-
-            if gate_hour == 15 and gate_minute == 0 and not self.ida1_locked_today:
-                self._trigger_ida_gate(ida_number=1, participation_level=ida_level)
-            elif gate_hour == 22 and gate_minute == 0 and not self.ida2_locked_today:
-                self._trigger_ida_gate(ida_number=2, participation_level=ida_level)
-            elif gate_hour == 10 and gate_minute == 0 and not self.ida3_locked_today:
-                self._trigger_ida_gate(ida_number=3, participation_level=ida_level)
-
-        # =====================================================================
-        # STAGE 1: UNPACK ACTION
-        # =====================================================================
-        afrr_action = action[0]
-        price_tier_action = action[1]
-        xbid_action = action[2]                    # XBID continuous / IDA participation
-        mfrr_qty_action = action[3]                # mFRR qty (TSO-activated)
-        freebid_qty_action = action[4] if self.enable_full_market else 5  # FreeBid qty (idle=5)
-        freebid_price_action = action[5] if self.enable_full_market else 2  # FreeBid price (neutral=2)
-
-        # I get current market data
         row = self.df.iloc[self.current_step]
-        # I use endogenous DAM commitment when available (Phase 4)
         dam_commitment = np.clip(self._get_dam_commitment(self.current_step),
                                   -self.max_power_mw, self.max_power_mw)
 
-        # I calculate remaining capacity after DAM
-        remaining_capacity = self.max_power_mw - abs(dam_commitment)
-
-        # =====================================================================
-        # STAGE 2: aFRR COMMITMENT & SELECTION
-        # I only allow re-commitment at 4-hour block boundaries per real
-        # Greek aFRR procurement rules. During a block, the committed MW
-        # stays locked.
-        # =====================================================================
-        if self._afrr_steps_remaining <= 0:
-            # I allow the agent to set a new commitment at block boundary
-            new_afrr_level = self.AFRR_LEVELS[afrr_action]
-            self.afrr_commitment_level = afrr_action
-            self.afrr_commitment_mw = new_afrr_level * remaining_capacity
-            self._afrr_steps_remaining = self._afrr_block_steps
-
-            # I determine if we're selected for this block
-            price_tier = self.AFRR_PRICE_TIERS[price_tier_action]
-            adjusted_selection_prob = self.selection_probability * (1.5 - price_tier * 0.5)
-            adjusted_selection_prob = np.clip(adjusted_selection_prob, 0.1, 0.95)
-
-            self.is_selected_for_afrr = (
-                self.afrr_commitment_mw > 0.1 and
-                np.random.random() < adjusted_selection_prob
-            )
-        # else: I keep the existing commitment (locked within 4h block)
-        self._afrr_steps_remaining -= 1
-
-        # aFRR capacity revenue
-        afrr_capacity_revenue = 0.0
-        if self.is_selected_for_afrr:
-            # I use marginal pricing: ALL selected providers receive the market
-            # clearing price, regardless of their individual bid. The price_tier
-            # only affects selection probability (line 444), NOT the payment.
-            cap_price = row.get('afrr_cap_up_price', 20.0)
-            afrr_capacity_revenue = self.afrr_commitment_mw * cap_price * self.time_step_hours
-            self.afrr_capacity_profit += afrr_capacity_revenue
-
-        # =====================================================================
-        # STAGE 3: aFRR ACTIVATION CHECK
-        # =====================================================================
-        afrr_activated = False
-        afrr_direction = None
-        afrr_energy_revenue = 0.0
-        afrr_energy_delivered = 0.0
-
-        if self.is_selected_for_afrr and self.afrr_commitment_mw > 0.1:
-            afrr_activated, afrr_direction = self._check_afrr_activation(row)
-
-        # =====================================================================
-        # STAGE 4: EXECUTE DAM COMMITMENT (MANDATORY)
-        # =====================================================================
-        actual_energy_mw = 0.0
-        dam_executed_mw = 0.0
-
-        if abs(dam_commitment) > 0.1:
-            available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
-            available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
-
-            if dam_commitment > 0:  # Must discharge
-                max_dam_discharge = min(
-                    abs(dam_commitment),
-                    available_discharge_mwh * self.eff_sqrt / self.time_step_hours
-                )
-                dam_executed_mw = max_dam_discharge
-
-                energy_mwh = dam_executed_mw * self.time_step_hours
-                soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
-                self.soc = max(self.min_soc, self.soc - soc_delta)
-
-                cycle_fraction = energy_mwh / self.capacity_mwh
-                self.total_cycles += cycle_fraction
-                self.daily_cycles += cycle_fraction
-
-            else:  # Must charge (dam_commitment < 0)
-                max_dam_charge = min(
-                    abs(dam_commitment),
-                    available_charge_mwh / self.eff_sqrt / self.time_step_hours
-                )
-                dam_executed_mw = -max_dam_charge
-
-                energy_mwh = max_dam_charge * self.time_step_hours
-                soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
-                self.soc = min(self.max_soc, self.soc + soc_delta)
-
-                cycle_fraction = energy_mwh / self.capacity_mwh
-                self.total_cycles += cycle_fraction
-                self.daily_cycles += cycle_fraction
-
-            actual_energy_mw = dam_executed_mw
-            self.dam_profit += dam_executed_mw * row.get('price', 100.0) * self.time_step_hours
-
-            # I track DAM energy volumes
-            dam_mwh = abs(dam_executed_mw) * self.time_step_hours
-            if dam_executed_mw > 0:
-                self.dam_mwh_sold += dam_mwh
-            elif dam_executed_mw < 0:
-                self.dam_mwh_bought += dam_mwh
-
-        # =====================================================================
-        # STAGE 5: EXECUTE aFRR IF ACTIVATED (takes priority)
-        # =====================================================================
-        available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
-        available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
-
-        max_discharge = min(
-            remaining_capacity,
-            available_discharge_mwh * self.eff_sqrt / self.time_step_hours
-        )
-        max_charge = min(
-            remaining_capacity,
-            available_charge_mwh / self.eff_sqrt / self.time_step_hours
+        ctx = StepContext(
+            action=action, row=row, step_idx=self.current_step,
+            dam_commitment=dam_commitment,
+            remaining_capacity=self.max_power_mw - abs(dam_commitment),
         )
 
-        # I compute the max power actually deliverable for aFRR given post-DAM SoC.
-        # I pass this to the reward calculator so it can distinguish between
-        # agent fault (chose wrong action) and SoC starvation (DAM consumed energy).
-        if afrr_direction == 'up':
-            afrr_max_deliverable_mw = max_discharge
-        elif afrr_direction == 'down':
-            afrr_max_deliverable_mw = max_charge
-        else:
-            afrr_max_deliverable_mw = None
+        # I run pre-pipeline stages (IDA gates + aFRR commitment)
+        self._ida_gate_stage.execute(ctx)
+        self._afrr_stage.execute_commitment(ctx)
+
+        # I run priority markets (DAM mandatory, aFRR energy post-DAM)
+        self._dam_stage.execute(ctx)
+        self._afrr_stage.execute(ctx)
+
+        # I run cascade pipeline (OCP: add markets here without touching step())
+        for stage in self._energy_stages:
+            stage.execute(ctx)
+
+        # I calculate reward and finalize the step
+        reward, reward_info = self._calculate_reward(ctx)
+        return self._finalize_step(ctx, reward, reward_info)
+
+    def _apply_market_result(self, market_name: str, result, count_daily_cycles: bool = True):
+        """I apply a pure executor's MarketResult to env state.
+
+        Used for DamExecutor (pure — returns MarketResult without mutation).
+        Impure executors (aFRR, IDA, mFRR, XBID, FreeBid) modify state directly.
+        """
+        self.soc = np.clip(self.soc + result.soc_delta, self.min_soc, self.max_soc)
+        self.total_cycles += result.cycle_fraction
+        if count_daily_cycles:
+            self.daily_cycles += result.cycle_fraction
+
+        # I update per-market profit tracking
+        profit_attr = f'{market_name}_profit'
+        if hasattr(self, profit_attr):
+            setattr(self, profit_attr, getattr(self, profit_attr) + result.revenue)
+
+        # I update per-market volume tracking
+        sold_attr = f'{market_name}_mwh_sold'
+        if hasattr(self, sold_attr):
+            setattr(self, sold_attr, getattr(self, sold_attr) + result.mwh_sold)
+        bought_attr = f'{market_name}_mwh_bought'
+        if hasattr(self, bought_attr):
+            setattr(self, bought_attr, getattr(self, bought_attr) + result.mwh_bought)
+
+    def _calculate_reward(self, ctx: 'StepContext') -> Tuple[float, Dict]:
+        """I calculate the shaped reward from the pipeline context.
+
+        Extracted from the old Stage 10 to keep step() clean.
+        """
+        row = ctx.row
 
-        if afrr_activated:
-            self.steps_since_afrr_activation = 0
-
-            if afrr_direction == 'up':
-                afrr_energy_delivered = min(self.afrr_commitment_mw, max_discharge)
-                if afrr_energy_delivered > 0.1:
-                    energy_mwh = afrr_energy_delivered * self.time_step_hours
-                    soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
-                    old_soc = self.soc
-                    self.soc = max(self.min_soc, self.soc - soc_delta)
-                    actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
-
-                    # I apply ADMIE "highest value rule": max(aFRR, mFRR)
-                    afrr_price = max(row.get('afrr_up', 80.0), row.get('mfrr_price_up', 0.0))
-                    afrr_energy_revenue = actual_energy * afrr_price
-
-                    cycle_fraction = actual_energy / self.capacity_mwh
-                    self.total_cycles += cycle_fraction
-                    self.daily_cycles += cycle_fraction
-
-                    afrr_energy_delivered = actual_energy / self.time_step_hours
-
-            else:  # 'down'
-                afrr_energy_delivered = min(self.afrr_commitment_mw, max_charge)
-                if afrr_energy_delivered > 0.1:
-                    energy_mwh = afrr_energy_delivered * self.time_step_hours
-                    soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
-                    old_soc = self.soc
-                    self.soc = min(self.max_soc, self.soc + soc_delta)
-                    actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
-
-                    # I apply ADMIE "highest value rule": max(aFRR, mFRR)
-                    afrr_price = max(row.get('afrr_down', 80.0), row.get('mfrr_price_down', 0.0))
-                    afrr_energy_revenue = actual_energy * afrr_price
-
-                    cycle_fraction = actual_energy / self.capacity_mwh
-                    self.total_cycles += cycle_fraction
-                    self.daily_cycles += cycle_fraction
-
-                    afrr_energy_delivered = -actual_energy / self.time_step_hours
-
-            self.afrr_energy_profit += afrr_energy_revenue
-            actual_energy_mw += afrr_energy_delivered
-
-            # I track aFRR energy volumes (up = sold/discharge, down = bought/charge)
-            afrr_mwh = abs(afrr_energy_delivered) * self.time_step_hours
-            if afrr_energy_delivered > 0:
-                self.afrr_mwh_sold += afrr_mwh
-            elif afrr_energy_delivered < 0:
-                self.afrr_mwh_bought += afrr_mwh
-
-            remaining_after_afrr = remaining_capacity - abs(afrr_energy_delivered)
-        else:
-            self.steps_since_afrr_activation += 1
-            # I subtract aFRR committed MW even when not activated — the capacity
-            # is reserved for potential activation and must not be used for other
-            # markets. This matches the action mask logic (line 557).
-            remaining_after_afrr = max(0, remaining_capacity - self.afrr_commitment_mw)
-
-        # =====================================================================
-        # STAGE 6: EXECUTE IDA POSITIONS (locked, mandatory like DAM)
-        # I execute locked IDA schedules generated at gate closure.
-        # IDA positions are mandatory — the agent must deliver them.
-        # IDA1/IDA2: deliver 00:00-24:00, IDA3: deliver 12:00-24:00
-        # =====================================================================
-        ida_energy_mw = 0.0
-        ida_revenue = 0.0
-        ida_shortfall_mw = 0.0
-        if self.enable_full_market:
-            # I get the locked IDA commitment for this step
-            net_ida = self._get_ida_commitment(self.current_step)
-            net_ida = np.clip(net_ida, -remaining_after_afrr, remaining_after_afrr)
-
-            if abs(net_ida) > 0.1:
-                # I recalculate limits for IDA execution
-                available_discharge_mwh_ida = (self.soc - self.min_soc) * self.capacity_mwh
-                available_charge_mwh_ida = (self.max_soc - self.soc) * self.capacity_mwh
-
-                if net_ida > 0:  # Discharge (sell)
-                    max_ida = min(net_ida,
-                                  available_discharge_mwh_ida * self.eff_sqrt / self.time_step_hours)
-                    if max_ida > 0.1:
-                        energy_mwh = max_ida * self.time_step_hours
-                        soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
-                        self.soc = max(self.min_soc, self.soc - soc_delta)
-                        ida_energy_mw = max_ida
-                        cycle_fraction = energy_mwh / self.capacity_mwh
-                        self.total_cycles += cycle_fraction
-                        self.daily_cycles += cycle_fraction
-                    # I check for shortfall (committed but couldn't deliver)
-                    ida_shortfall_mw = max(0, net_ida - max_ida) if max_ida > 0.1 else net_ida
-                else:  # Charge (buy)
-                    max_ida = min(abs(net_ida),
-                                  available_charge_mwh_ida / self.eff_sqrt / self.time_step_hours)
-                    if max_ida > 0.1:
-                        energy_mwh = max_ida * self.time_step_hours
-                        soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
-                        self.soc = min(self.max_soc, self.soc + soc_delta)
-                        ida_energy_mw = -max_ida
-                        cycle_fraction = energy_mwh / self.capacity_mwh
-                        self.total_cycles += cycle_fraction
-                        self.daily_cycles += cycle_fraction
-                    # I check for shortfall
-                    ida_shortfall_mw = max(0, abs(net_ida) - max_ida) if max_ida > 0.1 else abs(net_ida)
-
-                actual_energy_mw += ida_energy_mw
-                remaining_after_afrr -= abs(ida_energy_mw)
-
-            # I compute IDA revenue from individual schedule positions
-            day_offset_ida = self._step_day_offset[self.current_step]
-
-            ida1_pos = 0.0
-            if self.ida1_schedule is not None and 0 <= day_offset_ida < len(self.ida1_schedule):
-                ida1_pos = self.ida1_schedule[day_offset_ida]
-            ida2_pos = 0.0
-            if self.ida2_schedule is not None and 0 <= day_offset_ida < len(self.ida2_schedule):
-                ida2_pos = self.ida2_schedule[day_offset_ida]
-            ida3_pos = 0.0
-            if (self.ida3_schedule is not None and self.df.index[self.current_step].hour >= 12
-                    and 0 <= day_offset_ida < len(self.ida3_schedule)):
-                ida3_pos = self.ida3_schedule[day_offset_ida]
-
-            # I compute revenue per IDA at its clearing price
-            if abs(ida1_pos) > 0.01:
-                p1 = row.get('ida1_clearing_price', row.get('price', 100.0))
-                r1 = ida1_pos * p1 * self.time_step_hours
-                ida_revenue += r1
-                self.ida1_profit += r1
-            if abs(ida2_pos) > 0.01:
-                p2 = row.get('ida2_clearing_price', row.get('price', 100.0))
-                r2 = ida2_pos * p2 * self.time_step_hours
-                ida_revenue += r2
-                self.ida2_profit += r2
-            if abs(ida3_pos) > 0.01:
-                p3 = row.get('ida3_clearing_price', row.get('price', 100.0))
-                r3 = ida3_pos * p3 * self.time_step_hours
-                ida_revenue += r3
-                self.ida3_profit += r3
-
-            # I scale proportionally if execution was clipped by SoC/capacity limits
-            net_ida_committed = abs(ida1_pos) + abs(ida2_pos) + abs(ida3_pos)
-            if net_ida_committed > 0.1 and abs(ida_energy_mw) > 0.01:
-                execution_ratio = min(1.0, abs(ida_energy_mw) / net_ida_committed)
-                ida_revenue *= execution_ratio
-
-            self.ida_profit += ida_revenue
-
-            # I track IDA energy volumes
-            ida_mwh_step = abs(ida_energy_mw) * self.time_step_hours
-            if ida_energy_mw > 0:
-                self.ida_mwh_sold += ida_mwh_step
-            elif ida_energy_mw < 0:
-                self.ida_mwh_bought += ida_mwh_step
-
-            # I track IDA violations
-            if ida_shortfall_mw > 0.1:
-                self.episode_ida_violation_steps += 1
-                # I compute violation cost (1.5x clearing price, lighter than DAM's 2x)
-                avg_ida_price = row.get('ida1_clearing_price', row.get('price', 100.0))
-                ida_violation_cost = ida_shortfall_mw * avg_ida_price * 1.5 * self.time_step_hours
-                self.episode_ida_violation_cost += ida_violation_cost
-
-        remaining_after_ida = remaining_after_afrr
-
-        # =====================================================================
-        # STAGE 7: EXECUTE mFRR (TSO-activated, pay-as-cleared, mandatory)
-        # I promote mFRR before IntraDay because it's TSO-mandated and should
-        # get priority access to capacity. Cascade: DAM → aFRR → IDA → mFRR → IntraDay → FreeBid
-        # =====================================================================
-        mfrr_energy_mw = 0.0
-        mfrr_revenue = 0.0
-
-        # I removed the `not afrr_activated` guard. In production, aFRR
-        # activates in real-time (AGC signal) while mFRR positions are
-        # pre-committed. Both execute simultaneously — the only constraint
-        # is physical MW headroom, already handled by remaining_after_ida.
-        if True:
-            mfrr_level = self.MFRR_LEVELS[mfrr_qty_action]
-            requested_mfrr = mfrr_level * remaining_after_ida
-
-            # I determine mFRR activation from real market data (ADMIE volumes).
-            # Real data shows 84% UP and 96% DOWN system-wide activation rates,
-            # but individual BSP selection is much rarer. I apply a probabilistic
-            # gate (mfrr_activation_rate=35%) on top of the system-wide check.
-            # When activation columns are missing, I fall back to the legacy
-            # imbalance-based heuristic.
-            has_activation_data_exec = 'mfrr_activated_up_mwh' in row.index if hasattr(row, 'index') else 'mfrr_activated_up_mwh' in row
-            if has_activation_data_exec:
-                # I check two gates: (1) TSO activated mFRR in this direction,
-                # (2) our BSP was selected.
-                total_up = row.get('mfrr_activated_up_mwh', 0.0)
-                total_down = row.get('mfrr_activated_down_mwh', 0.0)
-
-                if requested_mfrr > 0:
-                    if total_up <= 0:
-                        requested_mfrr = 0.0  # TSO didn't activate UP this period
-                    elif np.random.random() > self.mfrr_activation_rate:
-                        requested_mfrr = 0.0  # Our BSP not selected
-                elif requested_mfrr < 0:
-                    if total_down <= 0:
-                        requested_mfrr = 0.0  # TSO didn't activate DOWN this period
-                    elif np.random.random() > self.mfrr_activation_rate:
-                        requested_mfrr = 0.0  # Our BSP not selected
-            else:
-                # I fall back to legacy imbalance-based constraint
-                imbalance = row.get('net_imbalance_mw_lag_1h',
-                                    row.get('system_deviation_mwh_lag_1h',
-                                            row.get('net_imbalance_mw', 0.0)))
-                if abs(imbalance) <= self.mfrr_imbalance_threshold:
-                    requested_mfrr = 0.0  # Balanced -> mFRR closed
-                elif imbalance < -self.mfrr_imbalance_threshold and requested_mfrr < 0:
-                    requested_mfrr = 0.0  # Can't charge during deficit
-                elif imbalance > self.mfrr_imbalance_threshold and requested_mfrr > 0:
-                    requested_mfrr = 0.0  # Can't discharge during surplus
-
-                # I apply probabilistic activation
-                if abs(requested_mfrr) > 0.1:
-                    activation_prob = self.mfrr_activation_rate
-                    abs_imbalance = abs(imbalance)
-                    if abs_imbalance > 500:
-                        activation_prob = min(0.9, activation_prob * 2.0)
-                    elif abs_imbalance > 200:
-                        activation_prob = min(0.8, activation_prob * 1.5)
-                    if np.random.random() > activation_prob:
-                        requested_mfrr = 0.0
-
-            if abs(requested_mfrr) > 0.1:
-                # I recalculate limits after IDA
-                available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
-                available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
-
-                max_discharge = min(
-                    remaining_after_ida,
-                    available_discharge_mwh * self.eff_sqrt / self.time_step_hours
-                )
-                max_charge = min(
-                    remaining_after_ida,
-                    available_charge_mwh / self.eff_sqrt / self.time_step_hours
-                )
-
-                if requested_mfrr > 0:
-                    actual_mfrr = min(requested_mfrr, max_discharge)
-                else:
-                    actual_mfrr = max(requested_mfrr, -max_charge)
-
-                if abs(actual_mfrr) > 0.1:
-                    if actual_mfrr > 0:  # Sell (discharge) — pay-as-cleared
-                        energy_mwh = actual_mfrr * self.time_step_hours
-                        soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
-                        old_soc = self.soc
-                        self.soc = max(self.min_soc, self.soc - soc_delta)
-                        actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
-
-                        # I use CURRENT mFRR clearing price for settlement.
-                        # Same as IntraDay: agent decides without knowing the price,
-                        # but settlement uses the realized clearing price (production-like).
-                        mfrr_price = min(
-                            row.get('mfrr_price_up', 120.0),
-                            self.mfrr_price_cap
-                        )
-                        mfrr_revenue = actual_energy * mfrr_price
-
-                    else:  # Provide DOWN regulation (charge) — pay-as-cleared
-                        energy_mwh = abs(actual_mfrr) * self.time_step_hours
-                        soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
-                        old_soc = self.soc
-                        self.soc = min(self.max_soc, self.soc + soc_delta)
-                        actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
-
-                        mfrr_price = min(
-                            row.get('mfrr_price_down', 60.0),
-                            self.mfrr_price_cap
-                        )
-                        mfrr_revenue = actual_energy * mfrr_price
-
-                    cycle_fraction = actual_energy / self.capacity_mwh
-                    self.total_cycles += cycle_fraction
-                    # I do NOT increment daily_cycles for mFRR — it's TSO-mandated,
-                    # the agent can't avoid it, so it shouldn't be penalized.
-
-                    mfrr_energy_mw = actual_mfrr
-                    self.mfrr_profit += mfrr_revenue
-                    actual_energy_mw += actual_mfrr
-
-                    # I track mFRR energy volumes
-                    mfrr_mwh = abs(actual_mfrr) * self.time_step_hours
-                    if actual_mfrr > 0:
-                        self.mfrr_mwh_sold += mfrr_mwh
-                    else:
-                        self.mfrr_mwh_bought += mfrr_mwh
-
-        # I calculate remaining capacity after mFRR for IntraDay
-        remaining_after_mfrr = remaining_after_ida - abs(mfrr_energy_mw)
-
-        # =====================================================================
-        # STAGE 8: EXECUTE INTRADAY CORRECTION (IDA auctions + ISP continuous)
-        # I route the unified IntraDay action to the appropriate market
-        # based on time-of-day: IDA1/2/3 auctions or ISP cascade.
-        # IntraDay now uses remaining capacity AFTER mFRR.
-        # =====================================================================
-        intraday_energy_mw = 0.0
-        xbid_energy_mw = 0.0
-        intraday_revenue = 0.0
-
-        active_market = self._get_intraday_market(row)
-        intraday_open = self._is_intraday_open(row)
-        # I removed the `not afrr_activated` guard. aFRR and IntraDay
-        # execute in parallel — capacity already reduced via cascade.
-        if intraday_open and active_market != 'closed':
-            intraday_level = self.INTRADAY_LEVELS[xbid_action]
-            requested_intraday = intraday_level * remaining_after_mfrr
-
-            if abs(requested_intraday) > 0.1:
-                # I recalculate limits after mFRR
-                available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
-                available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
-
-                max_discharge = min(
-                    remaining_after_mfrr,
-                    available_discharge_mwh * self.eff_sqrt / self.time_step_hours
-                )
-                max_charge = min(
-                    remaining_after_mfrr,
-                    available_charge_mwh / self.eff_sqrt / self.time_step_hours
-                )
-
-                if requested_intraday > 0:
-                    actual_intraday = min(requested_intraday, max_discharge)
-                else:
-                    actual_intraday = max(requested_intraday, -max_charge)
-
-                if abs(actual_intraday) > 0.1:
-                    if actual_intraday > 0:  # Sell (discharge)
-                        energy_mwh = actual_intraday * self.time_step_hours
-                        soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
-                        old_soc = self.soc
-                        self.soc = max(self.min_soc, self.soc - soc_delta)
-                        actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
-
-                        # I route to the correct market for pricing
-                        id_price = self._get_intraday_sell_price(active_market, row)
-                        intraday_revenue = actual_energy * id_price
-
-                    else:  # Buy (charge)
-                        energy_mwh = abs(actual_intraday) * self.time_step_hours
-                        soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
-                        old_soc = self.soc
-                        self.soc = min(self.max_soc, self.soc + soc_delta)
-                        actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
-
-                        # I route to the correct market for pricing
-                        id_price = self._get_intraday_buy_price(active_market, row)
-                        intraday_revenue = -actual_energy * id_price
-
-                    cycle_fraction = actual_energy / self.capacity_mwh
-                    self.total_cycles += cycle_fraction
-                    self.daily_cycles += cycle_fraction
-
-                    intraday_energy_mw = actual_intraday
-                    # I track XBID vs IDA profit separately for diagnostics
-                    if active_market == 'isp1':
-                        xbid_energy_mw = actual_intraday
-                        self.xbid_profit += intraday_revenue
-                    else:
-                        xbid_energy_mw = 0.0
-                    self.intraday_profit += intraday_revenue
-                    actual_energy_mw += actual_intraday
-
-                    # I track IntraDay and XBID energy volumes
-                    id_mwh = abs(actual_intraday) * self.time_step_hours
-                    if actual_intraday > 0:
-                        self.intraday_mwh_sold += id_mwh
-                        if active_market == 'isp1':
-                            self.xbid_mwh_sold += id_mwh
-                    else:
-                        self.intraday_mwh_bought += id_mwh
-                        if active_market == 'isp1':
-                            self.xbid_mwh_bought += id_mwh
-
-        # I calculate remaining after IntraDay for Free Bids
-        remaining_after_intraday = remaining_after_mfrr - abs(intraday_energy_mw)
-
-        # =====================================================================
-        # STAGE 9: EXECUTE FREE BID (agent-submitted, pay-as-bid, merit-order)
-        # I only execute Free Bids in full-market mode. The agent sets both
-        # quantity and price; activation depends on merit-order simulation.
-        # Free Bids use remaining capacity after IntraDay.
-        # =====================================================================
-        free_bid_energy_mw = 0.0
-        free_bid_revenue = 0.0
-        free_bid_activated = False
-        agent_bid_price = 0.0
-
-        # I removed the `not afrr_activated` guard. Free Bids execute
-        # in parallel with aFRR — capacity cascade handles the constraint.
-        if self.enable_full_market:
-            freebid_level = self.FREEBID_QTY_LEVELS[freebid_qty_action]
-            requested_freebid = freebid_level * remaining_after_intraday
-
-            if abs(requested_freebid) > 0.1:
-                # I recalculate limits after IntraDay (SoC may have changed)
-                available_discharge_mwh = (self.soc - self.min_soc) * self.capacity_mwh
-                available_charge_mwh = (self.max_soc - self.soc) * self.capacity_mwh
-
-                max_discharge = min(
-                    remaining_after_intraday,
-                    available_discharge_mwh * self.eff_sqrt / self.time_step_hours
-                )
-                max_charge = min(
-                    remaining_after_intraday,
-                    available_charge_mwh / self.eff_sqrt / self.time_step_hours
-                )
-
-                if requested_freebid > 0:
-                    actual_freebid = min(requested_freebid, max_discharge)
-                else:
-                    actual_freebid = max(requested_freebid, -max_charge)
-
-                if abs(actual_freebid) > 0.1:
-                    # I set the agent's bid price using the selected price tier
-                    imbalance_fb = row.get('net_imbalance_mw_lag_1h',
-                                           row.get('net_imbalance_mw', 0.0))
-                    price_tier = self.FREEBID_PRICE_TIERS[freebid_price_action]
-                    ref_price = row.get('free_bid_reference_price',
-                                        row.get('mfrr_price_up', 100.0))
-                    agent_bid_price = ref_price * price_tier
-                    self.free_bid_submissions += 1
-
-                    # I simulate merit-order activation
-                    free_bid_activated = self._simulate_free_bid_activation(
-                        agent_bid_price, ref_price, imbalance_fb, row
-                    )
-
-                    if free_bid_activated:
-                        if actual_freebid > 0:  # Sell (discharge) — pay-as-bid
-                            energy_mwh = actual_freebid * self.time_step_hours
-                            soc_delta = energy_mwh / self.eff_sqrt / self.capacity_mwh
-                            old_soc = self.soc
-                            self.soc = max(self.min_soc, self.soc - soc_delta)
-                            actual_energy = (old_soc - self.soc) * self.capacity_mwh * self.eff_sqrt
-
-                            free_bid_revenue = actual_energy * agent_bid_price
-
-                        else:  # Buy (charge) — pay-as-bid
-                            energy_mwh = abs(actual_freebid) * self.time_step_hours
-                            soc_delta = energy_mwh * self.eff_sqrt / self.capacity_mwh
-                            old_soc = self.soc
-                            self.soc = min(self.max_soc, self.soc + soc_delta)
-                            actual_energy = (self.soc - old_soc) * self.capacity_mwh / self.eff_sqrt
-
-                            free_bid_revenue = actual_energy * agent_bid_price
-
-                        cycle_fraction = actual_energy / self.capacity_mwh
-                        self.total_cycles += cycle_fraction
-                        self.daily_cycles += cycle_fraction
-
-                        free_bid_energy_mw = actual_freebid
-                        self.free_bid_profit += free_bid_revenue
-                        self.free_bid_activations += 1
-                        actual_energy_mw += actual_freebid
-
-                        # I track Free Bid energy volumes
-                        fb_mwh = abs(actual_freebid) * self.time_step_hours
-                        if actual_freebid > 0:
-                            self.free_bid_mwh_sold += fb_mwh
-                        else:
-                            self.free_bid_mwh_bought += fb_mwh
-
-        # =====================================================================
-        # STAGE 10: CALCULATE REWARD
-        # =====================================================================
         # I use realistic XBID continuous market prices for settlement
-        # ISP1 up/down remain as observation features (balancing signal)
         dam_price = row.get('price', 100.0)
         xbid_bid = row.get('xbid_price_bid', np.nan)
         xbid_ask = row.get('xbid_price_ask', np.nan)
-        # I fall back to DAM ± small spread when XBID columns missing
         if np.isnan(xbid_bid) or xbid_bid <= 0:
             xbid_bid = dam_price - 1.5
         if np.isnan(xbid_ask) or xbid_ask <= 0:
             xbid_ask = dam_price + 1.5
-        xbid_sell = xbid_bid   # sell at bid (lower)
-        xbid_buy = xbid_ask    # buy at ask (higher)
+        xbid_sell = xbid_bid
+        xbid_buy = xbid_ask
+
         market_state = UnifiedMarketState(
             dam_price=dam_price,
-            dam_commitment=dam_commitment,
-            intraday_bid=xbid_sell,    # XBID bid for sell-side
-            intraday_ask=xbid_buy,     # XBID ask for buy-side
-            intraday_spread=max(0.0, xbid_buy - xbid_sell),  # Correct: ask - bid
+            dam_commitment=ctx.dam_commitment,
+            intraday_bid=xbid_sell,
+            intraday_ask=xbid_buy,
+            intraday_spread=max(0.0, xbid_buy - xbid_sell),
             afrr_cap_up_price=row.get('afrr_cap_up_price', 20.0),
             afrr_cap_down_price=row.get('afrr_cap_down_price', 30.0),
             afrr_energy_up_price=row.get('afrr_up', 80.0),
             afrr_energy_down_price=row.get('afrr_down', 80.0),
-            afrr_activated=afrr_activated,
-            afrr_activation_direction=afrr_direction,
+            afrr_activated=ctx.afrr_activated,
+            afrr_activation_direction=ctx.afrr_direction,
             mfrr_price_up=row.get('mfrr_price_up', 120.0),
             mfrr_price_down=row.get('mfrr_price_down', 60.0),
-            # IDA sub-market fields (full market mode) — I pass clearing prices
             ida1_clearing_price=row.get('ida1_clearing_price', 0.0),
             ida2_clearing_price=row.get('ida2_clearing_price', 0.0),
             ida3_clearing_price=row.get('ida3_clearing_price', 0.0) if not np.isnan(row.get('ida3_clearing_price', 0.0)) else 0.0,
             net_ida_position=row.get('net_ida_position', 0.0),
             xbid_bid=xbid_sell,
             xbid_ask=xbid_buy,
-            free_bid_activated=free_bid_activated,
-            free_bid_agent_price=agent_bid_price if self.enable_full_market else 0.0,
+            free_bid_activated=ctx.free_bid_activated,
+            free_bid_agent_price=ctx.agent_bid_price if self.enable_full_market else 0.0,
         )
 
         shortfall_risk = self._calculate_shortfall_risk()
@@ -1170,11 +610,11 @@ class BatteryEnvUnified(gym.Env):
 
         reward_info = self.reward_calculator.calculate(
             market=market_state,
-            actual_energy_mw=actual_energy_mw,
+            actual_energy_mw=ctx.actual_energy_mw,
             afrr_capacity_committed_mw=self.afrr_commitment_mw if self.is_selected_for_afrr else 0.0,
-            afrr_energy_delivered_mw=afrr_energy_delivered,
-            intraday_energy_mw=intraday_energy_mw if not self.enable_full_market else 0.0,
-            mfrr_energy_mw=mfrr_energy_mw,
+            afrr_energy_delivered_mw=ctx.afrr_energy_delivered,
+            intraday_energy_mw=ctx.intraday_energy_mw if not self.enable_full_market else 0.0,
+            mfrr_energy_mw=ctx.mfrr_energy_mw,
             current_soc=self.soc,
             capacity_mwh=self.capacity_mwh,
             time_step_hours=self.time_step_hours,
@@ -1182,24 +622,16 @@ class BatteryEnvUnified(gym.Env):
             shortfall_risk=shortfall_risk,
             price_momentum=price_momentum,
             is_selected_for_afrr=self.is_selected_for_afrr,
-            # I pass DAM-only energy so violation check doesn't penalize
-            # IntraDay/aFRR/mFRR trades in the opposite direction
-            dam_executed_mw=dam_executed_mw,
-            # I pass max deliverable power so reward calculator can distinguish
-            # agent fault from SoC starvation on aFRR non-response
-            afrr_max_deliverable_mw=afrr_max_deliverable_mw,
-            # Full market mode params
-            ida_energy_mw=ida_energy_mw,
-            xbid_energy_mw=xbid_energy_mw,
-            free_bid_energy_mw=free_bid_energy_mw,
-            # I pass IDA shortfall for violation penalty
-            ida_shortfall_mw=ida_shortfall_mw if self.enable_full_market else 0.0,
-            # I pass daily_cycles for super-linear cycle excess penalty
+            dam_executed_mw=ctx.dam_executed_mw,
+            afrr_max_deliverable_mw=ctx.afrr_max_deliverable_mw,
+            ida_energy_mw=ctx.ida_energy_mw,
+            xbid_energy_mw=ctx.xbid_energy_mw,
+            free_bid_energy_mw=ctx.free_bid_energy_mw,
+            ida_shortfall_mw=ctx.ida_shortfall_mw if self.enable_full_market else 0.0,
             daily_cycles=self.daily_cycles,
         )
 
         reward = reward_info['reward']
-        # I track trading P&L (real economic profit) separately from shaped reward
         trading_pnl = reward_info['components'].get('trading_pnl', 0)
         self.total_profit += trading_pnl
         self.episode_profit += trading_pnl
@@ -1211,9 +643,14 @@ class BatteryEnvUnified(gym.Env):
             self.episode_dam_violation_count += 1
         self.episode_afrr_nonresponse_cost += reward_info['components'].get('afrr_nonresponse_cost', 0)
 
-        # =====================================================================
-        # STAGE 11: ADVANCE STEP
-        # =====================================================================
+        return reward, reward_info
+
+    def _finalize_step(self, ctx: 'StepContext', reward: float,
+                       reward_info: Dict) -> Tuple[np.ndarray, float, bool, bool, Dict]:
+        """I advance the step counter and build the return tuple.
+
+        Extracted from the old Stage 11 to keep step() clean.
+        """
         self.current_step += 1
 
         terminated = self.current_step >= self.max_steps
@@ -1230,25 +667,21 @@ class BatteryEnvUnified(gym.Env):
 
         obs = self._build_observation()
         info = self._get_info()
-        # I spread reward components first, then override with authoritative
-        # step-level values (the reward calculator uses simplified pricing
-        # that doesn't know about IDA/XBID routing).
         info.update(reward_info['components'])
         info.update({
-            'afrr_activated': afrr_activated,
-            'afrr_direction': afrr_direction,
+            'afrr_activated': ctx.afrr_activated,
+            'afrr_direction': ctx.afrr_direction,
             'is_selected': self.is_selected_for_afrr,
-            'actual_energy_mw': actual_energy_mw,
-            'dam_commitment_mw': dam_commitment,
-            'intraday_energy_mw': intraday_energy_mw,
-            'intraday_revenue': intraday_revenue,
-            'mfrr_energy_mw': mfrr_energy_mw,
-            'mfrr_revenue': mfrr_revenue,
-            # Full market mode fields
-            'ida_energy_mw': ida_energy_mw,
-            'xbid_energy_mw': xbid_energy_mw,
-            'free_bid_energy_mw': free_bid_energy_mw,
-            'free_bid_activated': free_bid_activated,
+            'actual_energy_mw': ctx.actual_energy_mw,
+            'dam_commitment_mw': ctx.dam_commitment,
+            'intraday_energy_mw': ctx.intraday_energy_mw,
+            'intraday_revenue': ctx.intraday_revenue,
+            'mfrr_energy_mw': ctx.mfrr_energy_mw,
+            'mfrr_revenue': ctx.mfrr_revenue,
+            'ida_energy_mw': ctx.ida_energy_mw,
+            'xbid_energy_mw': ctx.xbid_energy_mw,
+            'free_bid_energy_mw': ctx.free_bid_energy_mw,
+            'free_bid_activated': ctx.free_bid_activated,
         })
 
         return obs, reward, terminated, truncated, info
