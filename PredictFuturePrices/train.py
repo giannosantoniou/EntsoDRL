@@ -50,8 +50,48 @@ def load_training_data(data_path: Optional[Path] = None) -> pd.DataFrame:
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
 
+    # I map column names from the existing project data to what forecasters expect
+    column_aliases = {
+        "serbia_dam_price": "rs_dam_price",
+        "load_mw": "system_load_mw",
+        "price_std_24h": "dam_price_gr_std_24h",
+    }
+    for old_name, new_name in column_aliases.items():
+        if old_name in df.columns and new_name not in df.columns:
+            df[new_name] = df[old_name]
+
+    # I also create dam_price_gr alias if missing
+    if "dam_price_gr" not in df.columns and "price" in df.columns:
+        df["dam_price_gr"] = df["price"]
+
+    # I compute rs_gr_spread if both sides are available
+    if "rs_dam_price" in df.columns and "dam_price_gr" in df.columns:
+        if "rs_gr_spread" not in df.columns:
+            df["rs_gr_spread"] = df["rs_dam_price"] - df["dam_price_gr"]
+
+    # I add rolling stats if missing (needed by DAM forecaster)
+    dam_col = "dam_price_gr"
+    if dam_col in df.columns:
+        if f"{dam_col}_mean_24h" not in df.columns:
+            df[f"{dam_col}_mean_24h"] = df[dam_col].rolling(24, min_periods=1).mean()
+        if f"{dam_col}_std_24h" not in df.columns:
+            df[f"{dam_col}_std_24h"] = df[dam_col].rolling(24, min_periods=1).std()
+        if f"{dam_col}_min_24h" not in df.columns:
+            df[f"{dam_col}_min_24h"] = df[dam_col].rolling(24, min_periods=1).min()
+        if f"{dam_col}_max_24h" not in df.columns:
+            df[f"{dam_col}_max_24h"] = df[dam_col].rolling(24, min_periods=1).max()
+
+    # I resample 15-min to hourly if needed (forecasters work on hourly)
+    freq = pd.infer_freq(df.index[:100])
+    if freq and ("15" in str(freq) or "T" in str(freq) or "min" in str(freq)):
+        logger.info(f"Resampling from 15-min to hourly ({len(df)} rows)")
+        # I use mean for prices, sum for energy volumes, last for positions
+        df = df.resample("1h").mean()
+        df = df.dropna(how="all")
+        logger.info(f"After resample: {len(df)} hourly rows")
+
     logger.info(f"Loaded {len(df)} rows, {len(df.columns)} columns")
-    logger.info(f"Date range: {df.index.min()} → {df.index.max()}")
+    logger.info(f"Date range: {df.index.min()} to {df.index.max()}")
 
     return df
 
