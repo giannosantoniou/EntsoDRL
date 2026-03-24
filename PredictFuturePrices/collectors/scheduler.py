@@ -13,16 +13,24 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from PredictFuturePrices.config import PATHS
+from PredictFuturePrices.config import PATHS, SCHEDULER, MarketEvent
 
 logger = logging.getLogger(__name__)
 
 
-def run_all_collectors(end: Optional[datetime] = None) -> Dict[str, int]:
+def run_all_collectors(
+    end: Optional[datetime] = None,
+    market_event: Optional[MarketEvent] = None,
+) -> Dict[str, int]:
     """I run all collectors and return a summary of rows fetched.
 
     I import collectors lazily to avoid import errors when
     optional dependencies (yfinance, entsoe-py) aren't installed.
+
+    Args:
+        end: End date for incremental fetch. Defaults to now.
+        market_event: If provided, I only run collectors relevant to this
+            event (from SCHEDULER.event_collectors). None = run all (backward compat).
 
     Returns:
         Dict mapping collector name → rows fetched (or -1 on error).
@@ -40,6 +48,20 @@ def run_all_collectors(end: Optional[datetime] = None) -> Dict[str, int]:
         "entsoe_rs_dam": _create_entsoe_rs_dam_collector,
         "admie_balancing": _create_admie_balancing_collector,
     }
+
+    # I filter collectors based on market event if provided
+    if market_event is not None:
+        allowed = SCHEDULER.event_collectors.get(market_event)
+        if allowed is not None:
+            collector_factories = {
+                name: factory
+                for name, factory in collector_factories.items()
+                if name in allowed
+            }
+            logger.info(
+                f"[collectors] Event {market_event.value} → "
+                f"running {list(collector_factories.keys())}"
+            )
 
     for name, factory in collector_factories.items():
         logger.info(f"--- Running collector: {name} ---")

@@ -211,10 +211,16 @@ class EntsoeConnector:
         logger.debug(f"Fetching Load Forecast for {self.country_code}")
 
         try:
-            series = self.client.query_load_forecast(
+            result = self.client.query_load_forecast(
                 self.country_code, start=start_date, end=end_date
             )
-            df = series.to_frame(name='load_forecast')
+            # I handle both Series and DataFrame returns (entsoe-py version differences)
+            if isinstance(result, pd.DataFrame):
+                df = result
+                if len(df.columns) == 1:
+                    df.columns = ['load_forecast']
+            else:
+                df = result.to_frame(name='load_forecast')
 
             is_valid, error_msg = self._validate_dataframe(df, endpoint)
             if not is_valid:

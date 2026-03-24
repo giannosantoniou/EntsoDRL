@@ -8,6 +8,7 @@ each forecaster. Models are saved to the models/ directory.
 """
 
 import argparse
+import gc
 import logging
 import sys
 import time
@@ -69,26 +70,27 @@ def load_training_data(data_path: Optional[Path] = None) -> pd.DataFrame:
         if "rs_gr_spread" not in df.columns:
             df["rs_gr_spread"] = df["rs_dam_price"] - df["dam_price_gr"]
 
+    # I detect resolution: sph=4 for 15-min, sph=1 for hourly
+    sph = 1
+    freq = pd.infer_freq(df.index[:100])
+    if freq and ("15" in str(freq) or "T" in str(freq) or "min" in str(freq)):
+        sph = 4
+        logger.info(f"Detected 15-min resolution (sph={sph}, {len(df)} rows)")
+
+    # I compute window sizes based on resolution
+    window_24h = 24 * sph
+
     # I add rolling stats if missing (needed by DAM forecaster)
     dam_col = "dam_price_gr"
     if dam_col in df.columns:
         if f"{dam_col}_mean_24h" not in df.columns:
-            df[f"{dam_col}_mean_24h"] = df[dam_col].rolling(24, min_periods=1).mean()
+            df[f"{dam_col}_mean_24h"] = df[dam_col].rolling(window_24h, min_periods=1).mean()
         if f"{dam_col}_std_24h" not in df.columns:
-            df[f"{dam_col}_std_24h"] = df[dam_col].rolling(24, min_periods=1).std()
+            df[f"{dam_col}_std_24h"] = df[dam_col].rolling(window_24h, min_periods=1).std()
         if f"{dam_col}_min_24h" not in df.columns:
-            df[f"{dam_col}_min_24h"] = df[dam_col].rolling(24, min_periods=1).min()
+            df[f"{dam_col}_min_24h"] = df[dam_col].rolling(window_24h, min_periods=1).min()
         if f"{dam_col}_max_24h" not in df.columns:
-            df[f"{dam_col}_max_24h"] = df[dam_col].rolling(24, min_periods=1).max()
-
-    # I resample 15-min to hourly if needed (forecasters work on hourly)
-    freq = pd.infer_freq(df.index[:100])
-    if freq and ("15" in str(freq) or "T" in str(freq) or "min" in str(freq)):
-        logger.info(f"Resampling from 15-min to hourly ({len(df)} rows)")
-        # I use mean for prices, sum for energy volumes, last for positions
-        df = df.resample("1h").mean()
-        df = df.dropna(how="all")
-        logger.info(f"After resample: {len(df)} hourly rows")
+            df[f"{dam_col}_max_24h"] = df[dam_col].rolling(window_24h, min_periods=1).max()
 
     logger.info(f"Loaded {len(df)} rows, {len(df.columns)} columns")
     logger.info(f"Date range: {df.index.min()} to {df.index.max()}")
@@ -154,7 +156,10 @@ def train_forecaster(name: str, df: pd.DataFrame, train_end: int, val_end: int, 
         logger.info(f"[{name}] Computing test metrics ({val_end}:{test_end})")
         kwargs = {}
         if name == "dam":
-            kwargs = {"hour": 12}
+            # I use midday period, adapting to detected resolution (12 for hourly, 48 for 15-min)
+            kwargs = {"period": fc.n_periods // 2}
+        elif name == "load":
+            kwargs = {"period": fc.n_periods // 2}
         elif name == "ida":
             kwargs = {"ida_number": 1}
         elif name == "xbid":
@@ -165,12 +170,18 @@ def train_forecaster(name: str, df: pd.DataFrame, train_end: int, val_end: int, 
     else:
         metrics = fc.train_metrics
 
+    n_models = len(fc.models)
+
+    # I free the forecaster and its models immediately after saving
+    del fc
+    gc.collect()
+
     return {
         "name": name,
         "model_path": str(model_path),
         "elapsed_s": elapsed,
         "metrics": metrics,
-        "n_models": len(fc.models),
+        "n_models": n_models,
     }
 
 
@@ -221,6 +232,15 @@ def main():
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    # I suppress LightGBM's internal logger to prevent stdout/stderr flood
+    # that can crash Claude Code's Node.js process with heap OOM
+    logging.getLogger("lightgbm").setLevel(logging.WARNING)
+
+    # I suppress sklearn's "X does not have valid feature names" warnings
+    # that flood output during evaluation (500k+ lines)
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
     data_path = Path(args.data) if args.data else None
     output_dir = Path(args.output_dir) if args.output_dir else None

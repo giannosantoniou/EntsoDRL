@@ -69,6 +69,7 @@ class XBIDForecaster(BaseForecaster):
         super().__init__(name="xbid", n_features=XBID_FORECASTER.n_features)
         self.feature_names = self.FEATURE_NAMES
         self.horizons = XBID_FORECASTER.horizons_hours
+        self.sph = 4  # I use 15-min resolution (steps per hour)
 
     def _get_xbid_col(self, df: pd.DataFrame) -> str:
         """I find the best XBID price column."""
@@ -81,8 +82,9 @@ class XBIDForecaster(BaseForecaster):
     def build_features(
         self, df: pd.DataFrame, idx: int, **kwargs
     ) -> Optional[np.ndarray]:
-        """I build a 35-feature vector for XBID prediction."""
-        if idx < 168:
+        """I build a 37-feature vector for XBID prediction."""
+        min_history = 7 * 24 * self.sph
+        if idx < min_history:
             return None
 
         row = df.iloc[idx]
@@ -127,10 +129,11 @@ class XBIDForecaster(BaseForecaster):
 
         # I extract DAM features (2)
         dam_col = "dam_price_gr" if "dam_price_gr" in df.columns else "price"
+        window_24h = 24 * self.sph
         if dam_col in df.columns:
             dam_val = row.get(dam_col, 0)
             features[fi] = dam_val / 200.0
-            dam_mean = df[dam_col].iloc[max(0, idx - 24):idx].mean()
+            dam_mean = df[dam_col].iloc[max(0, idx - window_24h):idx].mean()
             features[fi + 1] = (dam_val - dam_mean) / 100.0 if not np.isnan(dam_mean) else 0
         fi += 2
 
@@ -144,21 +147,23 @@ class XBIDForecaster(BaseForecaster):
         # I extract price lags (8)
         xbid_col = self._get_xbid_col(df)
         for lag_hours in [1, 2, 3, 6, 12, 24, 48, 168]:
-            lag_idx = idx - lag_hours
+            lag_idx = idx - lag_hours * self.sph
             if lag_idx >= 0:
                 features[fi] = df[xbid_col].iloc[lag_idx] / 200.0
             fi += 1
 
         # I extract rolling mean stats (3)
-        for window in [6, 12, 24]:
-            w = df[xbid_col].iloc[max(0, idx - window):idx]
+        for window_hours in [6, 12, 24]:
+            w_size = window_hours * self.sph
+            w = df[xbid_col].iloc[max(0, idx - w_size):idx]
             if len(w) > 0:
                 features[fi] = w.mean() / 200.0
             fi += 1
 
         # I extract rolling std stats (3)
-        for window in [6, 12, 24]:
-            w = df[xbid_col].iloc[max(0, idx - window):idx]
+        for window_hours in [6, 12, 24]:
+            w_size = window_hours * self.sph
+            w = df[xbid_col].iloc[max(0, idx - w_size):idx]
             if len(w) > 1:
                 features[fi] = w.std() / 100.0
             fi += 1
@@ -174,19 +179,151 @@ class XBIDForecaster(BaseForecaster):
             features[fi] = row.get("ttf_gas", 0) / 50.0
         fi += 1
 
-        # I extract system deviation trend (1)
-        if "system_deviation_mwh" in df.columns and idx >= 3:
-            devs = df["system_deviation_mwh"].iloc[idx - 3:idx + 1].values
-            if len(devs) == 4 and not np.any(np.isnan(devs)):
+        # I extract system deviation trend (1) — 3h slope
+        dev_lag = 3 * self.sph
+        if "system_deviation_mwh" in df.columns and idx >= dev_lag:
+            devs = df["system_deviation_mwh"].iloc[idx - dev_lag:idx + 1].values
+            if len(devs) > 1 and not np.any(np.isnan(devs)):
                 features[fi] = (devs[-1] - devs[0]) / 500.0
         fi += 1
 
         return features
 
+    def build_features_matrix(
+        self, df: pd.DataFrame, start_idx: int, end_idx: int, **kwargs
+    ) -> Optional[tuple]:
+        """I build all XBID features vectorized for speed."""
+        horizon = kwargs.get("horizon", 1)
+        n = end_idx - start_idx
+        if n <= 0:
+            return np.empty((0, self.n_features)), np.empty(0), np.zeros(0, dtype=bool)
+
+        X = np.zeros((n, self.n_features), dtype=np.float64)
+        valid = np.ones(n, dtype=bool)
+
+        min_history = 7 * 24 * self.sph
+        for i in range(n):
+            if start_idx + i < min_history:
+                valid[i] = False
+
+        sl = slice(start_idx, end_idx)
+        fi = 0
+
+        # I compute time features (7)
+        ts_index = df.index[start_idx:end_idx]
+        hours = ts_index.hour.values
+        X[:, fi] = np.sin(2 * np.pi * hours / 24)
+        X[:, fi + 1] = np.cos(2 * np.pi * hours / 24)
+        X[:, fi + 2] = np.sin(2 * np.pi * ts_index.dayofweek.values / 7)
+        X[:, fi + 3] = np.cos(2 * np.pi * ts_index.dayofweek.values / 7)
+        X[:, fi + 4] = np.sin(2 * np.pi * ts_index.month.values / 12)
+        X[:, fi + 5] = np.cos(2 * np.pi * ts_index.month.values / 12)
+        X[:, fi + 6] = hours / 24.0
+        fi += 7
+
+        # I compute RES features (3)
+        for col, norm_val in [
+            ("solar_radiation", 1000.0), ("wind_100m", 25.0), ("res_forecast_mw", 5000.0)
+        ]:
+            alt = col.replace("_mw", "")
+            actual_col = col if col in df.columns else (alt if alt in df.columns else None)
+            if actual_col:
+                X[:, fi] = np.nan_to_num(df[actual_col].values[sl], nan=0.0) / norm_val
+            fi += 1
+
+        # I compute ISP1 signal (4)
+        if "isp1_price_up" in df.columns:
+            X[:, fi] = np.nan_to_num(df["isp1_price_up"].values[sl], nan=0.0) / 200.0
+        fi += 1
+        if "isp1_price_down" in df.columns:
+            X[:, fi] = np.nan_to_num(df["isp1_price_down"].values[sl], nan=0.0) / 200.0
+        fi += 1
+        if "isp1_price_up" in df.columns and "isp1_price_down" in df.columns:
+            up = df["isp1_price_up"].values[sl]
+            dn = df["isp1_price_down"].values[sl]
+            X[:, fi] = np.nan_to_num((up - dn) / 200.0, nan=0.0)
+        fi += 1
+        if "isp1_price_up" in df.columns:
+            X[:, fi] = np.nan_to_num(df["isp1_price_up"].shift(1).values[sl], nan=0.0) / 200.0
+        fi += 1
+
+        # I compute DAM features (2)
+        dam_col = "dam_price_gr" if "dam_price_gr" in df.columns else "price"
+        window_24h = 24 * self.sph
+        if dam_col in df.columns:
+            dam_v = df[dam_col].values[sl]
+            X[:, fi] = np.nan_to_num(dam_v, nan=0.0) / 200.0
+            dam_mean24 = df[dam_col].rolling(window_24h, min_periods=1).mean().shift(1).bfill().values
+            X[:, fi + 1] = np.nan_to_num((dam_v - dam_mean24[sl]) / 100.0, nan=0.0)
+        fi += 2
+
+        # I compute imbalance (2)
+        if "net_imbalance_mw" in df.columns:
+            imb = df["net_imbalance_mw"].values[sl]
+            X[:, fi] = np.sign(np.nan_to_num(imb, nan=0.0))
+            X[:, fi + 1] = np.abs(np.nan_to_num(imb, nan=0.0)) / 500.0
+        fi += 2
+
+        # I compute price lags (8)
+        xbid_col = self._get_xbid_col(df)
+        for lag_hours in [1, 2, 3, 6, 12, 24, 48, 168]:
+            shifted = df[xbid_col].shift(lag_hours * self.sph).values
+            X[:, fi] = np.nan_to_num(shifted[sl], nan=0.0) / 200.0
+            fi += 1
+
+        # I compute rolling mean stats (3)
+        xbid_series = df[xbid_col]
+        for window_hours in [6, 12, 24]:
+            w_size = window_hours * self.sph
+            rm = xbid_series.rolling(w_size, min_periods=1).mean().shift(1).bfill().values
+            X[:, fi] = rm[sl] / 200.0
+            fi += 1
+
+        # I compute rolling std stats (3)
+        for window_hours in [6, 12, 24]:
+            w_size = window_hours * self.sph
+            rs = xbid_series.rolling(w_size, min_periods=1).std().shift(1).fillna(0).values
+            X[:, fi] = rs[sl] / 100.0
+            fi += 1
+
+        # I compute weather (3)
+        for col, norm_val in [("wind_100m", 25.0), ("temperature", 40.0), ("cloud_cover", 100.0)]:
+            if col in df.columns:
+                X[:, fi] = np.nan_to_num(df[col].values[sl], nan=0.0) / norm_val
+            fi += 1
+
+        # I compute TTF gas (1)
+        if "ttf_gas" in df.columns:
+            X[:, fi] = np.nan_to_num(df["ttf_gas"].values[sl], nan=0.0) / 50.0
+        fi += 1
+
+        # I compute system deviation trend (1) — 3h slope
+        dev_lag = 3 * self.sph
+        if "system_deviation_mwh" in df.columns:
+            dev = df["system_deviation_mwh"].values
+            dev_current = dev[sl]
+            dev_3h_ago = df["system_deviation_mwh"].shift(dev_lag).values[sl]
+            X[:, fi] = np.nan_to_num((dev_current - np.nan_to_num(dev_3h_ago, nan=dev_current)) / 500.0, nan=0.0)
+        fi += 1
+
+        # I compute targets — XBID at idx + horizon (in steps, not hours)
+        horizon_steps = horizon * self.sph
+        y = np.full(n, np.nan)
+        xbid_vals = df[xbid_col].values
+        for i in range(n):
+            t_idx = start_idx + i + horizon_steps
+            if t_idx < len(df):
+                y[i] = xbid_vals[t_idx]
+
+        valid &= ~np.any(np.isnan(X), axis=1)
+        valid &= ~np.isnan(y)
+
+        return X, y, valid
+
     def _extract_target(self, df: pd.DataFrame, idx: int, **kwargs) -> Optional[float]:
         """I extract the XBID price at the target horizon."""
         horizon = kwargs.get("horizon", 1)
-        target_idx = idx + horizon
+        target_idx = idx + horizon * self.sph
 
         xbid_col = self._get_xbid_col(df)
         if target_idx >= len(df):
@@ -199,15 +336,22 @@ class XBIDForecaster(BaseForecaster):
         train_end_idx: int,
         val_end_idx: int,
     ) -> "XBIDForecaster":
-        """I train 4 LightGBM models (one per horizon)."""
+        """I train 4 LightGBM models (one per horizon).
+
+        I auto-detect data resolution so lags match the data.
+        """
         if lgb is None:
             raise ImportError("LightGBM is required.")
 
+        # I detect resolution from actual data, overriding config
+        self.sph = self._detect_resolution(df)
+
         params = dict(XBID_FORECASTER.lgbm_params)
 
+        min_history = 7 * 24 * self.sph
         for horizon in self.horizons:
             X_train, y_train = self.build_dataset(
-                df, 168, train_end_idx, horizon=horizon
+                df, min_history, train_end_idx, horizon=horizon
             )
             X_val, y_val = self.build_dataset(
                 df, train_end_idx, val_end_idx, horizon=horizon
@@ -224,10 +368,14 @@ class XBIDForecaster(BaseForecaster):
                 callbacks = [lgb.early_stopping(50, verbose=False)]
                 eval_set = [(X_val, y_val)]
 
+            n_samples = len(X_train)
             model.fit(X_train, y_train, eval_set=eval_set, callbacks=callbacks)
             self.models[f"h{horizon}"] = model
 
-            logger.info(f"[XBID] Horizon {horizon}h trained ({len(X_train)} samples)")
+            # I free the datasets immediately after training
+            del X_train, y_train, X_val, y_val
+
+            logger.info(f"[XBID] Horizon {horizon}h trained ({n_samples} samples)")
 
         self.is_fitted = True
 

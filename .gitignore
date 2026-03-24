@@ -1,5 +1,8 @@
-# Environment
+# Environment & Credentials
 .env
+*.p12
+*.pfx
+*.pem
 .venv/
 venv/
 __pycache__/

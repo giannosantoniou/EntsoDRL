@@ -35,6 +35,40 @@ class BaseForecaster(ABC):
         self.is_fitted: bool = False
         self.feature_names: List[str] = []
         self.train_metrics: Dict[str, float] = {}
+        # I set defaults; subclasses override in __init__, fit() may override again
+        self.sph: int = 1
+        self.n_periods: int = 24
+
+    def _detect_resolution(self, df: pd.DataFrame) -> int:
+        """I detect steps-per-hour from the DataFrame index.
+
+        I infer the data resolution by examining the median time delta
+        between consecutive rows. This lets forecasters adapt their lag
+        windows and model count to the actual data, regardless of config.
+
+        Returns:
+            Steps per hour: 4 for 15-min, 2 for 30-min, 1 for hourly.
+        """
+        if len(df) < 3:
+            return 1
+
+        # I sample up to 200 deltas for robustness
+        sample_size = min(200, len(df) - 1)
+        deltas = df.index[1:sample_size + 1] - df.index[:sample_size]
+        median_minutes = np.median(deltas.total_seconds()) / 60
+
+        if median_minutes <= 20:  # ~15 min
+            sph = 4
+        elif median_minutes <= 45:  # ~30 min
+            sph = 2
+        else:  # ~60 min
+            sph = 1
+
+        logger.info(
+            f"[{self.name}] Detected {'15-min' if sph == 4 else '30-min' if sph == 2 else 'hourly'} "
+            f"resolution (sph={sph}, median_delta={median_minutes:.0f}min)"
+        )
+        return sph
 
     @abstractmethod
     def build_features(self, df: pd.DataFrame, idx: int, **kwargs) -> np.ndarray:
@@ -84,6 +118,33 @@ class BaseForecaster(ABC):
         """
         ...
 
+    def build_features_matrix(
+        self,
+        df: pd.DataFrame,
+        start_idx: int,
+        end_idx: int,
+        **kwargs,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Build all features vectorized for a range. Override for speed.
+
+        Subclasses can override this to compute features using vectorized
+        pandas/numpy operations instead of row-by-row build_features() calls.
+        This is critical for training speed — 100x faster than the row loop.
+
+        Args:
+            df: Merged DataFrame.
+            start_idx: First index (inclusive).
+            end_idx: Last index (exclusive).
+            **kwargs: Forecaster-specific arguments.
+
+        Returns:
+            Tuple (X, y, valid_mask) or None if not implemented.
+            X: (n_range, n_features) — features for ALL rows in range.
+            y: (n_range,) — targets for ALL rows.
+            valid_mask: (n_range,) bool — True where both X and y are valid.
+        """
+        return None
+
     def build_dataset(
         self,
         df: pd.DataFrame,
@@ -93,8 +154,9 @@ class BaseForecaster(ABC):
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Build feature matrix X and target vector y for training.
 
-        I iterate over the data range, calling build_features for each valid
-        sample. Subclasses can override to customize target extraction.
+        I first try the vectorized build_features_matrix() path for speed.
+        If a subclass hasn't overridden it, I fall back to the row-by-row
+        build_features() loop.
 
         Args:
             df: Merged DataFrame.
@@ -105,8 +167,18 @@ class BaseForecaster(ABC):
         Returns:
             Tuple of (X, y) where X is (n_samples, n_features) and y is (n_samples,).
         """
-        X_list = []
-        y_list = []
+        # I try the fast vectorized path first
+        result = self.build_features_matrix(df, start_idx, end_idx, **kwargs)
+        if result is not None:
+            X_all, y_all, valid = result
+            if valid.any():
+                return X_all[valid], y_all[valid]
+            return np.empty((0, self.n_features)), np.empty(0)
+
+        # I fall back to slow row-by-row path
+        X = np.empty((end_idx - start_idx, self.n_features))
+        y = np.empty(end_idx - start_idx)
+        count = 0
 
         for idx in range(start_idx, end_idx):
             try:
@@ -115,15 +187,16 @@ class BaseForecaster(ABC):
 
                 if features is not None and target is not None:
                     if not np.any(np.isnan(features)):
-                        X_list.append(features)
-                        y_list.append(target)
+                        X[count] = features
+                        y[count] = target
+                        count += 1
             except (IndexError, KeyError):
                 continue
 
-        if not X_list:
+        if count == 0:
             return np.empty((0, self.n_features)), np.empty(0)
 
-        return np.array(X_list), np.array(y_list)
+        return X[:count].copy(), y[:count].copy()
 
     @abstractmethod
     def _extract_target(self, df: pd.DataFrame, idx: int, **kwargs) -> Optional[float]:
@@ -158,6 +231,8 @@ class BaseForecaster(ABC):
             "is_fitted": self.is_fitted,
             "feature_names": self.feature_names,
             "train_metrics": self.train_metrics,
+            "sph": getattr(self, "sph", 1),
+            "n_periods": getattr(self, "n_periods", 24),
             "saved_at": datetime.now().isoformat(),
         }
         with open(path, "wb") as f:
@@ -174,6 +249,8 @@ class BaseForecaster(ABC):
         Returns:
             self (for chaining).
         """
+        import re
+
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Model file not found: {path}")
@@ -185,6 +262,21 @@ class BaseForecaster(ABC):
         self.is_fitted = state["is_fitted"]
         self.feature_names = state.get("feature_names", [])
         self.train_metrics = state.get("train_metrics", {})
+
+        # I restore resolution metadata if saved; otherwise keep __init__ defaults
+        if "sph" in state:
+            self.sph = state["sph"]
+        if "n_periods" in state:
+            self.n_periods = state["n_periods"]
+
+        # I warn if old-format hourly keys are found (pre-15min migration)
+        old_keys = [k for k in self.models if re.match(r"^h\d+_q", k)]
+        if old_keys:
+            logger.warning(
+                f"[{self.name}] Loaded model has old hourly keys (e.g. {old_keys[0]}). "
+                f"This model was trained with hourly resolution and may not work "
+                f"correctly with 15-min data. Retrain recommended."
+            )
 
         logger.info(f"[{self.name}] Loaded from {path}")
         return self
@@ -215,8 +307,12 @@ class BaseForecaster(ABC):
         errors = []
         abs_errors = []
         pct_errors = []
+        total = end_idx - start_idx
 
-        for idx in range(start_idx, end_idx):
+        for i, idx in enumerate(range(start_idx, end_idx)):
+            if i > 0 and i % 500 == 0:
+                logger.info(f"[{self.name}] Evaluating... {i}/{total}")
+
             try:
                 preds = self.predict(df, idx, **kwargs)
                 target = self._extract_target(df, idx, **kwargs)
@@ -228,7 +324,13 @@ class BaseForecaster(ABC):
                 pred_key = "point" if "point" in preds else list(preds.keys())[0]
                 pred_val = preds[pred_key]
                 if isinstance(pred_val, np.ndarray):
-                    pred_val = pred_val[0] if len(pred_val) > 0 else np.nan
+                    # I index into the correct period, wrapping to valid range
+                    period = kwargs.get("period", 0)
+                    if len(pred_val) > 0:
+                        # I cap period to valid range to avoid comparing wrong period/target
+                        pred_val = pred_val[min(period, len(pred_val) - 1)]
+                    else:
+                        pred_val = np.nan
 
                 if np.isnan(pred_val):
                     continue

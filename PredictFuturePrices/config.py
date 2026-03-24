@@ -5,9 +5,10 @@ so that collectors, forecasters, and accuracy tracker stay in sync.
 """
 
 import os
+from enum import Enum
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 # I resolve the package root relative to this file
@@ -103,8 +104,8 @@ class CommodityConfig:
 
     # TTF Natural Gas Front-Month
     ttf_ticker: str = "TTF=F"
-    # EU Carbon Allowances (EUA)
-    eua_ticker: str = "CKZ25.ICE"
+    # EU Carbon Allowances (EUA) — CO2.L tracks EU ETS closely
+    eua_ticker: str = "CO2.L"
     # I use daily data forward-filled to hourly
     resample_method: str = "ffill"
 
@@ -113,8 +114,9 @@ class CommodityConfig:
 class DAMForecasterConfig:
     """DAM forecaster hyperparameters."""
 
-    n_hours: int = 24
-    # I train 3 models per hour: point, P10, P90
+    n_periods: int = 96
+    resolution_minutes: int = 15
+    # I train 3 models per period: point, P10, P90
     quantiles: tuple = (0.1, 0.5, 0.9)
     lgbm_params: dict = field(default_factory=lambda: {
         "n_estimators": 500,
@@ -158,7 +160,8 @@ class IDAForecasterConfig:
 class LoadForecasterConfig:
     """Load forecaster hyperparameters."""
 
-    n_hours: int = 24
+    n_periods: int = 96
+    resolution_minutes: int = 15
     lgbm_params: dict = field(default_factory=lambda: {
         "n_estimators": 400,
         "max_depth": 6,
@@ -214,3 +217,94 @@ IDA_FORECASTER = IDAForecasterConfig()
 LOAD_FORECASTER = LoadForecasterConfig()
 XBID_FORECASTER = XBIDForecasterConfig()
 ACCURACY = AccuracyConfig()
+
+
+class MarketEvent(Enum):
+    """I represent the market event that triggered a prediction cycle.
+
+    PRE_DAM  — 12:55: GR+RS DAM prices available (~12:50). Run all forecasters.
+    PRE_IDA1 — 14:30: Before IDA1 gate closure (15:00). XBID + IDA1.
+    PRE_IDA2 — 21:30: Before IDA2 gate closure (22:00). XBID + IDA2.
+    ALL      — Manual/--once mode. Run everything (backward compat).
+    """
+
+    PRE_DAM = "pre_dam"
+    PRE_IDA1 = "pre_ida1"
+    PRE_IDA2 = "pre_ida2"
+    ALL = "all"
+
+
+# I map each market event to a hard deadline (hour, minute).
+# If the cycle starts too close to the deadline, I enter fast mode.
+_DEFAULT_EVENT_DEADLINES: Dict[MarketEvent, Tuple[int, int]] = {
+    MarketEvent.PRE_DAM: (13, 30),    # DAM results available ~12:50, buffer until 13:30
+    MarketEvent.PRE_IDA1: (15, 0),    # IDA1 gate 15:00
+    MarketEvent.PRE_IDA2: (22, 0),    # IDA2 gate 22:00
+}
+
+# I map each market event to the collectors that should run.
+# PRE_DAM fetches everything (GR+RS DAM just published). PRE_IDA1/2 only need ADMIE.
+_DEFAULT_EVENT_COLLECTORS: Dict[MarketEvent, Tuple[str, ...]] = {
+    MarketEvent.PRE_DAM: ("weather", "commodity", "entsoe_gr_dam", "entsoe_rs_dam", "admie_balancing"),
+    MarketEvent.PRE_IDA1: ("admie_balancing",),
+    MarketEvent.PRE_IDA2: ("admie_balancing",),
+    MarketEvent.ALL: ("weather", "commodity", "entsoe_gr_dam", "entsoe_rs_dam", "admie_balancing"),
+}
+
+# I map each market event to the forecaster keys that should run.
+# Keys: "dam", "load", "xbid", "ida" (all 3), "ida1", "ida2", "ida3"
+_DEFAULT_EVENT_FORECASTERS: Dict[MarketEvent, Tuple[str, ...]] = {
+    MarketEvent.PRE_DAM: ("dam", "load", "xbid", "ida3"),
+    MarketEvent.PRE_IDA1: ("xbid", "ida1"),
+    MarketEvent.PRE_IDA2: ("xbid", "ida2"),
+    MarketEvent.ALL: ("dam", "load", "xbid", "ida"),
+}
+
+# I map (hour, minute) → MarketEvent for automatic event identification
+_DEFAULT_EVENT_TIMES: Dict[Tuple[int, int], MarketEvent] = {
+    (12, 55): MarketEvent.PRE_DAM,
+    (14, 30): MarketEvent.PRE_IDA1,
+    (21, 30): MarketEvent.PRE_IDA2,
+}
+
+
+@dataclass(frozen=True)
+class SchedulerConfig:
+    """Scheduler configuration for the continuous prediction pipeline."""
+
+    # I use Greek timezone because all market events are in Athens time
+    timezone: str = "Europe/Athens"
+    # I set the default interval to 1 hour between cycles
+    default_interval_seconds: int = 3600
+    # I enforce a minimum interval to prevent API abuse
+    min_interval_seconds: int = 300
+    # I set a maximum cycle duration (10 min) to prevent runaway cycles
+    cycle_timeout_seconds: int = 600
+    # I enter fast mode when fewer than 5 minutes remain before deadline
+    deadline_fast_mode_seconds: int = 300
+    # I align cycles to market events (hour, minute):
+    # 12:55 = pre-DAM (GR+RS published ~12:50), 14:30 = pre-IDA1, 21:30 = pre-IDA2
+    market_events: tuple = ((12, 55), (14, 30), (21, 30))
+    # I map each market event to the forecasters that should run
+    event_forecasters: Dict[MarketEvent, Tuple[str, ...]] = field(
+        default_factory=lambda: dict(_DEFAULT_EVENT_FORECASTERS)
+    )
+    # I map (hour, minute) → MarketEvent for automatic identification
+    event_times: Dict[Tuple[int, int], MarketEvent] = field(
+        default_factory=lambda: dict(_DEFAULT_EVENT_TIMES)
+    )
+    # I map each market event to its hard deadline
+    event_deadlines: Dict[MarketEvent, Tuple[int, int]] = field(
+        default_factory=lambda: dict(_DEFAULT_EVENT_DEADLINES)
+    )
+    # I map each market event to the collectors it needs
+    event_collectors: Dict[MarketEvent, Tuple[str, ...]] = field(
+        default_factory=lambda: dict(_DEFAULT_EVENT_COLLECTORS)
+    )
+    # I allow a ±10 minute tolerance window when matching market events
+    event_tolerance_minutes: int = 10
+    # I log scheduler activity to this file
+    log_file: str = "scheduler.log"
+
+
+SCHEDULER = SchedulerConfig()

@@ -49,7 +49,8 @@ class TestConfig:
         assert COMMODITY.ttf_ticker == "TTF=F"
 
     def test_dam_forecaster_config(self):
-        assert DAM_FORECASTER.n_hours == 24
+        assert DAM_FORECASTER.n_periods == 96
+        assert DAM_FORECASTER.resolution_minutes == 15
         assert len(DAM_FORECASTER.quantiles) == 3
         assert DAM_FORECASTER.lgbm_params["n_estimators"] == 500
 
@@ -59,7 +60,8 @@ class TestConfig:
         assert IDA_FORECASTER.blending_alphas[1] == pytest.approx(0.85)
 
     def test_load_forecaster_config(self):
-        assert LOAD_FORECASTER.n_hours == 24
+        assert LOAD_FORECASTER.n_periods == 96
+        assert LOAD_FORECASTER.resolution_minutes == 15
 
     def test_xbid_forecaster_config(self):
         assert XBID_FORECASTER.horizons_hours == (1, 2, 4, 8)
