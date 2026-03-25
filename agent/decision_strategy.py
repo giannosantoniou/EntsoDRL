@@ -52,50 +52,88 @@ class IDecisionStrategy(ABC):
 class RLAgentStrategy(IDecisionStrategy):
     """
     Strategy using trained RL model (PPO or MaskablePPO).
+
+    v23: I added VecNormalize support — observations are normalized
+    using the same statistics from training before being fed to the model.
     """
-    
-    def __init__(self, use_maskable: bool = True):
+
+    def __init__(self, use_maskable: bool = True, vec_normalize_path: Optional[str] = None):
         self.model = None
         self.use_maskable = use_maskable
         self._name = "MaskablePPO" if use_maskable else "PPO"
-    
+        self.vec_normalize_path = vec_normalize_path
+        self.obs_rms = None   # Running mean/std for observation normalization
+        self.clip_obs = 100.0  # Clip range (matches training default)
+
     @property
     def name(self) -> str:
         return self._name
-    
+
     def load(self, path: Optional[str] = None) -> None:
         if path is None:
             raise ValueError("RLAgentStrategy requires a model path")
-        
+
         print(f" Loading AI Model from {path}...")
-        
+
         if self.use_maskable:
             from sb3_contrib import MaskablePPO
             self.model = MaskablePPO.load(path)
         else:
             from stable_baselines3 import PPO
             self.model = PPO.load(path)
-        
+
         print(f" {self._name} Model Loaded Successfully.")
+
+        # v23: I load VecNormalize statistics for production observation normalization
+        if self.vec_normalize_path:
+            self._load_vec_normalize(self.vec_normalize_path)
+
+    def _load_vec_normalize(self, path: str) -> None:
+        """I load the VecNormalize running statistics from the training .pkl file."""
+        import pickle
+        import os
+        if not os.path.exists(path):
+            print(f"  WARNING: VecNormalize file not found: {path}")
+            return
+        try:
+            with open(path, 'rb') as f:
+                vec_norm = pickle.load(f)
+            self.obs_rms = vec_norm.obs_rms
+            self.clip_obs = getattr(vec_norm, 'clip_obs', 100.0)
+            print(f"  VecNormalize stats loaded from {path}")
+            print(f"    Observation mean shape: {self.obs_rms.mean.shape}")
+        except Exception as e:
+            print(f"  WARNING: Could not load VecNormalize: {e}")
+
+    def _normalize_obs(self, obs: np.ndarray) -> np.ndarray:
+        """I apply VecNormalize's observation normalization (same as training)."""
+        mean = self.obs_rms.mean
+        var = self.obs_rms.var
+        obs_normalized = (obs - mean) / np.sqrt(var + 1e-8)
+        return np.clip(obs_normalized, -self.clip_obs, self.clip_obs).astype(np.float32)
 
     def predict_action(self, observation: np.ndarray, action_mask: np.ndarray) -> int:
         if self.model is None:
             raise RuntimeError("Model not loaded! Call load() first.")
-        
+
+        # v23: I normalize the observation using training statistics
+        if self.obs_rms is not None:
+            observation = self._normalize_obs(observation)
+
         # Ensure observation is 2D (batch dimension)
         if observation.ndim == 1:
             observation = observation.reshape(1, -1)
-        
+
         # MaskablePPO requires action_masks parameter
         if self.use_maskable:
             action, _states = self.model.predict(
-                observation, 
-                deterministic=True, 
+                observation,
+                deterministic=True,
                 action_masks=action_mask.reshape(1, -1)
             )
         else:
             action, _states = self.model.predict(observation, deterministic=True)
-        
+
         return int(action[0])
 
 
@@ -396,7 +434,10 @@ def create_strategy(strategy_type: str, model_path: Optional[str] = None, **kwar
     strategy_type = strategy_type.upper()
 
     if strategy_type == "AI":
-        strategy = RLAgentStrategy(use_maskable=kwargs.get('use_maskable', True))
+        strategy = RLAgentStrategy(
+            use_maskable=kwargs.get('use_maskable', True),
+            vec_normalize_path=kwargs.get('vec_normalize_path', None)
+        )
         strategy.load(model_path)
         return strategy
 

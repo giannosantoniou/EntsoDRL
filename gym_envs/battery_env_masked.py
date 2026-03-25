@@ -57,7 +57,10 @@ class BatteryEnvMasked(gym.Env):
         include_price_awareness: bool = True,
         # v22: Gate closure awareness (HEnEx compliance)
         gate_closure_hours: float = 1.0,  # IntraDay gate closes H-1 before delivery
-        enable_gate_closure: bool = True   # Enable gate closure feature
+        enable_gate_closure: bool = True,  # Enable gate closure feature
+        # v23: Reset randomization (prevents overfitting to sequence position)
+        randomize_start: bool = True,      # Randomize episode start position
+        min_episode_length: int = 168      # Minimum episode length (1 week hourly)
     ):
         super().__init__()
 
@@ -88,6 +91,10 @@ class BatteryEnvMasked(gym.Env):
         self.gate_closure_hours = gate_closure_hours
         self.enable_gate_closure = enable_gate_closure
         self.extreme_spike_prob = extreme_spike_prob
+
+        # v23: Reset randomization
+        self.randomize_start = randomize_start
+        self.min_episode_length = min_episode_length
         
         # Forecast Uncertainty Settings
         self.forecast_err_1h = forecast_err_1h
@@ -282,8 +289,23 @@ class BatteryEnvMasked(gym.Env):
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         super().reset(seed=seed)
-        self.current_step = 0
-        self.current_soc = self.initial_soc
+
+        # v23: I randomize episode start position to prevent memorization
+        if self.randomize_start:
+            max_start = max(0, self.max_steps - self.min_episode_length)
+            if max_start > 0:
+                self.current_step = self.np_random.integers(0, max_start)
+            else:
+                self.current_step = 0
+            # I also randomize initial SoC slightly (±10%) for robustness
+            soc_noise = self.np_random.uniform(-0.1, 0.1)
+            self.current_soc = np.clip(
+                self.initial_soc + soc_noise, self.min_soc, self.max_soc
+            )
+        else:
+            self.current_step = 0
+            self.current_soc = self.initial_soc
+
         return self._get_observation(), {}
 
     def action_masks(self) -> np.ndarray:
@@ -625,7 +647,8 @@ class BatteryEnvMasked(gym.Env):
             afrr_up_mw=afrr_up,
             afrr_down_mw=afrr_down,
             price_vs_typical_hour=pvt,
-            trade_worthiness=tw
+            trade_worthiness=tw,
+            price_momentum=self.price_momentum[self.current_step]
         )
         
         # 2. Get History Slices for Imbalance Risk
@@ -660,9 +683,9 @@ class BatteryEnvMasked(gym.Env):
             hours_until_closure = self._get_hours_until_gate_closure()
             # Normalize to [0, 1] where 0 = gate closed, 1 = 24+ hours until closure
             gate_closure_normalized = min(1.0, hours_until_closure / 24.0)
-            obs = np.append(obs, gate_closure_normalized)
+            obs = np.append(obs, np.float32(gate_closure_normalized))
 
-        return obs
+        return obs.astype(np.float32)
 
     def _get_hours_until_gate_closure(self) -> float:
         """

@@ -46,6 +46,9 @@ class MarketStateDTO:
     price_vs_typical_hour: float = 0.0   # Current vs 30-day mean at this hour [-1, 1]
     trade_worthiness: float = 0.0        # 30-day avg daily spread / 100 [0, 1]
 
+    # v23: Backward-looking momentum (replaces oracle timing features)
+    price_momentum: float = 0.0          # 6h backward price momentum [-1, 1]
+
     def __post_init__(self):
         if self.price_lookahead is None:
             self.price_lookahead = [self.price] * 12
@@ -290,35 +293,38 @@ class FeatureEngineer:
         obs.append(market.afrr_up_mw / self.NORM_AFRR_UP)         # 21. aFRR Up
         obs.append(market.afrr_down_mw / self.NORM_AFRR_DOWN)     # 22. aFRR Down
 
-        # 23-26. v13 TIMING FEATURES - I help agent understand when to sell
-        # These derived features make lookahead information more actionable
+        # 23-26. v23 BACKWARD-LOOKING TIMING FEATURES (NO DATA LEAKAGE)
+        # I replaced oracle features that used future prices with causal alternatives.
+        # These use ONLY past data — a real trader could compute all of these.
         current_price = market.price
-        max_future_price = max(price_lookahead) if price_lookahead else current_price
 
-        # Price ratio: >1 means better prices coming, <1 means now is good
-        price_ratio = max_future_price / max(current_price, 1.0)
-        obs.append(min(price_ratio, 3.0) / 3.0)  # 23. Normalized price ratio (cap at 3x)
-
-        # Hours to peak: when is the best price?
-        if max_future_price > current_price and price_lookahead:
-            hours_to_peak = price_lookahead.index(max_future_price) + 1
+        # 23. Price position within past 24h range [0, 1]
+        # I check where the current price sits in the past day's range.
+        # Near 1.0 = near daily high (sell signal), near 0.0 = near daily low (buy signal).
+        price_range = market.price_max_24h - market.price_min_24h
+        if price_range > 1.0:
+            price_vs_24h_range = (current_price - market.price_min_24h) / price_range
         else:
-            hours_to_peak = 0  # We're at peak now
-        obs.append(hours_to_peak / 12.0)  # 24. Normalized hours to peak
+            price_vs_24h_range = 0.5  # No range = neutral
+        obs.append(max(0.0, min(1.0, price_vs_24h_range)))
 
-        # Is at peak: binary signal - should I sell now?
-        is_at_peak = 1.0 if current_price >= max_future_price * 0.95 else 0.0
-        obs.append(is_at_peak)  # 25. At peak indicator
+        # 24. Price momentum (6h backward) [-1, 1]
+        # I use the precomputed 6-hour backward momentum.
+        # Positive = prices rising (discharge opportunity), Negative = falling (charge).
+        obs.append(max(-1.0, min(1.0, market.price_momentum)))
 
-        # DAM slot comparison: if DAM discharge coming, compare prices
-        # Find first DAM discharge commitment in lookahead
-        dam_slot_ratio = 1.0  # Default: neutral
-        for i, dam_val in enumerate(dam_lookahead):
-            if dam_val > 0.1:  # Positive = discharge commitment
-                dam_slot_price = price_lookahead[i] if i < len(price_lookahead) else current_price
-                dam_slot_ratio = dam_slot_price / max(current_price, 1.0)
-                break
-        obs.append(min(dam_slot_ratio, 2.0) / 2.0)  # 26. DAM slot ratio (cap at 2x)
+        # 25. Is near daily high (backward-looking binary) [0, 1]
+        # I check if current price is within 5% of the PAST 24h max.
+        # A trader seeing prices near the daily high would consider selling.
+        is_near_daily_high = 1.0 if current_price >= market.price_max_24h * 0.95 else 0.0
+        obs.append(is_near_daily_high)
+
+        # 26. Price vs 24h mean [-1, 1]
+        # I compare current price to the past 24h average.
+        # Above average = discharge opportunity, below = charge opportunity.
+        mean_24h = max(market.price_mean_24h, 1.0)
+        price_vs_mean = (current_price - mean_24h) / mean_24h
+        obs.append(max(-1.0, min(1.0, price_vs_mean)))
 
         # 27-28. v21 TRADER-INSPIRED SIGNALS (conditional, past-only)
         # I replaced v20's leaky price_percentile/price_vs_mean with causal features.

@@ -1,8 +1,12 @@
 """
-Evaluation for MaskablePPO on Unseen Data - FIXED VERSION
+Evaluation for MaskablePPO on Unseen Data
+
+v23: I fixed VecNormalize loading — now uses saved training statistics
+instead of fitting fresh stats on test data. Also passes randomize_start=False.
 """
 import os
 import sys
+import argparse
 import numpy as np
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
@@ -33,52 +37,61 @@ def mask_fn(env):
     return env.action_masks()
 
 
-def evaluate_masked(model_path=None, test_ratio=0.2):
-    DATA_PATH = "data/feasible_data_with_dam.csv"
-    
+def evaluate_masked(model_path=None, vec_normalize_path=None, test_ratio=0.2,
+                    data_path="data/feasible_data_with_balancing.csv"):
     if model_path is None:
         checkpoint_dir = "models/checkpoints/ppo_masked/"
         checkpoints = sorted([f for f in os.listdir(checkpoint_dir) if f.endswith('.zip')],
                            key=lambda x: int(x.split('_')[-2]), reverse=True)
         model_path = os.path.join(checkpoint_dir, checkpoints[0])
-    
+
     print("=" * 60)
-    print("MaskablePPO EVALUATION ON UNSEEN DATA (FIXED)")
+    print("MaskablePPO EVALUATION ON UNSEEN DATA (v23)")
     print("=" * 60)
     print(f"Model: {model_path}")
-    
+    if vec_normalize_path:
+        print(f"VecNormalize: {vec_normalize_path}")
+
     # Load data
-    df = load_historical_data(DATA_PATH)
+    df = load_historical_data(data_path)
     split_idx = int(len(df) * (1 - test_ratio))
     test_df = df.iloc[split_idx:].copy()
-    
+
     print(f"Test period: {test_df.index[0]} to {test_df.index[-1]}")
     print(f"Test size: {len(test_df):,} hours")
-    
+
     # Generate DAM commitments for test
     battery_params = {'capacity_mwh': 146.0, 'max_discharge_mw': 30.0, 'efficiency': 0.94}
     gen = FeasibleDAMGenerator(
-        capacity_mwh=battery_params['capacity_mwh'], 
+        capacity_mwh=battery_params['capacity_mwh'],
         max_power_mw=battery_params['max_discharge_mw'],
         efficiency=battery_params['efficiency']
     )
     test_df['dam_commitment'] = gen.generate(test_df)
-    
-    # Create env - CORRECT WRAPPER ORDER!
-    # BatteryEnvMasked -> Monitor -> ActionMasker
-    # ActionMasker must be OUTERMOST so it can access action_masks
+
+    # I create env with randomize_start=False for deterministic evaluation
     def make_env():
-        env = BatteryEnvMasked(test_df, battery_params, n_actions=21)
-        env = Monitor(env)  # Monitor first
-        env = ActionMasker(env, lambda e: e.env.action_masks())  # ActionMasker wraps Monitor
+        env = BatteryEnvMasked(test_df, battery_params, n_actions=21,
+                               randomize_start=False)
+        env = Monitor(env)
+        env = ActionMasker(env, lambda e: e.env.action_masks())
         return env
-    
+
     env = DummyVecEnv([make_env])
-    env = VecNormalize(env, norm_obs=True, norm_reward=False, training=False)
-    
+
+    # v23: I load VecNormalize from training instead of creating fresh stats
+    if vec_normalize_path and os.path.exists(vec_normalize_path):
+        env = VecNormalize.load(vec_normalize_path, env)
+        env.training = False      # I freeze the running statistics
+        env.norm_reward = False   # I don't normalize rewards during evaluation
+        print(f"  VecNormalize loaded from training (frozen stats)")
+    else:
+        print("  WARNING: No VecNormalize path — using fresh stats (may be inaccurate)")
+        env = VecNormalize(env, norm_obs=True, norm_reward=False, training=False)
+
     # Load model
     model = MaskablePPO.load(model_path, env=env)
-    
+
     # Evaluate
     print("\nRunning evaluation with EXPLICIT action masks...")
     obs = env.reset()
@@ -87,19 +100,18 @@ def evaluate_masked(model_path=None, test_ratio=0.2):
     violations = 0
     steps = 0
     actions = {i: 0 for i in range(21)}
-    
+
     while not done:
-        # CRITICAL: Get mask and pass explicitly to predict()
         mask = get_action_mask(env)
         action, _ = model.predict(obs, deterministic=True, action_masks=np.array([mask]))
-        
+
         obs, reward, done, info = env.step(action)
         total_reward += reward[0]
         actions[int(action[0])] += 1
         if info[0].get('violation', 0) > 0.5:
             violations += 1
         steps += 1
-    
+
     # Results
     print("\n" + "=" * 60)
     print("RESULTS")
@@ -107,7 +119,7 @@ def evaluate_masked(model_path=None, test_ratio=0.2):
     print(f"  Total Reward:  {total_reward:>15,.2f}")
     print(f"  Violations:    {violations:>15,} ({violations/steps*100:.1f}%)")
     print(f"  Steps:         {steps:>15,}")
-    
+
     # Action distribution
     discharge = sum(actions[i] for i in range(11, 21))
     idle = actions[10]
@@ -117,14 +129,25 @@ def evaluate_masked(model_path=None, test_ratio=0.2):
     print(f"    Idle:        {idle/steps*100:>6.1f}%")
     print(f"    Charge:      {charge/steps*100:>6.1f}%")
     print("=" * 60)
-    
+
     if violations == 0:
-        print("✅ ZERO VIOLATIONS! Action masking works perfectly!")
+        print("ZERO VIOLATIONS! Action masking works perfectly!")
     elif violations / steps < 0.05:
-        print("✅ Less than 5% violations - excellent!")
-    
+        print("Less than 5% violations - excellent!")
+
     return total_reward, violations
 
 
 if __name__ == "__main__":
-    evaluate_masked()
+    parser = argparse.ArgumentParser(description="Evaluate MaskablePPO (v23)")
+    parser.add_argument('--model', default=None, help="Model path (.zip)")
+    parser.add_argument('--vec_normalize', default=None, help="VecNormalize path (.pkl)")
+    parser.add_argument('--data', default="data/feasible_data_with_balancing.csv")
+    parser.add_argument('--test_ratio', type=float, default=0.2)
+    args = parser.parse_args()
+    evaluate_masked(
+        model_path=args.model,
+        vec_normalize_path=args.vec_normalize,
+        test_ratio=args.test_ratio,
+        data_path=args.data
+    )
