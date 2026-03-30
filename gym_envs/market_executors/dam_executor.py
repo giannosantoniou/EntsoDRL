@@ -317,3 +317,170 @@ class DamExecutor:
         schedule = np.clip(schedule, -env.max_power_mw, env.max_power_mw)
 
         return schedule
+
+
+class DamBidSimulator:
+    """I simulate DAM bidding and EUPHEMIA market clearing.
+
+    I generate bids based on price forecasts and agent aggressiveness,
+    then simulate acceptance/rejection using actual clearing prices.
+
+    Real EUPHEMIA is a welfare-maximizing LP. I use a simplified model:
+    - SELL bid accepted if limit_price <= clearing_price
+    - BUY bid accepted if limit_price >= clearing_price
+    - Near the margin (±2 EUR): partial acceptance
+    - Settlement always at clearing_price (marginal pricing)
+    """
+
+    def __init__(self, max_power_mw: float = 30.0, capacity_mwh: float = 146.0,
+                 efficiency: float = 0.94, min_soc: float = 0.05, max_soc: float = 0.95,
+                 margin_eur: float = 2.0):
+        self._max_power = max_power_mw
+        self._capacity = capacity_mwh
+        self._eff_sqrt = np.sqrt(efficiency)
+        self._min_soc = min_soc
+        self._max_soc = max_soc
+        self._margin = margin_eur
+
+    def generate_bids(self, forecast: np.ndarray, aggressiveness: float,
+                      current_soc: float, sph: int = 4) -> Tuple[np.ndarray, np.ndarray]:
+        """I generate DAM bids based on price forecast and agent aggressiveness.
+
+        Args:
+            forecast: Price forecast array (hourly or quarter-hourly)
+            aggressiveness: -1 (conservative) to +1 (aggressive)
+            current_soc: Current battery SoC
+            sph: Steps per hour (4 for 15-min, 1 for hourly)
+
+        Returns:
+            (bid_mw, bid_prices): arrays of MW commitments and limit prices
+        """
+        n_slots = len(forecast)
+
+        # I compute spread threshold based on aggressiveness
+        # -1 → 60 EUR min spread (very selective)
+        #  0 → 30 EUR min spread (balanced)
+        # +1 → 10 EUR min spread (aggressive)
+        min_spread = 35.0 - 25.0 * aggressiveness  # 60 to 10
+
+        p25 = np.percentile(forecast, 25)
+        p75 = np.percentile(forecast, 75)
+        daily_spread = p75 - p25
+
+        bid_mw = np.zeros(n_slots)
+        bid_prices = np.zeros(n_slots)
+
+        if daily_spread < min_spread:
+            return bid_mw, bid_prices
+
+        # I compute commitment intensity based on aggressiveness
+        # -1 → 30% of max power
+        #  0 → 50% of max power
+        # +1 → 80% of max power
+        commit_ratio = 0.55 + 0.25 * aggressiveness  # 0.30 to 0.80
+
+        base_power = self._max_power * commit_ratio
+
+        for q in range(n_slots):
+            price = forecast[q]
+
+            if price <= p25:
+                # I bid to BUY (charge) at cheap hours
+                bid_mw[q] = -base_power * np.random.uniform(0.5, 1.0)
+                # I set limit price ABOVE forecast (willing to pay up to this)
+                bid_prices[q] = price + daily_spread * 0.15
+            elif price >= p75:
+                # I bid to SELL (discharge) at expensive hours
+                bid_mw[q] = base_power * np.random.uniform(0.5, 1.0)
+                # I set limit price BELOW forecast (willing to accept down to this)
+                bid_prices[q] = price - daily_spread * 0.15
+
+        # I ensure energy balance (can't sell more than we charge)
+        total_charge = abs(bid_mw[bid_mw < 0].sum()) if (bid_mw < 0).any() else 0
+        total_discharge = bid_mw[bid_mw > 0].sum() if (bid_mw > 0).any() else 0
+        if total_charge < total_discharge * 1.1 and total_discharge > 0:
+            scale = total_charge / (total_discharge * 1.1 + 1e-6)
+            bid_mw[bid_mw > 0] *= scale
+
+        # I simulate SoC trajectory to cap physically infeasible bids
+        simulated_soc = current_soc
+        time_step = 1.0 / sph
+        for q in range(n_slots):
+            mw = bid_mw[q]
+            if mw < -0.1:  # Charge
+                soc_delta = abs(mw) * time_step * self._eff_sqrt / self._capacity
+                if simulated_soc + soc_delta > self._max_soc:
+                    headroom = (self._max_soc - simulated_soc) * self._capacity
+                    max_mw = headroom / (time_step * self._eff_sqrt)
+                    bid_mw[q] = -max(max_mw, 0.0)
+                    simulated_soc = self._max_soc
+                else:
+                    simulated_soc += soc_delta
+            elif mw > 0.1:  # Discharge
+                soc_delta = mw * time_step / self._eff_sqrt / self._capacity
+                if simulated_soc - soc_delta < self._min_soc:
+                    available = (simulated_soc - self._min_soc) * self._capacity
+                    max_mw = available * self._eff_sqrt / time_step
+                    bid_mw[q] = max(max_mw, 0.0)
+                    simulated_soc = self._min_soc
+                else:
+                    simulated_soc -= soc_delta
+
+        bid_mw = np.clip(bid_mw, -self._max_power, self._max_power)
+        return bid_mw, bid_prices
+
+    def simulate_euphemia(self, bid_mw: np.ndarray, bid_prices: np.ndarray,
+                          actual_prices: np.ndarray) -> Tuple[np.ndarray, float]:
+        """I simulate EUPHEMIA market clearing.
+
+        Args:
+            bid_mw: Bid MW per slot (positive=sell, negative=buy)
+            bid_prices: Limit prices per slot
+            actual_prices: Actual DAM clearing prices per slot
+
+        Returns:
+            (accepted_mw, acceptance_rate): Accepted MW per slot and overall rate
+        """
+        n_slots = len(bid_mw)
+        accepted_mw = np.zeros(n_slots)
+        n_bids = 0
+        n_accepted = 0
+
+        for q in range(n_slots):
+            mw = bid_mw[q]
+            if abs(mw) < 0.1:
+                continue
+
+            n_bids += 1
+            limit = bid_prices[q]
+            clearing = actual_prices[q]
+
+            if mw > 0:  # SELL bid
+                # I accept if seller's limit <= clearing price
+                # (seller willing to accept at or below clearing)
+                if limit <= clearing:
+                    distance = clearing - limit
+                    if distance < self._margin:
+                        # I apply partial acceptance near the margin
+                        ratio = 0.5 + 0.5 * (distance / self._margin)
+                        accepted_mw[q] = mw * ratio
+                    else:
+                        accepted_mw[q] = mw
+                    n_accepted += 1
+                # else: rejected (seller wants more than clearing)
+
+            elif mw < 0:  # BUY bid
+                # I accept if buyer's limit >= clearing price
+                # (buyer willing to pay at or above clearing)
+                if limit >= clearing:
+                    distance = limit - clearing
+                    if distance < self._margin:
+                        ratio = 0.5 + 0.5 * (distance / self._margin)
+                        accepted_mw[q] = mw * ratio
+                    else:
+                        accepted_mw[q] = mw
+                    n_accepted += 1
+                # else: rejected (buyer won't pay clearing price)
+
+        acceptance_rate = n_accepted / max(n_bids, 1)
+        return accepted_mw, acceptance_rate

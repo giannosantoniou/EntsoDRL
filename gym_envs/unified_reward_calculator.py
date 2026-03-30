@@ -97,7 +97,10 @@ class UnifiedRewardCalculator:
         # LFP batteries are more SoC-tolerant than NMC, so I use a low coefficient.
         # penalty = soc_penalty_coeff × (|SoC% - 50|)²
         # This is a pure shaping signal — does NOT affect trading_pnl.
-        soc_penalty_coeff: float = 0.005,  # EUR per (percentage_point_deviation)²
+        # I reduced from 0.005 to 0.001 — the old value penalized SoC=95% at 10 EUR/step
+        # which made the agent avoid full charge even when buying cheap at night.
+        # LFP batteries can safely sit at 95% for hours. New: 0.001 * 45² = 2 EUR/step.
+        soc_penalty_coeff: float = 0.001,  # EUR per (percentage_point_deviation)²
 
         # Scaling — I raised from 0.001 to 0.01 so that a typical 300 EUR
         # trade produces a reward of 3.0 instead of 0.3, giving the NN a
@@ -386,6 +389,28 @@ class UnifiedRewardCalculator:
         components['calendar_aging_cost'] = calendar_aging_cost
 
         # =====================================================================
+        # 7d. PRICE-AWARE SHAPING (buy low, sell high signal)
+        # =====================================================================
+        # I add a shaping bonus/penalty based on the price relative to 24h mean.
+        # This helps the agent learn WHEN to trade, not just how much.
+        # I use intraday_energy_mw as the primary signal (agent-controlled).
+        price_timing_bonus = 0.0
+        dam_price = market.dam_price
+        price_mean = getattr(market, 'price_mean_24h', dam_price)
+        if price_mean > 0 and abs(intraday_energy_mw) > 0.1:
+            # I compute price deviation from 24h mean (normalized)
+            price_dev = (dam_price - price_mean) / max(price_mean, 1.0)
+
+            if intraday_energy_mw > 0:  # Selling
+                # I reward selling above mean, penalize selling below
+                price_timing_bonus = intraday_energy_mw * price_dev * 5.0 * time_step_hours
+            else:  # Buying
+                # I reward buying below mean, penalize buying above
+                price_timing_bonus = abs(intraday_energy_mw) * (-price_dev) * 5.0 * time_step_hours
+
+        components['price_timing_bonus'] = price_timing_bonus
+
+        # =====================================================================
         # 8. TOTAL REWARD
         # =====================================================================
         # I separate real economic P&L from shaping signals so we can
@@ -414,8 +439,8 @@ class UnifiedRewardCalculator:
         # Shaping: bonuses and penalties that exist only during training
         # I include degradation_cost here so the agent learns to avoid
         # unnecessary cycling, but it doesn't affect reported trading PnL.
-        shaping_bonus = dam_bonus
-        shaping_penalty = physical_penalty + calendar_aging_cost + degradation_cost
+        shaping_bonus = dam_bonus + max(0, price_timing_bonus)
+        shaping_penalty = physical_penalty + calendar_aging_cost + degradation_cost + max(0, -price_timing_bonus)
         components['shaping_bonus'] = shaping_bonus
         components['shaping_penalty'] = shaping_penalty
 
@@ -439,15 +464,34 @@ class UnifiedRewardCalculator:
 
     def _calculate_calendar_aging(self, soc: float) -> float:
         """
-        I calculate quadratic SoC deviation penalty.
+        I calculate ASYMMETRIC SoC penalty — harsher below 20%, gentler elsewhere.
 
-        penalty = soc_penalty_coeff × (|SoC% - 50|)²
+        The old symmetric formula (0.001 * |SoC%-50|^2) allowed the agent to sit
+        at 5% SoC for 45% of the time, relying on mFRR for free charging.
 
-        This is a pure shaping signal to keep SoC near 50%.
-        It does NOT affect trading_pnl.
+        New zones:
+          SoC < 15%:  SEVERE penalty (4x coefficient) — forces agent to buy energy
+          SoC 15-30%: Moderate penalty (2x coefficient) — mild pressure to charge
+          SoC 30-90%: FREE ZONE — no penalty, agent trades freely
+          SoC > 90%:  Mild penalty (1x coefficient) — avoid sitting at max
         """
-        deviation_pct = abs(soc * 100.0 - 50.0)
-        return self.soc_penalty_coeff * deviation_pct * deviation_pct
+        soc_pct = soc * 100.0
+
+        if soc_pct < 15.0:
+            # I apply severe penalty below 15% to prevent SoC depletion
+            deviation = 15.0 - soc_pct
+            return self.soc_penalty_coeff * 4.0 * deviation * deviation
+        elif soc_pct < 30.0:
+            # I apply moderate penalty 15-30% to encourage charging
+            deviation = 30.0 - soc_pct
+            return self.soc_penalty_coeff * 2.0 * deviation * deviation
+        elif soc_pct > 90.0:
+            # I apply mild penalty above 90% to avoid overcharge stress
+            deviation = soc_pct - 90.0
+            return self.soc_penalty_coeff * 1.0 * deviation * deviation
+        else:
+            # I give a FREE ZONE between 30-90% for unrestricted trading
+            return 0.0
 
     def _weighted_ida_price(self, market: UnifiedMarketState) -> float:
         """I compute a weighted average of IDA clearing prices for settlement."""

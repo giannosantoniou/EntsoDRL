@@ -76,10 +76,12 @@ class FeasibleDAMGenerator(DAMCommitmentGenerator):
 
         # Calculate rolling median price for decision making
         window = min(self.lookahead_hours * 7, n_steps // 10)  # ~1 week window
-        price_median = pd.Series(prices).rolling(window=window, center=True, min_periods=1).median().values
+        # I use center=False to avoid future data leakage — a real trader
+        # only knows past prices when submitting DAM bids (D-1)
+        price_median = pd.Series(prices).rolling(window=window, center=False, min_periods=1).median().values
 
         # Calculate price percentiles for commitment sizing
-        price_percentile = pd.Series(prices).rolling(window=window, center=True, min_periods=1).apply(
+        price_percentile = pd.Series(prices).rolling(window=window, center=False, min_periods=1).apply(
             lambda x: (x.iloc[-1] - x.min()) / (x.max() - x.min() + 1e-6) if len(x) > 0 else 0.5
         ).fillna(0.5).values
 

@@ -1754,7 +1754,7 @@ def _synthesize_xbid_prices(df, mask, time_step_hours=0.25):
     liquidity_factor = np.where(is_liquid, 0.8, 1.4)
 
     spread = np.abs(spread_ou) * liquidity_factor
-    spread = np.clip(spread, 1.0, 8.0)  # 1-8 EUR total spread
+    spread = np.clip(spread, 0.5, 3.0)  # I tightened from 1-8 to 0.5-3 EUR — real XBID spread is 0.5-3 EUR
 
     # I compute XBID bid (sell price, lower) and ask (buy price, higher)
     # Convention: bid < ask, spread = ask - bid = cost of round-trip

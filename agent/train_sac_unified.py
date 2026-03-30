@@ -30,7 +30,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import gymnasium as gym
-from stable_baselines3 import SAC
+from stable_baselines3 import SAC, TD3
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import (
     EvalCallback, CheckpointCallback, CallbackList, BaseCallback
@@ -128,14 +128,22 @@ class SACLoggingCallback(BaseCallback):
             if 'sac_penalty' in info:
                 self.step_penalties.append(info['sac_penalty'])
 
-            # I track participation via discrete_action
-            discrete = info.get('discrete_action', [0, 0, 5, 5])
-            if discrete[0] > 0:  # aFRR commitment > 0%
-                self.step_afrr_bids += 1
-            if discrete[2] != 5:  # IntraDay not idle
-                self.step_intraday_trades += 1
-            if discrete[3] != 5:  # mFRR not idle
-                self.step_mfrr_trades += 1
+            # I track participation via decoded_mw (v3 direct execution)
+            decoded = info.get('decoded_mw', {})
+            if decoded:
+                if abs(decoded.get('afrr', 0)) > 0.5:
+                    self.step_afrr_bids += 1
+                if abs(decoded.get('xbid', 0)) > 0.5:
+                    self.step_intraday_trades += 1
+                if abs(decoded.get('mfrr', 0)) > 0.5:
+                    self.step_mfrr_trades += 1
+            else:
+                # I fallback for legacy discrete_action format
+                discrete = info.get('discrete_action', [0, 0, 5, 5])
+                if len(discrete) >= 4:
+                    if discrete[0] > 0: self.step_afrr_bids += 1
+                    if discrete[2] != 5: self.step_intraday_trades += 1
+                    if discrete[3] != 5: self.step_mfrr_trades += 1
 
             # I track Free Bid trades (full-market mode routes mFRR to free_bid_energy_mw)
             free_bid_mw = info.get('free_bid_energy_mw', 0)
@@ -242,6 +250,7 @@ def train_sac_unified(
     output_dir: str = "models/unified_sac",
     total_timesteps: int = 5_000_000,
     n_envs: int = 8,  # I use 8 parallel envs for faster buffer filling
+    algorithm: str = "SAC",  # I support SAC or TD3
     learning_rate: float = 3e-4,
     buffer_size: int = 2_000_000,
     learning_starts: int = 10_000,
@@ -260,8 +269,8 @@ def train_sac_unified(
     market_forecaster_path: str = "models/market_forecaster.pkl",
     enable_endogenous_dam: bool = False,
     dam_bidder_min_spread: float = 30.0,
-    mfrr_activation_rate: float = 0.35,
-    mfrr_price_cap: float = 500.0,
+    mfrr_activation_rate: float = 0.20,  # I reduced from 0.35 — real ADMIE avg is 15-25%
+    mfrr_price_cap: float = 1000.0,  # I raised from 500 — real Greek mFRR reaches ~1190 EUR/MWh
     # SAC-specific soft penalty overrides (hard violations handled by action filtering)
     soc_soft_margin_penalty: float = 60.0,
     cycle_penalty: float = 2000.0,
@@ -312,7 +321,7 @@ def train_sac_unified(
 
     # I convert episode lengths from hours to steps
     train_episode_steps = int(168 / time_step_hours)  # 1 week
-    eval_episode_steps = int(336 / time_step_hours)   # 2 weeks
+    eval_episode_steps = int(168 / time_step_hours)   # 1 week (same as training)
 
     # I build shared env kwargs (excluding random_start and forecast_noise
     # which differ between train and eval)
@@ -464,16 +473,17 @@ def train_sac_unified(
         print(f"  Gamma: {gamma}")
         print(f"  Entropy coefficient: {ent_coef}")
 
-        model = SAC(
-            "MlpPolicy",
-            train_env,
+        # I select algorithm based on parameter
+        algo_class = SAC if algorithm.upper() == "SAC" else TD3
+        algo_kwargs = dict(
+            policy="MlpPolicy",
+            env=train_env,
             learning_rate=learning_rate,
             buffer_size=buffer_size,
             learning_starts=learning_starts,
             batch_size=batch_size,
             tau=tau,
             gamma=gamma,
-            ent_coef=ent_coef,
             verbose=1,
             tensorboard_log=str(model_dir / "tensorboard"),
             seed=seed,
@@ -482,10 +492,15 @@ def train_sac_unified(
                 "net_arch": dict(pi=[256, 256], qf=[256, 256])
             }
         )
+        # I add ent_coef only for SAC (TD3 uses deterministic policy + noise)
+        if algorithm.upper() == "SAC":
+            algo_kwargs["ent_coef"] = ent_coef
+
+        model = algo_class(**algo_kwargs)
 
     # I train the model
     reset_timesteps = resume_from is None
-    print(f"\nStarting SAC training for {total_timesteps:,} timesteps...")
+    print(f"\nStarting {algorithm.upper()} training for {total_timesteps:,} timesteps...")
     if resume_from:
         print("Continuing from previous checkpoint (reset_num_timesteps=False)")
     print("This will take several hours. Check tensorboard for progress.")
@@ -494,7 +509,7 @@ def train_sac_unified(
         model.learn(
             total_timesteps=total_timesteps,
             callback=callbacks,
-            progress_bar=True,
+            progress_bar=False,  # I disabled for background training compatibility
             reset_num_timesteps=reset_timesteps
         )
     except KeyboardInterrupt:
@@ -520,6 +535,7 @@ def train_sac_unified(
         'batch_size': batch_size,
         'tau': tau,
         'gamma': gamma,
+        'algorithm': algorithm.upper(),
         'ent_coef': str(ent_coef),
         'seed': seed,
         'data_path': str(data_path),
@@ -587,8 +603,8 @@ def evaluate_sac_model(
     market_forecaster_path = train_cfg.get('market_forecaster_path', 'models/market_forecaster.pkl')
     enable_endogenous_dam = train_cfg.get('enable_endogenous_dam', False)
     dam_bidder_min_spread = train_cfg.get('dam_bidder_min_spread', 30.0)
-    mfrr_activation_rate = train_cfg.get('mfrr_activation_rate', 0.35)
-    mfrr_price_cap = train_cfg.get('mfrr_price_cap', 500.0)
+    mfrr_activation_rate = train_cfg.get('mfrr_activation_rate', 0.20)
+    mfrr_price_cap = train_cfg.get('mfrr_price_cap', 1000.0)
     penalties = train_cfg.get('penalties', {})
 
     print(f"  time_step_hours={time_step_hours}, "
@@ -615,8 +631,11 @@ def evaluate_sac_model(
     else:
         df_eval = df
 
-    # I load SAC model
-    model = SAC.load(model_path)
+    # I load model (SAC or TD3) — I detect from training config
+    algo_name = train_cfg.get('algorithm', 'SAC').upper()
+    algo_class = TD3 if algo_name == 'TD3' else SAC
+    print(f"  Algorithm: {algo_name}")
+    model = algo_class.load(model_path)
 
     # I create evaluation environment
     eval_episode_steps = int(336 / time_step_hours)
@@ -766,6 +785,9 @@ if __name__ == "__main__":
                         help="Entropy coefficient ('auto' for learned temperature)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
+    parser.add_argument("--algorithm", type=str, default="SAC",
+                        choices=["SAC", "TD3"],
+                        help="RL algorithm to use (SAC or TD3)")
     parser.add_argument("--device", type=str, default="auto",
                         help="Training device (auto/cpu/cuda)")
     parser.add_argument("--resume", type=str, default=None,
@@ -787,8 +809,8 @@ if __name__ == "__main__":
     parser.add_argument("--enable-endogenous-dam", action='store_true',
                         help="Enable forecast-powered DAM commitment generation")
     parser.add_argument("--dam-bidder-min-spread", type=float, default=30.0)
-    parser.add_argument("--mfrr-activation-rate", type=float, default=0.35)
-    parser.add_argument("--mfrr-price-cap", type=float, default=500.0)
+    parser.add_argument("--mfrr-activation-rate", type=float, default=0.20)
+    parser.add_argument("--mfrr-price-cap", type=float, default=1000.0)
     # SAC-specific penalty args
     parser.add_argument("--soc-soft-margin-penalty", type=float, default=60.0,
                         help="SoC soft margin penalty EUR/MW (proximity to limits)")
@@ -813,6 +835,7 @@ if __name__ == "__main__":
             output_dir=args.output,
             total_timesteps=args.timesteps,
             n_envs=args.n_envs,
+            algorithm=args.algorithm,
             learning_rate=args.lr,
             buffer_size=args.buffer_size,
             learning_starts=args.learning_starts,

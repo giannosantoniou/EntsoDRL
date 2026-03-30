@@ -37,8 +37,8 @@ import torch
 from gym_envs.battery_env_masked import BatteryEnvMasked
 from data.data_loader import load_historical_data
 
-# I use 4 parallel envs (Windows-compatible with SubprocVecEnv)
-N_ENVS = 4
+# I use 10 parallel envs for better sample diversity and faster collection
+N_ENVS = 10
 MODEL_DIR = "models/ppo_v23_production"
 VECNORM_PATH = f"{MODEL_DIR}/vec_normalize.pkl"
 BEST_MODEL_PATH = f"{MODEL_DIR}/best_model"
@@ -141,9 +141,13 @@ def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    # I load historical data
-    df = load_historical_data('data/feasible_data_with_balancing.csv')
+    # I load 15-min resolution data (upsampled from hourly where needed)
+    df = load_historical_data('data/feasible_data_with_dam_15min.csv')
     print(f"Total data: {len(df):,} rows")
+
+    # I verify the data is uniform 15-min resolution
+    time_step_hours = 0.25  # 15-minute intervals
+    print(f"Time step: {time_step_hours}h (15-min resolution)")
 
     # Split: 70% train, 15% val, 15% test
     train_end = int(len(df) * 0.70)
@@ -193,6 +197,7 @@ def main():
         def _init():
             env = BatteryEnvMasked(
                 train_df, battery_params, n_actions=21,
+                time_step_hours=time_step_hours,  # 15-min resolution
                 use_ml_forecaster=use_ml,
                 forecaster_path=forecaster_path,
                 reward_config=reward_config,
@@ -201,7 +206,7 @@ def main():
                 enable_gate_closure=True,
                 # v23: Randomized starts for generalization
                 randomize_start=True,
-                min_episode_length=168,  # At least 1 week per episode
+                min_episode_length=672,  # 168h × 4 steps/h = 1 week in 15-min steps
             )
             env = ActionMasker(env, lambda e: e.action_masks())
             return env
@@ -211,6 +216,7 @@ def main():
     def make_val_env():
         env = BatteryEnvMasked(
             val_df, battery_params, n_actions=21,
+            time_step_hours=time_step_hours,  # 15-min resolution
             use_ml_forecaster=use_ml,
             forecaster_path=forecaster_path,
             reward_config=reward_config,
@@ -237,20 +243,41 @@ def main():
 
     # I create the MaskablePPO model
     print("\nCreating MaskablePPO model...")
+    # I tuned hyperparameters based on v23 run #1 diagnostics:
+    # - ent_coef 0.01→0.05: Entropy collapsed from 2.9 to 0.9 in 2M steps.
+    #   Higher entropy bonus keeps exploration alive longer.
+    # - n_steps 2048→4096: With 10 envs, buffer = 40,960 transitions per rollout.
+    #   Larger buffer captures more diverse market regimes per update.
+    # - n_epochs 10→5: Fewer passes over each buffer reduces overfitting per rollout
+    #   and prevents the high KL divergence (was 0.06, target <0.03).
+    # - batch_size 256→512: Larger batches give more stable gradient estimates,
+    #   reducing the clip fraction (was 0.32, target <0.25).
+    # - learning_rate 3e-4→2e-4 with linear decay: Gentler updates reduce
+    #   the aggressive policy changes that caused high KL and clip warnings.
+    # - clip_range 0.2→0.25: Slightly wider clip allows healthy policy updates
+    #   without triggering excessive clipping at the 0.2 boundary.
+    # - net_arch [256,256,128]→[512,256,128]: Wider first layer for better
+    #   market regime capture, same as v22 proven architecture.
+    def linear_schedule(initial_value):
+        def func(progress_remaining):
+            return progress_remaining * initial_value
+        return func
+
     model = MaskablePPO(
         "MlpPolicy",
         train_env,
-        learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=256,
-        n_epochs=10,
+        learning_rate=linear_schedule(1.5e-4),  # I reduced from 2e-4 for gentler updates (lower KL)
+        n_steps=4096,
+        batch_size=512,
+        n_epochs=4,           # I reduced from 5 — fewer passes = less policy drift per rollout
         gamma=0.995,
         gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
+        clip_range=0.25,
+        ent_coef=0.08,        # I raised from 0.05 — more exploration, slower entropy decay
+        target_kl=0.03,       # I added — SB3 stops epoch early if KL exceeds this
         vf_coef=0.5,
         max_grad_norm=0.5,
-        policy_kwargs={"net_arch": [256, 256, 128]},
+        policy_kwargs={"net_arch": [512, 256, 128]},
         verbose=1,
         device=device,
         tensorboard_log=f"{MODEL_DIR}/logs/"
@@ -272,7 +299,7 @@ def main():
     )
 
     # Training
-    total_timesteps = 5_000_000
+    total_timesteps = 3_000_000
     print(f"\nStarting training: {total_timesteps:,} timesteps")
     print("v23 key changes (Production-Ready):")
     print(f"  - REMOVED: Oracle features 23-26 (price_ratio, hours_to_peak, is_at_peak, dam_slot_ratio)")
@@ -287,7 +314,7 @@ def main():
     model.learn(
         total_timesteps=total_timesteps,
         callback=[val_callback, checkpoint_callback],
-        progress_bar=True
+        progress_bar=False
     )
 
     # I save final artifacts

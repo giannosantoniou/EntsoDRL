@@ -64,7 +64,7 @@ class ObservationBuilder:
 
         # I validate and clean
         obs = np.array(features, dtype=np.float32)
-        expected_features = 70
+        expected_features = 72  # I updated from 70: +2 DAM acceptance features in Group 7
         if env.enable_forecast:
             expected_features += 9
         if env.enable_market_forecast:
@@ -201,7 +201,7 @@ class ObservationBuilder:
         features.append(1.0 if env.is_selected_for_afrr else 0.0)
 
     def _add_risk_imbalance(self, features, env, row):
-        """Group 7: Risk/Imbalance (8 features)."""
+        """Group 7: Risk/Imbalance (10 features — was 8, added 2 DAM acceptance features)."""
         dam_min_soc, dam_max_soc = env._calculate_dam_soc_reserve()
         dam_discharge_reserve = (dam_min_soc - env.min_soc) / (env.max_soc - env.min_soc)
         features.append(np.clip(dam_discharge_reserve, 0, 1))
@@ -242,6 +242,21 @@ class ObservationBuilder:
         else:
             vol_regime = 0.5
         features.append(vol_regime)
+
+        # I add DAM bidding acceptance features (2 new features)
+        # These tell the agent how well DAM bids are being accepted today
+        dam_accept_rate = getattr(env, 'dam_acceptance_rate', 1.0)
+        features.append(np.clip(dam_accept_rate, 0.0, 1.0))
+
+        # I compute remaining rejected volume for rest of day (normalized)
+        dam_rejected_remaining = 0.0
+        if hasattr(env, 'dam_rejected_volume') and env.dam_rejected_volume is not None:
+            day_indices = env._get_day_indices_for_step(env.current_step)
+            if len(day_indices) > 0:
+                day_offset = env.current_step - day_indices[0]
+                remaining = env.dam_rejected_volume[day_offset:]
+                dam_rejected_remaining = abs(remaining).sum() / max(env.max_power_mw, 1.0)
+        features.append(np.clip(dam_rejected_remaining, 0.0, 5.0) / 5.0)
 
     def _add_market_phase(self, features, env, row, ts):
         """Group 8: Market Phase & System State (4 features)."""

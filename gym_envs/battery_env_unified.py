@@ -105,14 +105,14 @@ class BatteryEnvUnified(gym.Env):
         warmup_steps: int = 48,  # 48h warmup for rolling statistics
 
         # aFRR simulation parameters
-        selection_probability: float = 0.80,  # 80% chance of capacity bid selection
+        selection_probability: float = 0.65,  # I reduced from 80% to 65% — real ADMIE merit-order selects ~60-70% avg
         afrr_activation_rate: float = 0.15,  # 15% activation rate when selected
         peak_activation_boost: float = 1.3,  # Higher activation during peak hours
         high_imbalance_boost: float = 1.5,  # Higher activation during system stress
 
         # mFRR parameters
         mfrr_imbalance_threshold: float = 10.0,  # MW minimum |imbalance| for mFRR
-        mfrr_activation_rate: float = 0.35,  # Probability of mFRR bid acceptance (35%)
+        mfrr_activation_rate: float = 0.20,  # I reduced from 35% to 20% — real ADMIE avg is 15-25%
         mfrr_price_cap: float = 1000.0,  # EUR/MWh cap — real prices reach 1190 EUR
 
         # Cycling — degradation_cost already penalizes each cycle proportionally.
@@ -182,6 +182,19 @@ class BatteryEnvUnified(gym.Env):
         self.enable_endogenous_dam = enable_endogenous_dam
         self.dam_bidder_min_spread = dam_bidder_min_spread
         self.dam_schedule = None  # I store the 24h schedule generated at episode reset
+
+        # I create DamBidSimulator for EUPHEMIA acceptance simulation
+        if enable_endogenous_dam:
+            from gym_envs.market_executors.dam_executor import DamBidSimulator
+            self._dam_bid_simulator = DamBidSimulator(
+                max_power_mw=max_power_mw,
+                capacity_mwh=capacity_mwh,
+                efficiency=efficiency,
+                min_soc=min_soc,
+                max_soc=max_soc,
+            )
+        else:
+            self._dam_bid_simulator = None
 
         # I store IDA schedule configuration
         self.ida_min_spread = ida_min_spread
@@ -347,7 +360,7 @@ class BatteryEnvUnified(gym.Env):
             ])
 
         # I compute dynamic observation size based on enabled feature groups
-        n_obs = 70  # Base features (Groups 1-9) + situational awareness
+        n_obs = 72  # Base features (Groups 1-9) + DAM acceptance (was 70, +2 for EUPHEMIA)
         if self.enable_forecast:
             n_obs += 9   # IntraDay forecast + RES fundamentals
         if self.enable_market_forecast:
@@ -443,6 +456,13 @@ class BatteryEnvUnified(gym.Env):
         # ensures the agent doesn't rely on a "noisy oracle" DAM schedule.
         self._dam_forecast_bias = np.random.uniform(-12, 12)
 
+        # I track DAM bidding results (EUPHEMIA acceptance simulation)
+        self.dam_bid_schedule = None       # Original bids submitted (MW per slot)
+        self.dam_accepted_schedule = None  # Post-EUPHEMIA accepted bids
+        self.dam_rejected_volume = None    # Per-slot rejected MW
+        self.dam_acceptance_rate = 1.0     # Overall acceptance rate today
+        self.dam_aggressiveness = 0.0      # Agent-controlled bidding aggressiveness
+
     def reset(self, seed=None, options=None):
         """I reset the environment for a new episode."""
         super().reset(seed=seed)
@@ -495,6 +515,10 @@ class BatteryEnvUnified(gym.Env):
             if self.enable_endogenous_dam:
                 self.dam_schedule = self._generate_endogenous_dam_schedule()
                 self._dam_schedule_day_id = self._step_day_id[self.current_step]
+
+            # I run EUPHEMIA bid simulation if DamBidSimulator is available
+            if hasattr(self, '_dam_bid_simulator') and self._dam_bid_simulator is not None:
+                self._run_dam_bid_simulation()
 
     def set_degradation_cost(self, cost: float):
         """I allow the degradation curriculum callback to update the cost mid-training."""
@@ -686,6 +710,50 @@ class BatteryEnvUnified(gym.Env):
 
         return obs, reward, terminated, truncated, info
 
+    def _run_dam_bid_simulation(self):
+        """I run the EUPHEMIA bid simulation at each day boundary.
+
+        I use the DAM forecaster to generate price predictions, then the
+        DamBidSimulator to create bids and simulate EUPHEMIA acceptance.
+        The results are stored as state vars for the delivery day.
+        """
+        day_indices = self._get_day_indices_for_step(self.current_step)
+        if len(day_indices) < 4:
+            return
+
+        # I get price forecast for the day
+        actual_prices = np.array([
+            self.df.iloc[i].get('price', 80.0) for i in day_indices
+        ])
+
+        # I create noisy forecast (not perfect — agent shouldn't have oracle)
+        noise = np.random.normal(self._dam_forecast_bias, 18.0, len(actual_prices))
+        forecast = actual_prices + noise
+
+        # I generate bids using agent's aggressiveness parameter
+        bid_mw, bid_prices = self._dam_bid_simulator.generate_bids(
+            forecast=forecast,
+            aggressiveness=self.dam_aggressiveness,
+            current_soc=self.soc,
+            sph=self._sph
+        )
+
+        # I simulate EUPHEMIA clearing
+        accepted_mw, acceptance_rate = self._dam_bid_simulator.simulate_euphemia(
+            bid_mw, bid_prices, actual_prices
+        )
+
+        # I store results as state vars
+        self.dam_bid_schedule = bid_mw
+        self.dam_accepted_schedule = accepted_mw
+        self.dam_rejected_volume = bid_mw - accepted_mw
+        self.dam_acceptance_rate = acceptance_rate
+
+        # I update the dam_schedule used by DamExecutor for commitment lookup
+        if self.enable_endogenous_dam:
+            self.dam_schedule = accepted_mw
+            self._dam_schedule_day_id = self._step_day_id[self.current_step]
+
     def _check_afrr_activation(self, row: pd.Series) -> Tuple[bool, Optional[str]]:
         """I delegate to AfrrExecutor for activation simulation."""
         return self._afrr_executor.check_activation(row)
@@ -827,9 +895,11 @@ class BatteryEnvUnified(gym.Env):
                     id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
             return id_price
         # I use XBID bid price for selling (continuous market)
+        # I check for agent price offset (set by SAC wrapper for price control)
         xbid_bid = row.get('xbid_price_bid', np.nan)
         if not np.isnan(xbid_bid) and xbid_bid > 0:
-            return xbid_bid
+            agent_offset = getattr(self, '_xbid_price_offset', 0.0)
+            return xbid_bid + agent_offset
         # I fall back to DAM price minus small spread
         return row.get('price', 100.0) - 1.5
 
@@ -851,9 +921,11 @@ class BatteryEnvUnified(gym.Env):
                     id_price = row.get('ida2_clearing_price', row.get('price', 100.0))
             return id_price
         # I use XBID ask price for buying (continuous market)
+        # I check for agent price offset (set by SAC wrapper for price control)
         xbid_ask = row.get('xbid_price_ask', np.nan)
         if not np.isnan(xbid_ask) and xbid_ask > 0:
-            return xbid_ask
+            agent_offset = getattr(self, '_xbid_price_offset', 0.0)
+            return xbid_ask + agent_offset
         # I fall back to DAM price plus small spread
         return row.get('price', 100.0) + 1.5
 
