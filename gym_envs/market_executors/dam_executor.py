@@ -361,7 +361,7 @@ class DamBidSimulator:
         # -1 → 60 EUR min spread (very selective)
         #  0 → 30 EUR min spread (balanced)
         # +1 → 10 EUR min spread (aggressive)
-        min_spread = 35.0 - 25.0 * aggressiveness  # 60 to 10
+        min_spread = 20.0 - 12.0 * aggressiveness  # 32 to 8 EUR
 
         p25 = np.percentile(forecast, 25)
         p75 = np.percentile(forecast, 75)
@@ -387,13 +387,17 @@ class DamBidSimulator:
             if price <= p25:
                 # I bid to BUY (charge) at cheap hours
                 bid_mw[q] = -base_power * np.random.uniform(0.5, 1.0)
-                # I set limit price ABOVE forecast (willing to pay up to this)
-                bid_prices[q] = price + daily_spread * 0.15
+                # I set limit price near forecast with small margin
+                # Aggressive bids (high aggressiveness) set limit closer to forecast
+                # Conservative bids set limit further above (willing to pay more)
+                margin = np.random.uniform(2.0, 8.0) * (1.0 - 0.3 * aggressiveness)
+                bid_prices[q] = price + margin
             elif price >= p75:
                 # I bid to SELL (discharge) at expensive hours
                 bid_mw[q] = base_power * np.random.uniform(0.5, 1.0)
-                # I set limit price BELOW forecast (willing to accept down to this)
-                bid_prices[q] = price - daily_spread * 0.15
+                # I set limit price near forecast — some will be rejected
+                margin = np.random.uniform(2.0, 8.0) * (1.0 - 0.3 * aggressiveness)
+                bid_prices[q] = price - margin
 
         # I ensure energy balance (can't sell more than we charge)
         total_charge = abs(bid_mw[bid_mw < 0].sum()) if (bid_mw < 0).any() else 0

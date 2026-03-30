@@ -488,6 +488,10 @@ class BatteryEnvUnified(gym.Env):
             self.dam_schedule = self._generate_endogenous_dam_schedule()
             self._dam_schedule_day_id = self._step_day_id[self.current_step]
 
+        # I run EUPHEMIA bid simulation at episode start
+        if hasattr(self, '_dam_bid_simulator') and self._dam_bid_simulator is not None:
+            self._run_dam_bid_simulation()
+
         obs = self._build_observation()
         info = self._get_info()
 
@@ -727,8 +731,9 @@ class BatteryEnvUnified(gym.Env):
         ])
 
         # I create noisy forecast (not perfect — agent shouldn't have oracle)
-        noise = np.random.normal(self._dam_forecast_bias, 18.0, len(actual_prices))
-        forecast = actual_prices + noise
+        # I use realistic forecast error: bias ±12 EUR + noise σ=8 EUR (~8% MAPE)
+        noise = np.random.normal(self._dam_forecast_bias, 8.0, len(actual_prices))
+        forecast = np.maximum(0, actual_prices + noise)
 
         # I generate bids using agent's aggressiveness parameter
         bid_mw, bid_prices = self._dam_bid_simulator.generate_bids(
