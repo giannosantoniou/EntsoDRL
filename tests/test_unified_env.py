@@ -1230,25 +1230,25 @@ class TestMFRRDirectionConstraint:
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 50.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 0.0
         obs = unified_env._build_observation()
-        assert obs[65] == 1.0, f"Expected mfrr_direction=+1.0 for UP-only, got {obs[65]}"
+        assert obs[67] == 1.0, f"Expected mfrr_direction=+1.0 for UP-only, got {obs[65]}"
 
         # I test DOWN only → -1.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 0.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 80.0
         obs = unified_env._build_observation()
-        assert obs[65] == -1.0, f"Expected mfrr_direction=-1.0 for DOWN-only, got {obs[65]}"
+        assert obs[67] == -1.0, f"Expected mfrr_direction=-1.0 for DOWN-only, got {obs[65]}"
 
         # I test both active → 0.0 (UP - DOWN = 1 - 1 = 0)
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 50.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 80.0
         obs = unified_env._build_observation()
-        assert obs[65] == 0.0, f"Expected mfrr_direction=0.0 for both active, got {obs[65]}"
+        assert obs[67] == 0.0, f"Expected mfrr_direction=0.0 for both active, got {obs[65]}"
 
         # I test neither active → 0.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_up_mwh')] = 0.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('mfrr_activated_down_mwh')] = 0.0
         obs = unified_env._build_observation()
-        assert obs[65] == 0.0, f"Expected mfrr_direction=0.0 for neither active, got {obs[65]}"
+        assert obs[67] == 0.0, f"Expected mfrr_direction=0.0 for neither active, got {obs[65]}"
 
     def test_step_blocks_when_not_activated(self, unified_env):
         """I verify step() blocks mFRR trades when activation volume is zero."""
@@ -1357,7 +1357,7 @@ class TestMarketPhaseFeatures:
                 unified_env.current_step = i
                 obs = unified_env._build_observation()
                 assert obs[64] == 0.0, \
-                    f"Expected ida3_applies=0.0 for hour {ts.hour}, got {obs[64]}"
+                    f"Expected ida3_applies=0.0 for hour {ts.hour}, got {obs[66]}"
                 return
 
         pytest.skip("No hour < 12 found in test window")
@@ -1374,7 +1374,7 @@ class TestMarketPhaseFeatures:
                 unified_env.current_step = i
                 obs = unified_env._build_observation()
                 assert obs[64] == 1.0, \
-                    f"Expected ida3_applies=1.0 for hour {ts.hour}, got {obs[64]}"
+                    f"Expected ida3_applies=1.0 for hour {ts.hour}, got {obs[66]}"
                 return
 
         pytest.skip("No hour >= 12 found in test window")
@@ -1419,16 +1419,16 @@ class TestMarketPhaseFeatures:
         obs = unified_env._build_observation()
         # res_penetration = clip(3000/6000, 0, 1.5) / 1.5 = 0.5 / 1.5 = 0.333
         expected = (3000.0 / 6000.0) / 1.5
-        assert obs[64] == pytest.approx(expected, abs=0.01), \
-            f"Expected res_penetration={expected:.3f}, got {obs[64]}"
+        assert obs[66] == pytest.approx(expected, abs=0.01), \
+            f"Expected res_penetration={expected:.3f}, got {obs[66]}"
 
         # I test high RES (above 100% of load) → capped at 1.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('res_total_mw')] = 10000.0
         unified_env.df.iloc[step, unified_env.df.columns.get_loc('load_mw')] = 5000.0
         obs = unified_env._build_observation()
         # res_penetration = clip(10000/5000, 0, 1.5) / 1.5 = 1.5 / 1.5 = 1.0
-        assert obs[64] == pytest.approx(1.0, abs=0.01), \
-            f"Expected res_penetration=1.0 for high RES, got {obs[64]}"
+        assert obs[66] == pytest.approx(1.0, abs=0.01), \
+            f"Expected res_penetration=1.0 for high RES, got {obs[66]}"
 
 
 class TestAFRRMarginalPricing:
@@ -1840,7 +1840,7 @@ class TestIDADecomposition:
                 full_market_env.current_step = i
                 obs = full_market_env._build_observation()
                 assert obs[64] == pytest.approx(0.50, abs=0.01), \
-                    f"Expected ida_phase=0.50 for hour {ts.hour} (after IDA2), got {obs[64]}"
+                    f"Expected ida_phase=0.50 for hour {ts.hour} (after IDA2), got {obs[66]}"
                 return
 
         # I verify phase for afternoon (hour >= 14): should be 1.0 (IDA3 delivery)
@@ -1849,8 +1849,8 @@ class TestIDADecomposition:
             if ts.hour >= 14:
                 full_market_env.current_step = i
                 obs = full_market_env._build_observation()
-                assert obs[64] == pytest.approx(1.0, abs=0.01), \
-                    f"Expected ida_phase=1.0 for hour {ts.hour} (IDA3 delivery), got {obs[64]}"
+                assert obs[66] == pytest.approx(1.0, abs=0.01), \
+                    f"Expected ida_phase=1.0 for hour {ts.hour} (IDA3 delivery), got {obs[66]}"
                 return
 
         pytest.skip("No suitable hour found in test window")
@@ -2296,16 +2296,16 @@ class TestIntraDayForecast:
                 f"Forecast obs[{i}]={obs[i]:.3f} out of expected range"
 
     def test_correction_signal_matches(self, forecast_env):
-        """obs[76] == (obs[64]*100 - obs[4]*100) / 100."""
+        """obs[78] == (obs[64]*100 - obs[4]*100) / 100."""
         obs, info = forecast_env.reset(seed=42)
-        # obs[76] = (fc_1h - dam_price) / 100
+        # obs[78] = (fc_1h - dam_price) / 100
         # obs[64] = fc_1h / 100
         # obs[4] = dam_price / 100 (first feature in Group 2, absolute index 4)
         fc_1h = obs[64] * 100
         dam_price = obs[4] * 100
         expected_correction = (fc_1h - dam_price) / 100.0
-        assert obs[76] == pytest.approx(expected_correction, abs=0.001), \
-            f"Correction signal mismatch: obs[76]={obs[76]}, expected={expected_correction}"
+        assert obs[78] == pytest.approx(expected_correction, abs=0.001), \
+            f"Correction signal mismatch: obs[78]={obs[78]}, expected={expected_correction}"
 
     def test_res_features_nonneg(self, forecast_env):
         """Solar [76] and wind [77] >= 0."""
