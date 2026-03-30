@@ -41,10 +41,41 @@ class BatteryEnvUnifiedSAC(gym.Env):
     XBID_PRICE_OFFSET_MAX = 10.0
     N_ACTIONS = 7
 
+    # Fix 1: Network charges (Use-of-System fees)
+    # I apply ~4 EUR/MWh per direction (charge and discharge)
+    # This reflects real ADMIE/HEDNO transmission + distribution charges
+    NETWORK_CHARGE_EUR_PER_MWH = 4.0  # EUR/MWh per direction
+
+    # Fix 3: Minimum bid sizes (HEnEx rules)
+    MIN_BID_DAM_MW = 0.1     # DAM minimum bid
+    MIN_BID_BALANCING_MW = 1.0  # aFRR/mFRR minimum bid
+
+    # Fix 5: Prequalification flag
+    # I assume prequalified by default but can be disabled
+    is_prequalified_afrr = True
+    is_prequalified_mfrr = True
+
+    # Fix 8: Calendar aging cost (EUR per step, depends on SoC)
+    # I model that holding battery at extreme SoC accelerates degradation
+    # LFP optimal storage: 30-70% SoC. Penalty outside this range.
+    CALENDAR_AGING_BASE_EUR_PER_STEP = 0.5  # ~48 EUR/day baseline
+    CALENDAR_AGING_SOC_PENALTY_FACTOR = 0.02  # extra cost per (SoC%-50)^2
+
+    # Fix 12: Availability contract revenue
+    # I model the fixed availability payment from EU-funded scheme
+    # ~115,000 EUR/MW/year = ~315 EUR/MW/day = ~13 EUR/MW/hour
+    # For 30 MW: ~394 EUR/hour = ~99 EUR per 15-min step
+    AVAILABILITY_CONTRACT_EUR_PER_MW_PER_HOUR = 13.15  # EUR/MW/h
+
     def __init__(
         self,
         inner_env: Optional[BatteryEnvUnified] = None,
         penalties: Optional[Dict[str, float]] = None,
+        network_charge_eur_per_mwh: float = 4.0,
+        enable_availability_contract: bool = True,
+        availability_eur_per_mw_hour: float = 13.15,
+        prequalified_afrr: bool = True,
+        prequalified_mfrr: bool = True,
         **kwargs
     ):
         super().__init__()
@@ -58,6 +89,17 @@ class BatteryEnvUnifiedSAC(gym.Env):
         self.penalties = dict(self.DEFAULT_PENALTIES)
         if penalties:
             self.penalties.update(penalties)
+
+        # Fix 1: Network charges
+        self.NETWORK_CHARGE_EUR_PER_MWH = network_charge_eur_per_mwh
+
+        # Fix 5: Prequalification
+        self.is_prequalified_afrr = prequalified_afrr
+        self.is_prequalified_mfrr = prequalified_mfrr
+
+        # Fix 12: Availability contract
+        self._enable_availability_contract = enable_availability_contract
+        self.AVAILABILITY_CONTRACT_EUR_PER_MW_PER_HOUR = availability_eur_per_mw_hour
 
         # I cache physics constants from inner env
         self._max_power = self._inner.max_power_mw
@@ -172,6 +214,17 @@ class BatteryEnvUnifiedSAC(gym.Env):
                 if d['mfrr_mw'] < 0: d['mfrr_mw'] *= scale
                 if d['freebid_mw'] < 0: d['freebid_mw'] *= scale
 
+        # Fix 3: I enforce minimum bid sizes (HEnEx rules)
+        # aFRR/mFRR: minimum 1 MW, DAM: minimum 0.1 MW
+        if abs(d['afrr_mw']) < self.MIN_BID_BALANCING_MW:
+            d['afrr_mw'] = 0.0
+        if abs(d['xbid_mw']) < self.MIN_BID_DAM_MW:
+            d['xbid_mw'] = 0.0
+        if abs(d['mfrr_mw']) < self.MIN_BID_BALANCING_MW:
+            d['mfrr_mw'] = 0.0
+        if abs(d['freebid_mw']) < self.MIN_BID_BALANCING_MW:
+            d['freebid_mw'] = 0.0
+
         return d
 
     # ─── SoC update primitives ────────────────────────────────────
@@ -233,6 +286,10 @@ class BatteryEnvUnifiedSAC(gym.Env):
             'settlement_price': 0.0,
         }
 
+        # Fix 5: I check prequalification before allowing aFRR
+        if not self.is_prequalified_afrr:
+            return result
+
         # I check if new 4-hour block starts (block boundary)
         if env._afrr_steps_remaining <= 0:
             committed = min(abs(afrr_mw), self._max_power)
@@ -288,6 +345,10 @@ class BatteryEnvUnifiedSAC(gym.Env):
     def _determine_mfrr(self, mfrr_mw: float, row) -> dict:
         """I determine mFRR activation using ADMIE data. No SoC change."""
         result = {'mfrr_mw': 0.0, 'mfrr_price': 0.0, 'activated': False}
+
+        # Fix 5: I check prequalification before allowing mFRR
+        if not self.is_prequalified_mfrr:
+            return result
 
         if abs(mfrr_mw) < 0.1:
             return result
@@ -436,15 +497,33 @@ class BatteryEnvUnifiedSAC(gym.Env):
             mfrr_revenue = mfrr_mw * mfrr['mfrr_price'] * self._time_step
         afrr_cap_revenue = afrr['afrr_capacity_revenue']
 
-        # I compute total revenue for this step
+        # Fix 12: Availability contract revenue (fixed payment, independent of trading)
+        availability_revenue = 0.0
+        if self._enable_availability_contract:
+            availability_revenue = (self._max_power *
+                                    self.AVAILABILITY_CONTRACT_EUR_PER_MW_PER_HOUR *
+                                    self._time_step)
+
+        # I compute total market revenue for this step
         total_revenue = (dam_revenue + afrr_energy_revenue + afrr_cap_revenue +
-                        xbid_revenue + mfrr_revenue)
+                        xbid_revenue + mfrr_revenue + availability_revenue)
 
         # I account for degradation cost based on actual cycling
         deg_cost = abs(actual_energy) * self._inner.reward_calculator.degradation_cost
 
+        # Fix 1: Network charges — I charge for energy flowing through the grid
+        # Both charge and discharge incur UoS fees (metered at connection point)
+        network_cost = abs(actual_energy) * self.NETWORK_CHARGE_EUR_PER_MWH
+
+        # Fix 8: Calendar aging — I add time-based degradation that depends on SoC
+        # Holding battery at extreme SoC (very high or very low) accelerates aging
+        soc_pct = self._inner.soc * 100  # 0-100
+        soc_deviation = abs(soc_pct - 50.0)  # distance from optimal 50%
+        calendar_aging = (self.CALENDAR_AGING_BASE_EUR_PER_STEP +
+                         self.CALENDAR_AGING_SOC_PENALTY_FACTOR * soc_deviation ** 2)
+
         # I compute net profit for this step
-        step_profit = total_revenue - deg_cost
+        step_profit = total_revenue - deg_cost - network_cost - calendar_aging
 
         # ── Phase 5: Build reward ──
 
@@ -452,6 +531,10 @@ class BatteryEnvUnifiedSAC(gym.Env):
         dam_price = dam['dam_price']
         id_bid = row.get('xbid_price_bid', dam_price - 1.5)
         id_ask = row.get('xbid_price_ask', dam_price + 1.5)
+
+        # Fix 2: Single imbalance price (ADMIE uses weighted average of activated balancing)
+        # I use the single imbalance_price column if available, otherwise fall back to DAM price
+        single_imbalance_price = row.get('imbalance_price', dam_price)
 
         market_state = UnifiedMarketState(
             dam_price=dam_price,
@@ -544,6 +627,9 @@ class BatteryEnvUnifiedSAC(gym.Env):
             'net_profit': step_profit,
             'step_revenue': total_revenue,
             'step_degradation': deg_cost,
+            'step_network_cost': network_cost,
+            'step_calendar_aging': calendar_aging,
+            'step_availability_revenue': availability_revenue,
             'sac_penalty': penalty,
             'sac_penalty_scaled': scaled_penalty,
             'discrete_action': [],
