@@ -38,7 +38,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
         'cycle_excess': 2000.0,
     }
     CYCLE_TARGET = 5.0
-    XBID_PRICE_OFFSET_MAX = 10.0
+    XBID_PRICE_OFFSET_MAX = 50.0  # EUR/MWh (±50 for volatile intraday near gate closure)
     N_ACTIONS = 7
 
     # Fix 1: Network charges (Use-of-System fees)
@@ -58,8 +58,11 @@ class BatteryEnvUnifiedSAC(gym.Env):
     # Fix 8: Calendar aging cost (EUR per step, depends on SoC)
     # I model that holding battery at extreme SoC accelerates degradation
     # LFP optimal storage: 30-70% SoC. Penalty outside this range.
-    CALENDAR_AGING_BASE_EUR_PER_STEP = 0.5  # ~48 EUR/day baseline
-    CALENDAR_AGING_SOC_PENALTY_FACTOR = 0.02  # extra cost per (SoC%-50)^2
+    # Battery ~22M EUR / 20 years = ~3,000 EUR/day total aging budget.
+    # Calendar aging = ~30% of total = ~900 EUR/day = ~9.4 EUR/step (at 96 steps/day)
+    CALENDAR_AGING_BASE_EUR_PER_STEP = 0.3  # ~29 EUR/day baseline (minimal)
+    CALENDAR_AGING_SOC_PENALTY_FACTOR = 0.001  # extra cost per (SoC%-50)^2
+    # At SoC 95%: 0.3 + 0.001*2025 = 2.33 EUR/step = 224 EUR/day (reasonable)
 
     # Fix 12: Availability contract revenue
     # I model the fixed availability payment from EU-funded scheme
@@ -447,26 +450,50 @@ class BatteryEnvUnifiedSAC(gym.Env):
         # I get current market data
         row = self._inner.df.iloc[self._inner.current_step]
 
-        # ── Phase 1: Determine all market positions (NO SoC changes) ──
+        # ── Phase 1: Determine market positions with PRIORITY CASCADE ──
+        # Priority: DAM (mandatory) → aFRR (if selected) → mFRR → XBID
+        # I allocate inverter capacity in priority order. Lower-priority markets
+        # get only the REMAINING capacity after higher-priority markets.
 
         dam = self._determine_dam(row)
-        afrr = self._determine_afrr(decoded['afrr_mw'], decoded['afrr_price_tier'], row)
-        xbid_price_info = self._determine_xbid_price(
-            decoded['xbid_mw'], decoded['xbid_price_offset'], row)
-        mfrr = self._determine_mfrr(decoded['mfrr_mw'], row)
-
-        # I collect all MW positions
         dam_mw = dam['dam_mw']
-        afrr_energy_mw = afrr['afrr_energy_mw']  # 0 if not activated
-        xbid_mw = decoded['xbid_mw']
-        mfrr_mw = mfrr['mfrr_mw']  # 0 if not activated
 
-        # ── Phase 2: Calculate NET physical MW (single inverter) ──
+        # I calculate remaining inverter capacity after DAM
+        remaining_capacity = self._max_power - abs(dam_mw)
+        remaining_capacity = max(0.0, remaining_capacity)
 
+        # aFRR (2nd priority — mandatory if selected by TSO)
+        afrr = self._determine_afrr(
+            min(abs(decoded['afrr_mw']), remaining_capacity),
+            decoded['afrr_price_tier'], row)
+        afrr_energy_mw = afrr['afrr_energy_mw']
+        remaining_capacity -= abs(afrr_energy_mw)
+        remaining_capacity = max(0.0, remaining_capacity)
+
+        # mFRR (3rd priority — TSO-activated)
+        mfrr_requested = np.clip(decoded['mfrr_mw'], -remaining_capacity, remaining_capacity)
+        mfrr = self._determine_mfrr(mfrr_requested, row)
+        mfrr_mw = mfrr['mfrr_mw']
+        remaining_capacity -= abs(mfrr_mw)
+        remaining_capacity = max(0.0, remaining_capacity)
+
+        # XBID (lowest priority — agent-controlled, uses remaining capacity)
+        xbid_mw = np.clip(decoded['xbid_mw'], -remaining_capacity, remaining_capacity)
+
+        # XBID fill probability — orders may not fill in continuous market
+        xbid_price_info = self._determine_xbid_price(xbid_mw, decoded['xbid_price_offset'], row)
+        if abs(xbid_mw) > 0.1:
+            xbid_mid = (row.get('xbid_price_bid', 98.0) + row.get('xbid_price_ask', 102.0)) / 2
+            price_distance = abs(xbid_price_info['price'] - xbid_mid)
+            # I model fill probability: near mid-price = high fill, far = low fill
+            # At 0 EUR distance: 95% fill. At 20 EUR: 50%. At 50 EUR: 10%.
+            fill_prob = np.clip(0.95 - price_distance * 0.02, 0.05, 0.95)
+            if np.random.random() > fill_prob:
+                xbid_mw = 0.0  # Order not filled
+
+        # ── Phase 2: Calculate NET physical MW (already capacity-constrained) ──
+        # No clipping needed — priority cascade ensures sum ≤ max_power
         net_mw = dam_mw + afrr_energy_mw + xbid_mw + mfrr_mw
-
-        # I clamp net_mw to inverter limits
-        net_mw = np.clip(net_mw, -self._max_power, self._max_power)
 
         # ── Phase 3: Single SoC update ──
 
@@ -515,8 +542,9 @@ class BatteryEnvUnifiedSAC(gym.Env):
         # Both charge and discharge incur UoS fees (metered at connection point)
         network_cost = abs(actual_energy) * self.NETWORK_CHARGE_EUR_PER_MWH
 
-        # Fix 8: Calendar aging — I add time-based degradation that depends on SoC
-        # Holding battery at extreme SoC (very high or very low) accelerates aging
+        # Fix 8: Calendar aging — single source (NOT double-counted with reward calculator)
+        # I compute aging here and pass soc_penalty_coeff=0 to reward calculator
+        # to avoid double-counting. Battery ~22M EUR / 20 years ≈ 3,000 EUR/day total.
         soc_pct = self._inner.soc * 100  # 0-100
         soc_deviation = abs(soc_pct - 50.0)  # distance from optimal 50%
         calendar_aging = (self.CALENDAR_AGING_BASE_EUR_PER_STEP +

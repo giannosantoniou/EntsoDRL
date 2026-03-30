@@ -256,7 +256,7 @@ def train_sac_unified(
     learning_starts: int = 10_000,
     batch_size: int = 256,
     tau: float = 0.005,
-    gamma: float = 0.99,
+    gamma: float = 0.999,  # ~1000 steps horizon = 250h = 10.4 days at 15-min
     ent_coef: str = "auto",
     seed: int = 42,
     device: str = "auto",
@@ -779,8 +779,8 @@ if __name__ == "__main__":
                         help="Batch size for updates")
     parser.add_argument("--tau", type=float, default=0.005,
                         help="Soft update coefficient")
-    parser.add_argument("--gamma", type=float, default=0.99,
-                        help="Discount factor")
+    parser.add_argument("--gamma", type=float, default=0.999,
+                        help="Discount factor (0.999 = ~250h horizon at 15-min steps)")
     parser.add_argument("--ent-coef", type=str, default="auto",
                         help="Entropy coefficient ('auto' for learned temperature)")
     parser.add_argument("--seed", type=int, default=42,

@@ -333,7 +333,7 @@ class TestContinuousToAbsolute:
         assert decoded['afrr_mw'] == pytest.approx(0.0, abs=0.1)  # aFRR min is 0
         assert decoded['afrr_price_tier'] == pytest.approx(0.7, abs=0.01)
         assert decoded['xbid_mw'] == pytest.approx(-30.0, abs=0.1)  # full charge
-        assert decoded['xbid_price_offset'] == pytest.approx(-10.0, abs=0.1)
+        assert decoded['xbid_price_offset'] == pytest.approx(-50.0, abs=0.1)
         assert decoded['mfrr_mw'] == pytest.approx(-30.0, abs=0.1)
 
     def test_clipping(self, sac_env):
@@ -355,7 +355,7 @@ class TestContinuousToAbsolute:
     def test_xbid_price_offset_range(self, sac_env):
         """I verify XBID price offset maps correctly within range."""
         # I test several values
-        for cont_val, expected_offset in [(-1.0, -10.0), (0.0, 0.0), (0.5, 5.0), (1.0, 10.0)]:
+        for cont_val, expected_offset in [(-1.0, -50.0), (0.0, 0.0), (0.5, 25.0), (1.0, 50.0)]:
             action = np.array([0.0, 0.0, 0.0, cont_val, 0.0, 0.0, 0.0], dtype=np.float32)
             decoded = sac_env._decode_action(action)
             assert decoded['xbid_price_offset'] == pytest.approx(expected_offset, abs=0.1)
@@ -561,7 +561,7 @@ class TestRewardCalculator:
     def test_reward_calculator_settable(self, sac_env):
         """I verify degradation cost can be updated."""
         sac_env.reward_calculator.degradation_cost = 10.0
-        assert sac_env._inner.reward_calculator.degradation_cost == 10.0
+        assert sac_env._inner.reward_calculator.degradation_cost == 50.0
 
 
 class TestEpisodeCompletion:
@@ -978,7 +978,7 @@ class TestContinuousToAbsolute:
         assert decoded['afrr_mw'] == pytest.approx(0.0, abs=0.1)  # aFRR min is 0
         assert decoded['afrr_price_tier'] == pytest.approx(0.7, abs=0.01)
         assert decoded['xbid_mw'] == pytest.approx(-30.0, abs=0.1)  # full charge
-        assert decoded['xbid_price_offset'] == pytest.approx(-10.0, abs=0.1)
+        assert decoded['xbid_price_offset'] == pytest.approx(-50.0, abs=0.1)
         assert decoded['mfrr_mw'] == pytest.approx(-30.0, abs=0.1)
 
     def test_clipping(self, sac_env):
@@ -1000,7 +1000,7 @@ class TestContinuousToAbsolute:
     def test_xbid_price_offset_range(self, sac_env):
         """I verify XBID price offset maps correctly within range."""
         # I test several values
-        for cont_val, expected_offset in [(-1.0, -10.0), (0.0, 0.0), (0.5, 5.0), (1.0, 10.0)]:
+        for cont_val, expected_offset in [(-1.0, -50.0), (0.0, 0.0), (0.5, 25.0), (1.0, 50.0)]:
             action = np.array([0.0, 0.0, 0.0, cont_val, 0.0, 0.0, 0.0], dtype=np.float32)
             decoded = sac_env._decode_action(action)
             assert decoded['xbid_price_offset'] == pytest.approx(expected_offset, abs=0.1)
@@ -1206,7 +1206,7 @@ class TestRewardCalculator:
     def test_reward_calculator_settable(self, sac_env):
         """I verify degradation cost can be updated."""
         sac_env.reward_calculator.degradation_cost = 10.0
-        assert sac_env._inner.reward_calculator.degradation_cost == 10.0
+        assert sac_env._inner.reward_calculator.degradation_cost == 50.0
 
 
 class TestEpisodeCompletion:
@@ -1474,7 +1474,7 @@ class TestContinuousToAbsolute:
         assert decoded['afrr_mw'] == pytest.approx(0.0, abs=0.1)  # aFRR min is 0
         assert decoded['afrr_price_tier'] == pytest.approx(0.7, abs=0.01)
         assert decoded['xbid_mw'] == pytest.approx(-30.0, abs=0.1)  # full charge
-        assert decoded['xbid_price_offset'] == pytest.approx(-10.0, abs=0.1)
+        assert decoded['xbid_price_offset'] == pytest.approx(-50.0, abs=0.1)
         assert decoded['mfrr_mw'] == pytest.approx(-30.0, abs=0.1)
 
     def test_clipping(self, sac_env):
@@ -1496,7 +1496,7 @@ class TestContinuousToAbsolute:
     def test_xbid_price_offset_range(self, sac_env):
         """I verify XBID price offset maps correctly within range."""
         # I test several values
-        for cont_val, expected_offset in [(-1.0, -10.0), (0.0, 0.0), (0.5, 5.0), (1.0, 10.0)]:
+        for cont_val, expected_offset in [(-1.0, -50.0), (0.0, 0.0), (0.5, 25.0), (1.0, 50.0)]:
             action = np.array([0.0, 0.0, 0.0, cont_val, 0.0, 0.0, 0.0], dtype=np.float32)
             decoded = sac_env._decode_action(action)
             assert decoded['xbid_price_offset'] == pytest.approx(expected_offset, abs=0.1)
@@ -1702,7 +1702,7 @@ class TestRewardCalculator:
     def test_reward_calculator_settable(self, sac_env):
         """I verify degradation cost can be updated."""
         sac_env.reward_calculator.degradation_cost = 10.0
-        assert sac_env._inner.reward_calculator.degradation_cost == 10.0
+        assert sac_env._inner.reward_calculator.degradation_cost == 50.0
 
 
 class TestEpisodeCompletion:
