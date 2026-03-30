@@ -183,9 +183,17 @@ class BatteryEnvUnified(gym.Env):
         self.dam_bidder_min_spread = dam_bidder_min_spread
         self.dam_schedule = None  # I store the 24h schedule generated at episode reset
 
-        # I create DamBidSimulator for EUPHEMIA acceptance simulation
+        # I create DamOptimizer + DamBidSimulator for daily DAM scheduling
         if enable_endogenous_dam:
-            from gym_envs.market_executors.dam_executor import DamBidSimulator
+            from gym_envs.market_executors.dam_executor import DamBidSimulator, DamOptimizer
+            self._dam_optimizer = DamOptimizer(
+                max_power_mw=max_power_mw,
+                capacity_mwh=capacity_mwh,
+                efficiency=efficiency,
+                min_soc=min_soc,
+                max_soc=max_soc,
+                time_step_hours=time_step_hours,
+            )
             self._dam_bid_simulator = DamBidSimulator(
                 max_power_mw=max_power_mw,
                 capacity_mwh=capacity_mwh,
@@ -194,6 +202,7 @@ class BatteryEnvUnified(gym.Env):
                 max_soc=max_soc,
             )
         else:
+            self._dam_optimizer = None
             self._dam_bid_simulator = None
 
         # I store IDA schedule configuration
@@ -515,14 +524,48 @@ class BatteryEnvUnified(gym.Env):
             self.ida1_locked_today = False
             self.ida2_locked_today = False
             self.ida3_locked_today = False
-            # I regenerate endogenous DAM schedule for the new day
+            # I regenerate DAM schedule for the new day using DamOptimizer or fallback
             if self.enable_endogenous_dam:
-                self.dam_schedule = self._generate_endogenous_dam_schedule()
+                if hasattr(self, '_dam_optimizer') and self._dam_optimizer is not None:
+                    # I use the LP-based DamOptimizer (preferred)
+                    forecast = self._get_dam_forecast_for_day()
+                    self.dam_schedule = self._dam_optimizer.optimize(
+                        forecast, current_soc=self.soc, n_slots=self._day_length[self._step_day_id[self.current_step]]
+                    )
+                else:
+                    # I fall back to legacy rule-based schedule
+                    self.dam_schedule = self._generate_endogenous_dam_schedule()
                 self._dam_schedule_day_id = self._step_day_id[self.current_step]
 
             # I run EUPHEMIA bid simulation if DamBidSimulator is available
             if hasattr(self, '_dam_bid_simulator') and self._dam_bid_simulator is not None:
                 self._run_dam_bid_simulation()
+
+    def _get_dam_forecast_for_day(self) -> np.ndarray:
+        """I get price forecast for the current day (for DamOptimizer).
+
+        I use actual prices + noise as forecast (simulates ML forecaster uncertainty).
+        In production, this would use the real DAM forecaster.
+        """
+        day_id = self._step_day_id[self.current_step]
+        start = self._day_start[day_id]
+        length = self._day_length[day_id]
+
+        prices = np.zeros(length)
+        for i in range(length):
+            idx = min(start + i, len(self.df) - 1)
+            prices[i] = self.df.iloc[idx].get('price', 80.0)
+
+        # I add forecast noise (realistic uncertainty, not oracle)
+        if hasattr(self, 'dam_forecast_bias'):
+            bias = self.dam_forecast_bias
+        else:
+            bias = np.random.uniform(-12, 12)
+            self.dam_forecast_bias = bias
+
+        noise = np.random.normal(bias, 18.0, length)
+        forecast = np.maximum(5.0, prices + noise)
+        return forecast
 
     def set_degradation_cost(self, cost: float):
         """I allow the degradation curriculum callback to update the cost mid-training."""

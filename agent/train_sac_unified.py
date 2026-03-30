@@ -267,7 +267,7 @@ def train_sac_unified(
     forecaster_path: str = "models/intraday_forecaster.pkl",
     enable_market_forecast: bool = False,
     market_forecaster_path: str = "models/market_forecaster.pkl",
-    enable_endogenous_dam: bool = False,
+    enable_endogenous_dam: bool = True,  # DAM optimizer manages daily schedule
     dam_bidder_min_spread: float = 30.0,
     mfrr_activation_rate: float = 0.20,  # I reduced from 0.35 — real ADMIE avg is 15-25%
     mfrr_price_cap: float = 1000.0,  # I raised from 500 — real Greek mFRR reaches ~1190 EUR/MWh

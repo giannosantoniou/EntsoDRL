@@ -104,6 +104,11 @@ class BatteryEnvUnifiedSAC(gym.Env):
         self._enable_availability_contract = enable_availability_contract
         self.AVAILABILITY_CONTRACT_EUR_PER_MW_PER_HOUR = availability_eur_per_mw_hour
 
+        # Fix 3: I set soc_penalty_coeff=0 in reward calculator to avoid double
+        # calendar aging (SAC wrapper has its own, more realistic model)
+        if hasattr(self._inner, 'reward_calculator') and self._inner.reward_calculator is not None:
+            self._inner.reward_calculator.soc_penalty_coeff = 0.0
+
         # I cache physics constants from inner env
         self._max_power = self._inner.max_power_mw
         self._capacity = self._inner.capacity_mwh
@@ -295,14 +300,24 @@ class BatteryEnvUnifiedSAC(gym.Env):
             committed = min(abs(afrr_mw), self._max_power)
             env.afrr_commitment_mw = committed
 
-            # MERIT ORDER selection: I compare agent bid vs clearing price
+            # SMOOTH MERIT ORDER: I compare agent bid vs clearing price
+            # Instead of hard cutoff, I use a sigmoid probability based on
+            # how far the bid is from clearing. This gives smooth gradient.
             clearing_price = row.get('afrr_cap_up_price', 20.0)
-            reference_price = clearing_price  # I use market clearing as reference
-            agent_bid_price = reference_price * price_tier  # tier 0.7-1.3 × clearing
+            agent_bid_price = clearing_price * price_tier  # tier 0.7-1.3 × clearing
 
-            # I am selected if my bid is at or below clearing (cheapest wins)
-            env.is_selected_for_afrr = (agent_bid_price <= clearing_price * 1.05
-                                         and committed > self.MIN_BID_BALANCING_MW)
+            # I compute selection probability: sigmoid centered at clearing price
+            # bid << clearing → prob ≈ 1.0 (cheap bid, always wins)
+            # bid ≈ clearing → prob ≈ 0.5 (marginal bid)
+            # bid >> clearing → prob ≈ 0.0 (expensive bid, never wins)
+            if clearing_price > 0.1 and committed > self.MIN_BID_BALANCING_MW:
+                ratio = agent_bid_price / clearing_price  # <1 = cheap, >1 = expensive
+                # I use logistic function: p = 1 / (1 + exp(k*(ratio - 1)))
+                # k=10 gives smooth transition: 0.73→1.00 ratio maps to 95%→50% prob
+                selection_prob = 1.0 / (1.0 + np.exp(10.0 * (ratio - 1.0)))
+                env.is_selected_for_afrr = np.random.random() < selection_prob
+            else:
+                env.is_selected_for_afrr = False
             env._afrr_steps_remaining = env._afrr_block_steps
         else:
             env._afrr_steps_remaining -= 1
@@ -349,6 +364,8 @@ class BatteryEnvUnifiedSAC(gym.Env):
         mFRR is TSO-activated: when the grid needs balancing, the TSO calls
         on available reserves. The battery must respond with full available
         capacity. This is deterministic from ADMIE data — no random rolls.
+
+        I also check SoC limits — can't discharge if SoC too low, can't charge if too high.
         """
         result = {'mfrr_mw': 0.0, 'mfrr_price': 0.0, 'activated': False}
 
@@ -358,21 +375,32 @@ class BatteryEnvUnifiedSAC(gym.Env):
         if remaining_capacity_mw < self.MIN_BID_BALANCING_MW:
             return result
 
+        # I compute SoC-constrained capacity
+        soc = self._inner.soc
+        max_discharge_mw = min(
+            remaining_capacity_mw,
+            (soc - self._min_soc) * self._capacity * self._eff_sqrt / self._time_step
+        )
+        max_charge_mw = min(
+            remaining_capacity_mw,
+            (self._max_soc - soc) * self._capacity / self._eff_sqrt / self._time_step
+        )
+
         # DETERMINISTIC: I check if TSO activated mFRR this step
         real_up = row.get('mfrr_activated_up_mwh', 0.0)
         real_down = row.get('mfrr_activated_down_mwh', 0.0)
 
-        if real_up > 0.5:
-            # TSO needs upward regulation → I discharge with all available capacity
+        if real_up > 0.5 and max_discharge_mw >= self.MIN_BID_BALANCING_MW:
+            # TSO needs upward regulation → I discharge with SoC-constrained capacity
             result['activated'] = True
-            result['mfrr_mw'] = min(remaining_capacity_mw, self._max_power)
+            result['mfrr_mw'] = max_discharge_mw
             result['mfrr_price'] = min(row.get('mfrr_price_up', 100.0),
                                        self._inner.mfrr_price_cap)
 
-        elif real_down > 0.5:
-            # TSO needs downward regulation → I charge with all available capacity
+        elif real_down > 0.5 and max_charge_mw >= self.MIN_BID_BALANCING_MW:
+            # TSO needs downward regulation → I charge with SoC-constrained capacity
             result['activated'] = True
-            result['mfrr_mw'] = -min(remaining_capacity_mw, self._max_power)
+            result['mfrr_mw'] = -max_charge_mw
             result['mfrr_price'] = min(row.get('mfrr_price_down', 80.0),
                                        self._inner.mfrr_price_cap)
 
