@@ -151,12 +151,12 @@ class TestObservationSpace:
 
     def test_observation_shape(self, unified_env):
         """I verify the observation space is 70 features."""
-        assert unified_env.observation_space.shape == (72,)
+        assert unified_env.observation_space.shape == (80,)
 
     def test_observation_reset(self, unified_env):
         """I verify observation is correctly shaped after reset."""
         obs, info = unified_env.reset(seed=42)
-        assert obs.shape == (72,)
+        assert obs.shape == (80,)
         assert not np.any(np.isnan(obs))
         assert not np.any(np.isinf(obs))
 
@@ -165,7 +165,7 @@ class TestObservationSpace:
         unified_env.reset(seed=42)
         action = np.array([0, 2, 5, 5])  # No aFRR, neutral price, idle ID, idle mFRR
         obs, reward, done, truncated, info = unified_env.step(action)
-        assert obs.shape == (72,)
+        assert obs.shape == (80,)
         assert isinstance(reward, (int, float))
 
     def test_cycles_remaining_feature(self, unified_env):
@@ -1555,9 +1555,9 @@ class Test15MinResolution:
 
     def test_obs_shape_15min(self, env_15min):
         """I verify observation space is still 70 features at 15-min resolution."""
-        assert env_15min.observation_space.shape == (72,)
+        assert env_15min.observation_space.shape == (80,)
         obs, info = env_15min.reset(seed=42)
-        assert obs.shape == (72,)
+        assert obs.shape == (80,)
         assert not np.any(np.isnan(obs))
 
     def test_sph_value(self, env_15min):
@@ -1640,10 +1640,10 @@ class Test15MinResolution:
         )
 
         assert env_1h._sph == 1
-        assert env_1h.observation_space.shape == (72,)
+        assert env_1h.observation_space.shape == (80,)
 
         obs, info = env_1h.reset(seed=42)
-        assert obs.shape == (72,)
+        assert obs.shape == (80,)
 
         # I verify a full episode runs without errors
         for _ in range(50):
@@ -2134,9 +2134,9 @@ class TestBackwardCompat:
 
     def test_legacy_obs_72(self, unified_env):
         """I verify 70-feature observation when flag is False."""
-        assert unified_env.observation_space.shape == (72,)
+        assert unified_env.observation_space.shape == (80,)
         obs, info = unified_env.reset(seed=42)
-        assert obs.shape == (72,)
+        assert obs.shape == (80,)
 
     def test_legacy_mask_32(self, unified_env):
         """I verify 32-element mask when flag is False."""
@@ -2151,7 +2151,7 @@ class TestBackwardCompat:
         for _ in range(30):
             action = np.array([0, 2, 5, 5])  # Idle
             obs, reward, done, truncated, info = unified_env.step(action)
-            assert obs.shape == (72,)
+            assert obs.shape == (80,)
             assert np.isfinite(reward)
             if done or truncated:
                 break
@@ -2174,7 +2174,7 @@ class TestSeparateRevenueTracking:
     def test_full_market_obs_shape(self, full_market_env):
         """I verify 83-feature observation in full market mode."""
         obs, info = full_market_env.reset(seed=42)
-        assert obs.shape == (85,)
+        assert obs.shape == (93,)
         assert not np.any(np.isnan(obs))
         assert not np.any(np.isinf(obs))
 
@@ -2185,7 +2185,7 @@ class TestSeparateRevenueTracking:
         for _ in range(30):
             action = full_market_env.action_space.sample()
             obs, reward, done, truncated, info = full_market_env.step(action)
-            assert obs.shape == (85,)
+            assert obs.shape == (93,)
             assert np.isfinite(reward)
             assert 0.05 <= info['soc'] <= 0.95
             if done or truncated:
@@ -2283,9 +2283,9 @@ class TestIntraDayForecast:
 
     def test_backward_compat_72(self, unified_env):
         """70 features when forecast disabled."""
-        assert unified_env.observation_space.shape == (72,)
+        assert unified_env.observation_space.shape == (80,)
         obs, info = unified_env.reset(seed=42)
-        assert obs.shape == (72,)
+        assert obs.shape == (80,)
 
     def test_forecast_features_range(self, forecast_env):
         """Forecast values in reasonable range (0.2-3.0 = 20-300 EUR/100)."""
@@ -2348,9 +2348,9 @@ class TestIntraDayForecast:
             forecast_noise=False,
         )
 
-        assert env.observation_space.shape == (94,)
+        assert env.observation_space.shape == (102,)
         obs, info = env.reset(seed=42)
-        assert obs.shape == (94,)
+        assert obs.shape == (102,)
         assert not np.any(np.isnan(obs))
         assert not np.any(np.isinf(obs))
 
@@ -2712,10 +2712,10 @@ class TestMarketForecastFeatures:
             random_start=False,
             enable_market_forecast=True,
         )
-        assert env.observation_space.shape == (94,)
+        assert env.observation_space.shape == (102,)
 
         obs, _ = env.reset(seed=42)
-        assert obs.shape == (94,)
+        assert obs.shape == (102,)
         assert not np.any(np.isnan(obs))
         assert not np.any(np.isinf(obs))
 
@@ -2781,7 +2781,7 @@ class TestMarketForecastFeatures:
         for _ in range(10):
             action = np.array([0, 2, 5, 5])  # idle
             obs, reward, done, truncated, info = env.step(action)
-            assert obs.shape == (94,)
+            assert obs.shape == (102,)
             assert np.isfinite(reward)
             if done or truncated:
                 break
@@ -2798,10 +2798,10 @@ class TestMarketForecastFeatures:
             episode_length=72,
             random_start=False,
         )
-        assert env.observation_space.shape == (72,)
+        assert env.observation_space.shape == (80,)
 
         obs, _ = env.reset(seed=42)
-        assert obs.shape == (72,)
+        assert obs.shape == (80,)
 
 
 class TestSituationalAwareness:
@@ -2946,7 +2946,7 @@ class TestEndogenousDAM:
         for _ in range(20):
             action = np.array([0, 2, 5, 5])  # idle
             obs, reward, done, truncated, info = env.step(action)
-            assert obs.shape == (72,)  # No forecast features
+            assert obs.shape == (80,)  # No forecast features
             assert np.isfinite(reward)
             if done or truncated:
                 break
@@ -2997,15 +2997,15 @@ class TestEndogenousDAM:
             dam_bidder_min_spread=10.0,
         )
 
-        assert env.observation_space.shape == (94,)
+        assert env.observation_space.shape == (102,)
 
         obs, _ = env.reset(seed=42)
-        assert obs.shape == (94,)
+        assert obs.shape == (102,)
 
         for _ in range(10):
             action = np.array([0, 2, 5, 5])
             obs, reward, done, truncated, info = env.step(action)
-            assert obs.shape == (94,)
+            assert obs.shape == (102,)
             assert np.isfinite(reward)
             if done or truncated:
                 break
@@ -4283,7 +4283,7 @@ class TestObservationImbalanceFeatures:
             df=sample_data, episode_length=72, random_start=False
         )
         obs, _ = env.reset(seed=42)
-        assert obs.shape == (72,), f"Expected 70 features, got {obs.shape}"
+        assert obs.shape == (80,), f"Expected 70 features, got {obs.shape}"
 
 
 class TestAFRRHighestValueRule:
@@ -4605,11 +4605,11 @@ class TestSoCAwareDAMBidder:
             random_start=False,
         )
 
-        assert env.observation_space.shape == (72,), \
+        assert env.observation_space.shape == (80,), \
             f"Expected (72,), got {env.observation_space.shape}"
 
         obs, _ = env.reset(seed=42)
-        assert obs.shape == (72,), f"Expected obs (72,), got {obs.shape}"
+        assert obs.shape == (80,), f"Expected obs (72,), got {obs.shape}"
 
     def test_predicted_soc_eod_feature(self, sample_data):
         """I verify predicted_soc_eod feature is in valid range [0,1]."""

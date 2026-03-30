@@ -360,7 +360,7 @@ class BatteryEnvUnified(gym.Env):
             ])
 
         # I compute dynamic observation size based on enabled feature groups
-        n_obs = 72  # Base features (Groups 1-9) + DAM acceptance (was 70, +2 for EUPHEMIA)
+        n_obs = 80  # Base features (Groups 1-9) + DAM acceptance + Trading Signals (72+8)
         if self.enable_forecast:
             n_obs += 9   # IntraDay forecast + RES fundamentals
         if self.enable_market_forecast:

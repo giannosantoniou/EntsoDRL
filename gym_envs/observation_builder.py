@@ -55,6 +55,9 @@ class ObservationBuilder:
         self._add_market_phase(features, env, row, ts)
         self._add_timing_signals(features, env, row, ts)
 
+        # Group 10c: Trading Signals (always enabled, 8 features)
+        self._add_trading_signals(features, env, row, ts)
+
         if env.enable_forecast:
             self._add_forecast_features(features, env, row)
         if env.enable_market_forecast:
@@ -64,7 +67,7 @@ class ObservationBuilder:
 
         # I validate and clean
         obs = np.array(features, dtype=np.float32)
-        expected_features = 72  # I updated from 70: +2 DAM acceptance features in Group 7
+        expected_features = 80  # 72 base + 8 trading signals
         if env.enable_forecast:
             expected_features += 9
         if env.enable_market_forecast:
@@ -310,6 +313,53 @@ class ObservationBuilder:
 
         hours_to_peak = min(abs(19 - hour), abs(19 - hour + 24)) / 12.0
         features.append(hours_to_peak)
+
+    def _add_trading_signals(self, features, env, row, ts):
+        """Group 10c: Trading Decision Signals (8 features, always enabled).
+
+        I provide the agent with high-level signals that a human trader uses:
+        1. DAM forecast summary (where are spikes/valleys?)
+        2. Buy/sell opportunity signal (should I trade now or wait?)
+        3. Weather-driven supply signal (wind/solar affect prices)
+        4. Weekly pattern (weekend = cheaper)
+        """
+        dam_price = row.get('price', 100.0)
+
+        # A. DAM Forecast Summary (3 features)
+        fc_mean = row.get('dam_forecast_next_4h_mean', dam_price)
+        fc_max = row.get('dam_forecast_next_4h_max', dam_price)
+        fc_min = row.get('dam_forecast_next_4h_min', dam_price)
+        fc_spread = max(0, fc_max - fc_min)
+
+        features.append(fc_spread / 100.0)  # [72] How volatile is the forecast?
+        features.append(np.clip((fc_max - dam_price) / 100.0, -1, 1))  # [73] Upside potential
+        features.append(np.clip((dam_price - fc_min) / 100.0, -1, 1))  # [74] Downside potential
+
+        # B. Buy/Sell Opportunity Signal (2 features)
+        # I compute: is now a good time to buy or sell?
+        # Based on where current price sits vs forecast range
+        if fc_spread > 5.0:  # Only meaningful if spread > 5 EUR
+            # Normalized position: -1 = at forecast min (buy!), +1 = at forecast max (sell!)
+            position = np.clip((dam_price - fc_min) / max(fc_spread, 1.0) * 2 - 1, -1, 1)
+        else:
+            position = 0.0  # Flat market, no clear signal
+        features.append(position)  # [75] Price position in forecast range
+
+        # I compute spread opportunity: larger spread = more profit potential
+        spread_opportunity = fc_spread / max(fc_mean, 1.0)
+        features.append(np.clip(spread_opportunity, 0, 2))  # [76] Spread opportunity ratio
+
+        # C. Weather/Supply Signal (2 features)
+        # I normalize wind and solar by typical values
+        wind = row.get('wind_onshore', 0.0)
+        solar = row.get('solar', 0.0)
+        features.append(min(wind / 2000.0, 1.5))  # [77] Wind generation (high = cheap prices)
+        features.append(min(solar / 1500.0, 1.5))  # [78] Solar generation (high = cheap midday)
+
+        # D. Weekly Pattern (1 feature)
+        # Weekend prices are typically 15-25% lower
+        is_weekend = 1.0 if ts.dayofweek >= 5 else 0.0
+        features.append(is_weekend)  # [79] Weekend flag
 
     def _add_forecast_features(self, features, env, row):
         """Group 10: IntraDay Forecast + RES Fundamentals (9 features)."""

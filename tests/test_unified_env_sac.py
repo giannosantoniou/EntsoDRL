@@ -656,12 +656,12 @@ class TestVecNormalizeCompatibility:
         vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False)
 
         obs = vec_env.reset()
-        assert obs.shape[1] == 72
+        assert obs.shape[1] == 80
 
         for _ in range(10):
             action = [vec_env.action_space.sample()]
             obs, reward, done, info = vec_env.step(action)
-            assert obs.shape[1] == 72
+            assert obs.shape[1] == 80
             assert np.all(np.isfinite(obs))
 
     def test_observation_normalization_stable(self, sample_data):
@@ -1301,12 +1301,12 @@ class TestVecNormalizeCompatibility:
         vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False)
 
         obs = vec_env.reset()
-        assert obs.shape[1] == 72
+        assert obs.shape[1] == 80
 
         for _ in range(10):
             action = [vec_env.action_space.sample()]
             obs, reward, done, info = vec_env.step(action)
-            assert obs.shape[1] == 72
+            assert obs.shape[1] == 80
             assert np.all(np.isfinite(obs))
 
     def test_observation_normalization_stable(self, sample_data):
@@ -1797,12 +1797,12 @@ class TestVecNormalizeCompatibility:
         vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False)
 
         obs = vec_env.reset()
-        assert obs.shape[1] == 72
+        assert obs.shape[1] == 80
 
         for _ in range(10):
             action = [vec_env.action_space.sample()]
             obs, reward, done, info = vec_env.step(action)
-            assert obs.shape[1] == 72
+            assert obs.shape[1] == 80
             assert np.all(np.isfinite(obs))
 
     def test_observation_normalization_stable(self, sample_data):
