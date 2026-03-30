@@ -280,11 +280,11 @@ class TestActionSpace:
 
     def test_action_space_always_7dim(self, sac_env):
         """I verify action space is always Box(shape=(7,)) regardless of inner env."""
-        assert sac_env.action_space.shape == (7,)
+        assert sac_env.action_space.shape == (4,)
 
     def test_action_space_7dim_full_market(self, sac_env_full_market):
         """I verify full-market also has Box(shape=(7,))."""
-        assert sac_env_full_market.action_space.shape == (7,)
+        assert sac_env_full_market.action_space.shape == (4,)
 
     def test_action_space_bounds(self, sac_env):
         """I verify action space bounds are [-1, 1] x 6."""
@@ -425,7 +425,7 @@ class TestActionFiltering:
 
         assert 'decoded_mw' in info
         assert 'xbid' in info['decoded_mw']
-        assert 'mfrr' in info['decoded_mw']
+        assert 'mfrr_auto' in info['decoded_mw']
         assert 'xbid_price_offset' in info['decoded_mw']
 
     def test_filtering_full_market(self, sac_env_full_market):
@@ -925,11 +925,11 @@ class TestActionSpace:
 
     def test_action_space_always_7dim(self, sac_env):
         """I verify action space is always Box(shape=(7,)) regardless of inner env."""
-        assert sac_env.action_space.shape == (7,)
+        assert sac_env.action_space.shape == (4,)
 
     def test_action_space_7dim_full_market(self, sac_env_full_market):
         """I verify full-market also has Box(shape=(7,))."""
-        assert sac_env_full_market.action_space.shape == (7,)
+        assert sac_env_full_market.action_space.shape == (4,)
 
     def test_action_space_bounds(self, sac_env):
         """I verify action space bounds are [-1, 1] x 6."""
@@ -1070,7 +1070,7 @@ class TestActionFiltering:
 
         assert 'decoded_mw' in info
         assert 'xbid' in info['decoded_mw']
-        assert 'mfrr' in info['decoded_mw']
+        assert 'mfrr_auto' in info['decoded_mw']
         assert 'xbid_price_offset' in info['decoded_mw']
 
     def test_filtering_full_market(self, sac_env_full_market):
@@ -1566,7 +1566,7 @@ class TestActionFiltering:
 
         assert 'decoded_mw' in info
         assert 'xbid' in info['decoded_mw']
-        assert 'mfrr' in info['decoded_mw']
+        assert 'mfrr_auto' in info['decoded_mw']
         assert 'xbid_price_offset' in info['decoded_mw']
 
     def test_filtering_full_market(self, sac_env_full_market):

@@ -39,7 +39,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
     }
     CYCLE_TARGET = 5.0
     XBID_PRICE_OFFSET_MAX = 50.0  # EUR/MWh (±50 for volatile intraday near gate closure)
-    N_ACTIONS = 7
+    N_ACTIONS = 4  # aFRR_commit, aFRR_price, XBID_mw, XBID_price_offset
 
     # Fix 1: Network charges (Use-of-System fees)
     # I apply ~4 EUR/MWh per direction (charge and discharge)
@@ -152,32 +152,43 @@ class BatteryEnvUnifiedSAC(gym.Env):
     # ─── Action decoding ──────────────────────────────────────────
 
     def _decode_action(self, action: np.ndarray) -> dict:
-        """I convert continuous [-1,+1] to absolute MW + price offset."""
+        """I convert continuous [-1,+1] to absolute MW + price offset.
+
+        Action space (4D):
+          [0] aFRR commitment: 0..max_power MW
+          [1] aFRR price tier: 0.7..1.3 (bid aggressiveness)
+          [2] XBID quantity: -max_power..+max_power MW
+          [3] XBID price offset: -50..+50 EUR/MWh
+
+        mFRR is NOT controlled by agent (TSO auto-response).
+        DAM is NOT controlled by agent (LP optimizer at day boundary).
+        """
         a = np.clip(action, -1.0, 1.0)
         return {
             'afrr_mw': (a[0] + 1.0) / 2.0 * self._max_power,
             'afrr_price_tier': 0.7 + (a[1] + 1.0) / 2.0 * 0.6,
             'xbid_mw': a[2] * self._max_power,
             'xbid_price_offset': a[3] * self.XBID_PRICE_OFFSET_MAX,
-            'mfrr_mw': a[4] * self._max_power,
-            'freebid_mw': a[5] * self._max_power if self._is_full_market else 0.0,
-            'dam_aggressiveness': a[6],  # -1 (conservative) to +1 (aggressive)
         }
 
     def _enforce_constraints(self, d: dict) -> dict:
-        """I enforce capacity + SoC limits via proportional scaling."""
-        # I get DAM commitment (mandatory, pre-set)
-        dam_mw = abs(self._inner._get_dam_commitment(self._inner.current_step))
-        available = max(0.0, self._max_power - dam_mw)
+        """I enforce capacity + SoC limits for agent-controlled actions only.
 
-        # I scale down if total > available
-        total = abs(d['afrr_mw']) + abs(d['xbid_mw']) + abs(d['mfrr_mw']) + abs(d['freebid_mw'])
+        The agent controls ONLY aFRR commitment and XBID.
+        DAM is set by optimizer, mFRR is auto-response — not in this dict.
+        """
+        # I get DAM commitment (mandatory, set by DamOptimizer)
+        dam_mw = abs(self._inner._get_dam_commitment(self._inner.current_step))
+        # I reserve capacity for potential mFRR auto-response (~5 MW buffer)
+        mfrr_buffer = 5.0
+        available = max(0.0, self._max_power - dam_mw - mfrr_buffer)
+
+        # I scale down agent actions if total > available
+        total = abs(d['afrr_mw']) + abs(d['xbid_mw'])
         if total > available and total > 0.1:
             scale = available / total
             d['afrr_mw'] *= scale
             d['xbid_mw'] *= scale
-            d['mfrr_mw'] *= scale
-            d['freebid_mw'] *= scale
 
         # I enforce SoC limits
         soc = self._inner.soc
@@ -190,43 +201,28 @@ class BatteryEnvUnifiedSAC(gym.Env):
             (self._max_soc - soc) * self._capacity / self._eff_sqrt / self._time_step
         )
 
-        # I compute total discharge and charge across all markets
-        total_discharge = max(0, d['xbid_mw']) + max(0, d['mfrr_mw']) + max(0, d['freebid_mw'])
-        total_charge = abs(min(0, d['xbid_mw'])) + abs(min(0, d['mfrr_mw'])) + abs(min(0, d['freebid_mw']))
-
-        # I add DAM contribution
-        total_discharge += max(0, dam_mw)  # DAM sell = discharge
-        total_charge += abs(min(0, dam_mw))  # DAM buy = charge (negative commitment)
+        # I enforce SoC limits on agent-controlled actions (XBID only — aFRR is commitment, not energy)
+        dam_mw_signed = self._inner._get_dam_commitment(self._inner.current_step)
+        total_discharge = max(0, d['xbid_mw']) + max(0, dam_mw_signed)
+        total_charge = abs(min(0, d['xbid_mw'])) + abs(min(0, dam_mw_signed))
 
         if total_discharge > max_discharge_mw and total_discharge > 0.1:
-            # I only scale agent-controlled markets (not DAM)
-            agent_discharge = total_discharge - max(0, dam_mw)
+            agent_discharge = max(0, d['xbid_mw'])
             if agent_discharge > 0.1:
-                scale = max(0, max_discharge_mw - max(0, dam_mw)) / agent_discharge
-                scale = max(0, min(1, scale))
-                if d['xbid_mw'] > 0: d['xbid_mw'] *= scale
-                if d['mfrr_mw'] > 0: d['mfrr_mw'] *= scale
-                if d['freebid_mw'] > 0: d['freebid_mw'] *= scale
+                headroom = max(0, max_discharge_mw - max(0, dam_mw_signed))
+                d['xbid_mw'] = min(d['xbid_mw'], headroom)
 
         if total_charge > max_charge_mw and total_charge > 0.1:
-            agent_charge = total_charge - abs(min(0, dam_mw))
+            agent_charge = abs(min(0, d['xbid_mw']))
             if agent_charge > 0.1:
-                scale = max(0, max_charge_mw - abs(min(0, dam_mw))) / agent_charge
-                scale = max(0, min(1, scale))
-                if d['xbid_mw'] < 0: d['xbid_mw'] *= scale
-                if d['mfrr_mw'] < 0: d['mfrr_mw'] *= scale
-                if d['freebid_mw'] < 0: d['freebid_mw'] *= scale
+                headroom = max(0, max_charge_mw - abs(min(0, dam_mw_signed)))
+                d['xbid_mw'] = max(d['xbid_mw'], -headroom)
 
-        # Fix 3: I enforce minimum bid sizes (HEnEx rules)
-        # aFRR/mFRR: minimum 1 MW, DAM: minimum 0.1 MW
+        # I enforce minimum bid sizes (HEnEx rules)
         if abs(d['afrr_mw']) < self.MIN_BID_BALANCING_MW:
             d['afrr_mw'] = 0.0
         if abs(d['xbid_mw']) < self.MIN_BID_DAM_MW:
             d['xbid_mw'] = 0.0
-        if abs(d['mfrr_mw']) < self.MIN_BID_BALANCING_MW:
-            d['mfrr_mw'] = 0.0
-        if abs(d['freebid_mw']) < self.MIN_BID_BALANCING_MW:
-            d['freebid_mw'] = 0.0
 
         return d
 
@@ -274,10 +270,12 @@ class BatteryEnvUnifiedSAC(gym.Env):
         return {'dam_mw': dam_mw, 'dam_price': row.get('price', 100.0)}
 
     def _determine_afrr(self, afrr_mw: float, price_tier: float, row) -> dict:
-        """I determine aFRR commitment and activation. No SoC change.
+        """I determine aFRR commitment and activation using MERIT ORDER logic.
 
-        I handle 4-hour block selection and stochastic activation using ADMIE data,
-        but I do NOT update SoC — that happens in the single net execution step.
+        Selection: I compare agent's bid price vs market clearing price.
+          If agent bid <= clearing → selected (cheapest wins).
+        Activation: DETERMINISTIC from ADMIE data (no random rolls).
+          If TSO activated aFRR this step → battery must respond.
         """
         env = self._inner
         result = {
@@ -289,7 +287,6 @@ class BatteryEnvUnifiedSAC(gym.Env):
             'settlement_price': 0.0,
         }
 
-        # Fix 5: I check prequalification before allowing aFRR
         if not self.is_prequalified_afrr:
             return result
 
@@ -297,12 +294,15 @@ class BatteryEnvUnifiedSAC(gym.Env):
         if env._afrr_steps_remaining <= 0:
             committed = min(abs(afrr_mw), self._max_power)
             env.afrr_commitment_mw = committed
-            tso_requirement = row.get('afrr_cap_up_qty', 300.0)
-            estimated_pool = tso_requirement * 1.5
-            base_prob = min(0.85, committed / max(estimated_pool, 1.0) + 0.3)
-            tier_factor = 1.4 - price_tier * 0.4
-            selection_prob = np.clip(base_prob * tier_factor, 0.05, 0.90)
-            env.is_selected_for_afrr = np.random.random() < selection_prob
+
+            # MERIT ORDER selection: I compare agent bid vs clearing price
+            clearing_price = row.get('afrr_cap_up_price', 20.0)
+            reference_price = clearing_price  # I use market clearing as reference
+            agent_bid_price = reference_price * price_tier  # tier 0.7-1.3 × clearing
+
+            # I am selected if my bid is at or below clearing (cheapest wins)
+            env.is_selected_for_afrr = (agent_bid_price <= clearing_price * 1.05
+                                         and committed > self.MIN_BID_BALANCING_MW)
             env._afrr_steps_remaining = env._afrr_block_steps
         else:
             env._afrr_steps_remaining -= 1
@@ -310,33 +310,31 @@ class BatteryEnvUnifiedSAC(gym.Env):
         result['afrr_commitment_mw'] = env.afrr_commitment_mw
         result['is_selected'] = env.is_selected_for_afrr
 
-        # I calculate capacity revenue (financial, independent of physical)
+        # I calculate capacity revenue (if selected)
         if env.is_selected_for_afrr and env.afrr_commitment_mw > 0.1:
             cap_price = row.get('afrr_cap_up_price', 20.0)
             result['afrr_capacity_revenue'] = env.afrr_commitment_mw * cap_price * self._time_step
 
-        # I check activation using REAL ADMIE volumes
+        # DETERMINISTIC activation: I check if TSO actually activated aFRR this step
         if env.is_selected_for_afrr and env.afrr_commitment_mw > 0.1:
             afrr_act_up = row.get('afrr_activated_up_mwh', 0.0)
             afrr_act_down = row.get('afrr_activated_down_mwh', 0.0)
 
             if afrr_act_up > 0.5:
-                prob = min(0.70, env.afrr_commitment_mw / max(afrr_act_up, 1.0))
-                if np.random.random() < prob:
-                    result['is_activated'] = True
-                    result['afrr_energy_mw'] = min(env.afrr_commitment_mw, self._max_power)
-                    result['settlement_price'] = max(
-                        row.get('afrr_up', 100.0), row.get('mfrr_price_up', 100.0))
-                    env.steps_since_afrr_activation = 0
+                # TSO activated upward → I must discharge
+                result['is_activated'] = True
+                result['afrr_energy_mw'] = min(env.afrr_commitment_mw, self._max_power)
+                result['settlement_price'] = max(
+                    row.get('afrr_up', 100.0), row.get('mfrr_price_up', 100.0))
+                env.steps_since_afrr_activation = 0
 
             elif afrr_act_down > 0.5:
-                prob = min(0.70, env.afrr_commitment_mw / max(afrr_act_down, 1.0))
-                if np.random.random() < prob:
-                    result['is_activated'] = True
-                    result['afrr_energy_mw'] = -min(env.afrr_commitment_mw, self._max_power)
-                    result['settlement_price'] = max(
-                        row.get('afrr_down', 80.0), row.get('mfrr_price_down', 80.0))
-                    env.steps_since_afrr_activation = 0
+                # TSO activated downward → I must charge
+                result['is_activated'] = True
+                result['afrr_energy_mw'] = -min(env.afrr_commitment_mw, self._max_power)
+                result['settlement_price'] = max(
+                    row.get('afrr_down', 80.0), row.get('mfrr_price_down', 80.0))
+                env.steps_since_afrr_activation = 0
 
             if not result['is_activated']:
                 env.steps_since_afrr_activation += 1
@@ -345,35 +343,38 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
         return result
 
-    def _determine_mfrr(self, mfrr_mw: float, row) -> dict:
-        """I determine mFRR activation using ADMIE data. No SoC change."""
+    def _determine_mfrr_auto(self, remaining_capacity_mw: float, row) -> dict:
+        """I auto-respond to TSO mFRR activation. Agent does NOT control this.
+
+        mFRR is TSO-activated: when the grid needs balancing, the TSO calls
+        on available reserves. The battery must respond with full available
+        capacity. This is deterministic from ADMIE data — no random rolls.
+        """
         result = {'mfrr_mw': 0.0, 'mfrr_price': 0.0, 'activated': False}
 
-        # Fix 5: I check prequalification before allowing mFRR
         if not self.is_prequalified_mfrr:
             return result
 
-        if abs(mfrr_mw) < 0.1:
+        if remaining_capacity_mw < self.MIN_BID_BALANCING_MW:
             return result
 
-        real_activated_up = row.get('mfrr_activated_up_mwh', 0.0)
-        real_activated_down = row.get('mfrr_activated_down_mwh', 0.0)
+        # DETERMINISTIC: I check if TSO activated mFRR this step
+        real_up = row.get('mfrr_activated_up_mwh', 0.0)
+        real_down = row.get('mfrr_activated_down_mwh', 0.0)
 
-        if mfrr_mw > 0 and real_activated_up > 0.5:
-            prob = min(0.60, abs(mfrr_mw) / max(real_activated_up, 1.0))
-            if np.random.random() < prob:
-                result['activated'] = True
-                result['mfrr_mw'] = mfrr_mw
-                result['mfrr_price'] = min(row.get('mfrr_price_up', 100.0),
-                                           self._inner.mfrr_price_cap)
+        if real_up > 0.5:
+            # TSO needs upward regulation → I discharge with all available capacity
+            result['activated'] = True
+            result['mfrr_mw'] = min(remaining_capacity_mw, self._max_power)
+            result['mfrr_price'] = min(row.get('mfrr_price_up', 100.0),
+                                       self._inner.mfrr_price_cap)
 
-        elif mfrr_mw < 0 and real_activated_down > 0.5:
-            prob = min(0.60, abs(mfrr_mw) / max(real_activated_down, 1.0))
-            if np.random.random() < prob:
-                result['activated'] = True
-                result['mfrr_mw'] = mfrr_mw
-                result['mfrr_price'] = min(row.get('mfrr_price_down', 80.0),
-                                           self._inner.mfrr_price_cap)
+        elif real_down > 0.5:
+            # TSO needs downward regulation → I charge with all available capacity
+            result['activated'] = True
+            result['mfrr_mw'] = -min(remaining_capacity_mw, self._max_power)
+            result['mfrr_price'] = min(row.get('mfrr_price_down', 80.0),
+                                       self._inner.mfrr_price_cap)
 
         return result
 
@@ -397,8 +398,9 @@ class BatteryEnvUnifiedSAC(gym.Env):
         soc = self._inner.soc
         margin = 0.05
 
-        net_discharge = max(0, d['xbid_mw']) + max(0, d['mfrr_mw']) + max(0, d['freebid_mw'])
-        net_charge = abs(min(0, d['xbid_mw'])) + abs(min(0, d['mfrr_mw'])) + abs(min(0, d['freebid_mw']))
+        # I only penalize agent-controlled actions (XBID)
+        net_discharge = max(0, d.get('xbid_mw', 0))
+        net_charge = abs(min(0, d.get('xbid_mw', 0)))
         discharge_intensity = net_discharge / self._max_power
         charge_intensity = net_charge / self._max_power
 
@@ -436,57 +438,44 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
         This ensures energy balance: energy_in - energy_out = SoC_change × capacity
         """
-        # I decode and constrain
+        # I decode agent's REAL-TIME decisions (aFRR commitment + XBID only)
         decoded = self._decode_action(action)
         decoded = self._enforce_constraints(decoded)
 
-        # I pass agent's DAM aggressiveness to inner env before day reset
-        # (day reset triggers DAM bid generation which uses aggressiveness)
-        self._inner.dam_aggressiveness = decoded.get('dam_aggressiveness', 0.0)
-
-        # I check day boundary (resets daily cycles, IDA schedules, DAM bids)
+        # I check day boundary (DamOptimizer runs here, resets daily state)
         self._inner._check_day_reset()
 
         # I get current market data
         row = self._inner.df.iloc[self._inner.current_step]
 
-        # ── Phase 1: Determine market positions with PRIORITY CASCADE ──
-        # Priority: DAM (mandatory) → aFRR (if selected) → mFRR → XBID
-        # I allocate inverter capacity in priority order. Lower-priority markets
-        # get only the REMAINING capacity after higher-priority markets.
+        # ── Phase 1: HIERARCHICAL PRIORITY CASCADE ──
+        # Priority: DAM (mandatory) → aFRR (mandatory if activated) → mFRR (auto) → XBID (agent)
 
+        # 1. DAM (mandatory, set by DamOptimizer at day boundary)
         dam = self._determine_dam(row)
         dam_mw = dam['dam_mw']
+        remaining_capacity = max(0.0, self._max_power - abs(dam_mw))
 
-        # I calculate remaining inverter capacity after DAM
-        remaining_capacity = self._max_power - abs(dam_mw)
-        remaining_capacity = max(0.0, remaining_capacity)
-
-        # aFRR (2nd priority — mandatory if selected by TSO)
+        # 2. aFRR (agent controls commitment, activation is deterministic/merit-order)
         afrr = self._determine_afrr(
             min(abs(decoded['afrr_mw']), remaining_capacity),
             decoded['afrr_price_tier'], row)
         afrr_energy_mw = afrr['afrr_energy_mw']
-        remaining_capacity -= abs(afrr_energy_mw)
-        remaining_capacity = max(0.0, remaining_capacity)
+        remaining_capacity = max(0.0, remaining_capacity - abs(afrr_energy_mw))
 
-        # mFRR (3rd priority — TSO-activated)
-        mfrr_requested = np.clip(decoded['mfrr_mw'], -remaining_capacity, remaining_capacity)
-        mfrr = self._determine_mfrr(mfrr_requested, row)
+        # 3. mFRR (AUTO-RESPONSE — agent does NOT control, TSO deterministic)
+        mfrr = self._determine_mfrr_auto(remaining_capacity, row)
         mfrr_mw = mfrr['mfrr_mw']
-        remaining_capacity -= abs(mfrr_mw)
-        remaining_capacity = max(0.0, remaining_capacity)
+        remaining_capacity = max(0.0, remaining_capacity - abs(mfrr_mw))
 
-        # XBID (lowest priority — agent-controlled, uses remaining capacity)
+        # 4. XBID (agent-controlled, uses remaining capacity)
         xbid_mw = np.clip(decoded['xbid_mw'], -remaining_capacity, remaining_capacity)
-
-        # XBID fill probability — orders may not fill in continuous market
         xbid_price_info = self._determine_xbid_price(xbid_mw, decoded['xbid_price_offset'], row)
+
+        # I model XBID fill probability (continuous market, not guaranteed)
         if abs(xbid_mw) > 0.1:
             xbid_mid = (row.get('xbid_price_bid', 98.0) + row.get('xbid_price_ask', 102.0)) / 2
             price_distance = abs(xbid_price_info['price'] - xbid_mid)
-            # I model fill probability: near mid-price = high fill, far = low fill
-            # At 0 EUR distance: 95% fill. At 20 EUR: 50%. At 50 EUR: 10%.
             fill_prob = np.clip(0.95 - price_distance * 0.02, 0.05, 0.95)
             if np.random.random() > fill_prob:
                 xbid_mw = 0.0  # Order not filled
@@ -524,16 +513,18 @@ class BatteryEnvUnifiedSAC(gym.Env):
             mfrr_revenue = mfrr_mw * mfrr['mfrr_price'] * self._time_step
         afrr_cap_revenue = afrr['afrr_capacity_revenue']
 
-        # Fix 12: Availability contract revenue (fixed payment, independent of trading)
+        # Availability contract: I track for accounting but EXCLUDE from RL reward
+        # It's a constant +99 EUR/step regardless of agent action — adds no learning signal
         availability_revenue = 0.0
         if self._enable_availability_contract:
             availability_revenue = (self._max_power *
                                     self.AVAILABILITY_CONTRACT_EUR_PER_MW_PER_HOUR *
                                     self._time_step)
 
-        # I compute total market revenue for this step
+        # I compute TRADING revenue only (agent-influenced, for RL reward)
         total_revenue = (dam_revenue + afrr_energy_revenue + afrr_cap_revenue +
-                        xbid_revenue + mfrr_revenue + availability_revenue)
+                        xbid_revenue + mfrr_revenue)
+        # Note: availability_revenue NOT included — it's reported in info dict only
 
         # I account for degradation cost based on actual cycling
         deg_cost = abs(actual_energy) * self._inner.reward_calculator.degradation_cost
@@ -665,11 +656,9 @@ class BatteryEnvUnifiedSAC(gym.Env):
                 'afrr': decoded['afrr_mw'],
                 'xbid': decoded['xbid_mw'],
                 'xbid_price_offset': decoded['xbid_price_offset'],
-                'mfrr': decoded['mfrr_mw'],
-                'freebid': decoded['freebid_mw'],
                 'dam': dam_mw,
                 'afrr_energy': afrr_energy_mw,
-                'mfrr_activated': mfrr_mw,
+                'mfrr_auto': mfrr_mw,
                 'net_physical': net_mw,
             },
         }

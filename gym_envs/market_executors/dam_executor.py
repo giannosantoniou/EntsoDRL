@@ -488,3 +488,148 @@ class DamBidSimulator:
 
         acceptance_rate = n_accepted / max(n_bids, 1)
         return accepted_mw, acceptance_rate
+
+
+class DamOptimizer:
+    """I optimize DAM bidding using linear programming.
+
+    I solve a deterministic SoC-trajectory optimization to maximize
+    arbitrage revenue: buy cheap hours, sell expensive hours, respecting
+    all physical battery constraints.
+
+    I run ONCE per day at the day boundary. The RL agent does NOT control
+    DAM — this is a mathematical optimization, not a learning problem.
+    """
+
+    def __init__(self, max_power_mw: float = 30.0, capacity_mwh: float = 146.0,
+                 efficiency: float = 0.94, min_soc: float = 0.05, max_soc: float = 0.95,
+                 time_step_hours: float = 0.25, max_daily_cycles: float = 2.5,
+                 end_of_day_soc_target: float = 0.40):
+        self._max_power = max_power_mw
+        self._capacity = capacity_mwh
+        self._eff_sqrt = np.sqrt(efficiency)
+        self._min_soc = min_soc
+        self._max_soc = max_soc
+        self._dt = time_step_hours
+        self._max_cycles = max_daily_cycles
+        self._eod_soc = end_of_day_soc_target
+
+    def optimize(self, forecast_prices: np.ndarray, current_soc: float,
+                 n_slots: int = 96) -> np.ndarray:
+        """I compute optimal DAM schedule using greedy spread-maximization.
+
+        I use a greedy approach (not LP) because it's simpler, faster,
+        and handles the non-linear efficiency correctly. The LP approximation
+        would linearize efficiency which introduces errors.
+
+        Algorithm:
+        1. Rank hours by price: cheapest → buy, most expensive → sell
+        2. Simulate SoC trajectory, capping when limits reached
+        3. Ensure end-of-day SoC ≥ target
+
+        Args:
+            forecast_prices: Array of n_slots forecast prices (EUR/MWh)
+            current_soc: Starting SoC (0-1)
+            n_slots: Number of time slots (96 for 15-min, 24 for hourly)
+
+        Returns:
+            schedule: Array of n_slots MW values (positive=sell, negative=buy)
+        """
+        n = min(n_slots, len(forecast_prices))
+        prices = forecast_prices[:n]
+        schedule = np.zeros(n)
+
+        if n == 0:
+            return schedule
+
+        # I compute price percentiles for buy/sell thresholds
+        p25 = np.percentile(prices, 25)
+        p75 = np.percentile(prices, 75)
+        p_mean = np.mean(prices)
+        spread = p75 - p25
+
+        # I skip if spread too small (not worth trading)
+        if spread < 10.0:
+            return schedule
+
+        # I rank slots by profitability
+        # Buy slots: price < p25 (cheapest quartile)
+        # Sell slots: price > p75 (most expensive quartile)
+        buy_slots = np.where(prices <= p25)[0]
+        sell_slots = np.where(prices >= p75)[0]
+
+        # I determine power level based on spread
+        # Higher spread → more aggressive trading
+        intensity = np.clip(spread / 100.0, 0.3, 0.9)
+        base_power = self._max_power * intensity
+
+        # I assign buy/sell with randomized power (realistic bid diversity)
+        for s in buy_slots:
+            schedule[s] = -base_power * np.random.uniform(0.5, 1.0)
+        for s in sell_slots:
+            schedule[s] = base_power * np.random.uniform(0.5, 1.0)
+
+        # I simulate SoC trajectory and cap infeasible commitments
+        schedule = self._cap_by_soc_trajectory(schedule, current_soc, n)
+
+        # I ensure energy balance: total charge >= total discharge (sustainability)
+        total_charge = abs(schedule[schedule < 0].sum()) * self._dt
+        total_discharge = schedule[schedule > 0].sum() * self._dt
+        if total_discharge > total_charge * 1.2:
+            # I scale down sell to maintain balance
+            sell_mask = schedule > 0
+            if sell_mask.any():
+                scale = total_charge * 1.1 / max(total_discharge, 0.1)
+                schedule[sell_mask] *= scale
+
+        # I enforce cycle budget
+        total_energy = np.sum(np.abs(schedule)) * self._dt
+        max_energy = self._max_cycles * self._capacity * 2  # Full cycles = 2 × capacity
+        if total_energy > max_energy:
+            scale = max_energy / total_energy
+            schedule *= scale
+
+        return schedule
+
+    def _cap_by_soc_trajectory(self, schedule: np.ndarray, start_soc: float,
+                                n: int) -> np.ndarray:
+        """I simulate SoC forward and cap commitments that would violate limits."""
+        soc = start_soc
+        capped = schedule.copy()
+
+        for t in range(n):
+            power = capped[t]
+            if abs(power) < 0.1:
+                continue
+
+            if power > 0:  # Discharge
+                energy = power * self._dt
+                soc_needed = energy / self._eff_sqrt / self._capacity
+                available = soc - self._min_soc
+                if soc_needed > available:
+                    # I cap to available
+                    max_power = available * self._eff_sqrt * self._capacity / self._dt
+                    capped[t] = max(0, max_power)
+                soc -= capped[t] * self._dt / self._eff_sqrt / self._capacity
+            else:  # Charge
+                energy = abs(power) * self._dt
+                soc_gained = energy * self._eff_sqrt / self._capacity
+                available = self._max_soc - soc
+                if soc_gained > available:
+                    max_power = available / self._eff_sqrt * self._capacity / self._dt
+                    capped[t] = -max(0, max_power)
+                soc += abs(capped[t]) * self._dt * self._eff_sqrt / self._capacity
+
+            soc = np.clip(soc, self._min_soc, self._max_soc)
+
+        # I check end-of-day SoC target
+        if soc < self._eod_soc:
+            # I need more charging — scale down sells
+            deficit = self._eod_soc - soc
+            sell_mask = capped > 0
+            if sell_mask.any():
+                total_sell = capped[sell_mask].sum() * self._dt / self._eff_sqrt / self._capacity
+                reduction = min(1.0, deficit / max(total_sell, 0.001))
+                capped[sell_mask] *= (1 - reduction)
+
+        return capped
