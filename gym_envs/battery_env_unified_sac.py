@@ -496,8 +496,43 @@ class BatteryEnvUnifiedSAC(gym.Env):
         mfrr_mw = mfrr['mfrr_mw']
         remaining_capacity = max(0.0, remaining_capacity - abs(mfrr_mw))
 
-        # 4. XBID (agent-controlled, uses remaining capacity)
-        xbid_mw = np.clip(decoded['xbid_mw'], -remaining_capacity, remaining_capacity)
+        # 4. IDA fallback: I check if there's rejected DAM volume to cover
+        # If EUPHEMIA rejected our DAM bids, I try to cover via XBID (simplified IDA)
+        ida_fallback_mw = 0.0
+        if hasattr(self._inner, 'dam_rejected_volume') and self._inner.dam_rejected_volume is not None:
+            step_offset = self._inner._step_day_offset[self._inner.current_step]
+            if step_offset < len(self._inner.dam_rejected_volume):
+                rejected = self._inner.dam_rejected_volume[step_offset]
+                if abs(rejected) > 0.5 and remaining_capacity > self.MIN_BID_DAM_MW:
+                    # I cover the rejected volume via XBID at market price (IDA proxy)
+                    ida_fallback_mw = np.clip(rejected, -remaining_capacity, remaining_capacity)
+                    remaining_capacity = max(0.0, remaining_capacity - abs(ida_fallback_mw))
+
+        # 5. XBID (agent-controlled, uses remaining capacity)
+        # HIGH FIX: XBID gate closure — no trading within 1 hour of delivery
+        ts = self._inner.df.index[self._inner.current_step]
+        hour = ts.hour + ts.minute / 60.0
+        # I check: is this the LAST hour of the day? (simplified H-1 gate)
+        xbid_gate_open = True
+        next_step = min(self._inner.current_step + 1, len(self._inner.df) - 1)
+        if next_step < len(self._inner.df):
+            next_ts = self._inner.df.index[next_step]
+            # I close XBID if less than 1h remaining in delivery window
+            # Simplified: if we're in the last 4 steps (4×15min=1h) of the day
+            step_in_day = self._inner._step_day_offset[self._inner.current_step]
+            day_length = self._inner._day_length[self._inner._step_day_id[self._inner.current_step]]
+            if day_length - step_in_day <= 4:  # Last 1 hour
+                xbid_gate_open = False
+
+        if xbid_gate_open:
+            xbid_mw = np.clip(decoded['xbid_mw'], -remaining_capacity, remaining_capacity)
+        else:
+            xbid_mw = 0.0  # XBID gate closed
+
+        # I add IDA fallback to XBID (same market, different trigger)
+        xbid_mw += ida_fallback_mw
+        xbid_mw = np.clip(xbid_mw, -self._max_power, self._max_power)
+
         xbid_price_info = self._determine_xbid_price(xbid_mw, decoded['xbid_price_offset'], row)
 
         # I model XBID fill probability (continuous market, not guaranteed)
