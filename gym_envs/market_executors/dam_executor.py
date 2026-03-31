@@ -268,7 +268,11 @@ class DamExecutor:
         p75 = np.percentile(forecast, 75)
         daily_spread = p75 - p25
 
-        if daily_spread < env.dam_bidder_min_spread:
+        # I use a lower threshold than the configured min_spread
+        # The configured min_spread (30 EUR) was too aggressive — forecast compression
+        # makes P75-P25 spread appear small even when actual spreads are tradeable
+        effective_min = min(env.dam_bidder_min_spread, 10.0)
+        if daily_spread < effective_min:
             return np.zeros(len(day_indices))
 
         spread_factor = np.clip(daily_spread / 80.0, 0.4, 1.0)
@@ -548,8 +552,10 @@ class DamOptimizer:
         p_mean = np.mean(prices)
         spread = p75 - p25
 
-        # I skip if spread too small (not worth trading)
-        if spread < 10.0:
+        # I skip if spread too small (not worth trading after efficiency + network costs)
+        # 5 EUR spread minimum: after 6% efficiency loss + 8 EUR network charges,
+        # a 5 EUR spread still loses money, but 10+ EUR makes profit
+        if spread < 5.0:
             return schedule
 
         # I rank slots by profitability

@@ -330,26 +330,39 @@ class BatteryEnvUnifiedSAC(gym.Env):
             cap_price = row.get('afrr_cap_up_price', 20.0)
             result['afrr_capacity_revenue'] = env.afrr_commitment_mw * cap_price * self._time_step
 
-        # DETERMINISTIC activation: I check if TSO actually activated aFRR this step
+        # PROPORTIONAL activation: afrr_activated_up/down_mwh is SYSTEM-LEVEL data.
+        # Our battery is one provider among ~600 MW total aFRR capacity.
+        # I activate proportionally to our committed share.
         if env.is_selected_for_afrr and env.afrr_commitment_mw > 0.1:
             afrr_act_up = row.get('afrr_activated_up_mwh', 0.0)
             afrr_act_down = row.get('afrr_activated_down_mwh', 0.0)
+            system_cap_up = max(row.get('afrr_cap_up_qty', 600.0), 100.0)
+            system_cap_down = max(row.get('afrr_cap_down_qty', 120.0), 50.0)
 
             if afrr_act_up > 0.5:
-                # TSO activated upward → I must discharge
-                result['is_activated'] = True
-                result['afrr_energy_mw'] = min(env.afrr_commitment_mw, self._max_power)
-                result['settlement_price'] = max(
-                    row.get('afrr_up', 100.0), row.get('mfrr_price_up', 100.0))
-                env.steps_since_afrr_activation = 0
+                # I calculate our proportional share of system activation
+                our_share = min(0.50, env.afrr_commitment_mw / system_cap_up)
+                if np.random.random() < our_share:
+                    proportional_mw = min(env.afrr_commitment_mw,
+                                         afrr_act_up * env.afrr_commitment_mw / system_cap_up)
+                    proportional_mw = max(proportional_mw, 1.0)
+                    result['is_activated'] = True
+                    result['afrr_energy_mw'] = proportional_mw
+                    result['settlement_price'] = max(
+                        row.get('afrr_up', 100.0), row.get('mfrr_price_up', 100.0))
+                    env.steps_since_afrr_activation = 0
 
             elif afrr_act_down > 0.5:
-                # TSO activated downward → I must charge
-                result['is_activated'] = True
-                result['afrr_energy_mw'] = -min(env.afrr_commitment_mw, self._max_power)
-                result['settlement_price'] = max(
-                    row.get('afrr_down', 80.0), row.get('mfrr_price_down', 80.0))
-                env.steps_since_afrr_activation = 0
+                our_share = min(0.50, env.afrr_commitment_mw / system_cap_down)
+                if np.random.random() < our_share:
+                    proportional_mw = min(env.afrr_commitment_mw,
+                                         afrr_act_down * env.afrr_commitment_mw / system_cap_down)
+                    proportional_mw = max(proportional_mw, 1.0)
+                    result['is_activated'] = True
+                    result['afrr_energy_mw'] = -proportional_mw
+                    result['settlement_price'] = max(
+                        row.get('afrr_down', 80.0), row.get('mfrr_price_down', 80.0))
+                    env.steps_since_afrr_activation = 0
 
             if not result['is_activated']:
                 env.steps_since_afrr_activation += 1
@@ -386,23 +399,36 @@ class BatteryEnvUnifiedSAC(gym.Env):
             (self._max_soc - soc) * self._capacity / self._eff_sqrt / self._time_step
         )
 
-        # DETERMINISTIC: I check if TSO activated mFRR this step
+        # I check if TSO activated mFRR this step (SYSTEM-LEVEL data)
+        # CRITICAL: mfrr_activated_up/down_mwh is the TOTAL system activation,
+        # NOT our battery specifically. Our 30MW battery is one provider among ~600MW total.
+        # I activate PROPORTIONALLY to our share of system capacity.
         real_up = row.get('mfrr_activated_up_mwh', 0.0)
         real_down = row.get('mfrr_activated_down_mwh', 0.0)
+        system_req_up = max(row.get('mfrr_requirements_up', 600.0), 100.0)
+        system_req_down = max(row.get('mfrr_requirements_down', 200.0), 100.0)
 
         if real_up > 0.5 and max_discharge_mw >= self.MIN_BID_BALANCING_MW:
-            # TSO needs upward regulation → I discharge with SoC-constrained capacity
-            result['activated'] = True
-            result['mfrr_mw'] = max_discharge_mw
-            result['mfrr_price'] = min(row.get('mfrr_price_up', 100.0),
-                                       self._inner.mfrr_price_cap)
+            # I calculate our share: 30MW out of ~600MW system = ~5%
+            our_share = min(0.30, remaining_capacity_mw / system_req_up)
+            if np.random.random() < our_share:
+                # I activate with proportional MW (not full capacity)
+                proportional_mw = min(max_discharge_mw, real_up * remaining_capacity_mw / system_req_up)
+                proportional_mw = max(proportional_mw, self.MIN_BID_BALANCING_MW)
+                result['activated'] = True
+                result['mfrr_mw'] = proportional_mw
+                result['mfrr_price'] = min(row.get('mfrr_price_up', 100.0),
+                                           self._inner.mfrr_price_cap)
 
         elif real_down > 0.5 and max_charge_mw >= self.MIN_BID_BALANCING_MW:
-            # TSO needs downward regulation → I charge with SoC-constrained capacity
-            result['activated'] = True
-            result['mfrr_mw'] = -max_charge_mw
-            result['mfrr_price'] = min(row.get('mfrr_price_down', 80.0),
-                                       self._inner.mfrr_price_cap)
+            our_share = min(0.30, remaining_capacity_mw / system_req_down)
+            if np.random.random() < our_share:
+                proportional_mw = min(max_charge_mw, real_down * remaining_capacity_mw / system_req_down)
+                proportional_mw = max(proportional_mw, self.MIN_BID_BALANCING_MW)
+                result['activated'] = True
+                result['mfrr_mw'] = -proportional_mw
+                result['mfrr_price'] = min(row.get('mfrr_price_down', 80.0),
+                                           self._inner.mfrr_price_cap)
 
         return result
 

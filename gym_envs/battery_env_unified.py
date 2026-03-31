@@ -494,7 +494,16 @@ class BatteryEnvUnified(gym.Env):
 
         # I generate endogenous DAM schedule if enabled (Phase 4)
         if self.enable_endogenous_dam:
-            self.dam_schedule = self._generate_endogenous_dam_schedule()
+            # I prefer DamOptimizer (LP-based) over legacy schedule
+            if hasattr(self, '_dam_optimizer') and self._dam_optimizer is not None:
+                forecast = self._get_dam_forecast_for_day()
+                day_id = self._step_day_id[self.current_step]
+                n_slots = self._day_length[day_id] if day_id < len(self._day_length) else 96
+                self.dam_schedule = self._dam_optimizer.optimize(
+                    forecast, current_soc=self.soc, n_slots=n_slots
+                )
+            else:
+                self.dam_schedule = self._generate_endogenous_dam_schedule()
             self._dam_schedule_day_id = self._step_day_id[self.current_step]
 
         # I run EUPHEMIA bid simulation at episode start
