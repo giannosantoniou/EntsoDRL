@@ -517,47 +517,57 @@ class BatteryEnvUnifiedSAC(gym.Env):
         afrr_energy_mw = afrr['afrr_energy_mw']
         remaining_capacity = max(0.0, remaining_capacity - abs(afrr_energy_mw))
 
-        # 3. mFRR (AUTO-RESPONSE — agent does NOT control, TSO deterministic)
+        # 3. IDA1/2/3 (rule-based, locked at gate closures — like DAM but intraday)
+        # I trigger IDA gate closures at the correct timestamps
+        ts = self._inner.df.index[self._inner.current_step]
+        hour_min = ts.hour * 60 + ts.minute
+
+        # IDA1: D-1 15:00 (checks both exact and within 15-min window)
+        if 900 <= hour_min < 915 and not self._inner.ida1_locked_today:
+            try:
+                self._inner._trigger_ida_gate(1, participation_level=1.0)
+            except Exception:
+                pass
+
+        # IDA2: D-1 22:00
+        if 1320 <= hour_min < 1335 and not self._inner.ida2_locked_today:
+            try:
+                self._inner._trigger_ida_gate(2, participation_level=1.0)
+            except Exception:
+                pass
+
+        # IDA3: D+0 10:00
+        if 600 <= hour_min < 615 and not self._inner.ida3_locked_today:
+            try:
+                self._inner._trigger_ida_gate(3, participation_level=1.0)
+            except Exception:
+                pass
+
+        # I execute locked IDA commitments (mandatory, like DAM)
+        ida_mw = self._inner._get_ida_commitment(self._inner.current_step)
+        ida_mw = np.clip(ida_mw, -remaining_capacity, remaining_capacity)
+        remaining_capacity = max(0.0, remaining_capacity - abs(ida_mw))
+
+        # 4. mFRR (AUTO-RESPONSE — agent does NOT control, TSO deterministic)
         mfrr = self._determine_mfrr_auto(remaining_capacity, row)
         mfrr_mw = mfrr['mfrr_mw']
         remaining_capacity = max(0.0, remaining_capacity - abs(mfrr_mw))
 
-        # 4. IDA fallback: I check if there's rejected DAM volume to cover
-        # If EUPHEMIA rejected our DAM bids, I try to cover via XBID (simplified IDA)
-        ida_fallback_mw = 0.0
-        if hasattr(self._inner, 'dam_rejected_volume') and self._inner.dam_rejected_volume is not None:
-            step_offset = self._inner._step_day_offset[self._inner.current_step]
-            if step_offset < len(self._inner.dam_rejected_volume):
-                rejected = self._inner.dam_rejected_volume[step_offset]
-                if abs(rejected) > 0.5 and remaining_capacity > self.MIN_BID_DAM_MW:
-                    # I cover the rejected volume via XBID at market price (IDA proxy)
-                    ida_fallback_mw = np.clip(rejected, -remaining_capacity, remaining_capacity)
-                    remaining_capacity = max(0.0, remaining_capacity - abs(ida_fallback_mw))
-
         # 5. XBID (agent-controlled, uses remaining capacity)
-        # HIGH FIX: XBID gate closure — no trading within 1 hour of delivery
-        ts = self._inner.df.index[self._inner.current_step]
-        hour = ts.hour + ts.minute / 60.0
-        # I check: is this the LAST hour of the day? (simplified H-1 gate)
+        # XBID gate closure: no trading within 1 hour of delivery
+        # ts already set above (for IDA gate checks)
         xbid_gate_open = True
-        next_step = min(self._inner.current_step + 1, len(self._inner.df) - 1)
-        if next_step < len(self._inner.df):
-            next_ts = self._inner.df.index[next_step]
-            # I close XBID if less than 1h remaining in delivery window
-            # Simplified: if we're in the last 4 steps (4×15min=1h) of the day
-            step_in_day = self._inner._step_day_offset[self._inner.current_step]
-            day_length = self._inner._day_length[self._inner._step_day_id[self._inner.current_step]]
-            if day_length - step_in_day <= 4:  # Last 1 hour
+        step_in_day = self._inner._step_day_offset[self._inner.current_step]
+        day_id = self._inner._step_day_id[self._inner.current_step]
+        if day_id < len(self._inner._day_length):
+            day_length = self._inner._day_length[day_id]
+            if day_length - step_in_day <= 4:  # Last 1 hour (4 × 15min)
                 xbid_gate_open = False
 
         if xbid_gate_open:
             xbid_mw = np.clip(decoded['xbid_mw'], -remaining_capacity, remaining_capacity)
         else:
             xbid_mw = 0.0  # XBID gate closed
-
-        # I add IDA fallback to XBID (same market, different trigger)
-        xbid_mw += ida_fallback_mw
-        xbid_mw = np.clip(xbid_mw, -self._max_power, self._max_power)
 
         xbid_price_info = self._determine_xbid_price(xbid_mw, decoded['xbid_price_offset'], row)
 
@@ -571,7 +581,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
         # ── Phase 2: Calculate NET physical MW (already capacity-constrained) ──
         # No clipping needed — priority cascade ensures sum ≤ max_power
-        net_mw = dam_mw + afrr_energy_mw + xbid_mw + mfrr_mw
+        net_mw = dam_mw + afrr_energy_mw + ida_mw + xbid_mw + mfrr_mw
 
         # ── Phase 3: Single SoC update ──
 
@@ -602,6 +612,19 @@ class BatteryEnvUnifiedSAC(gym.Env):
             mfrr_revenue = mfrr_mw * mfrr['mfrr_price'] * self._time_step
         afrr_cap_revenue = afrr['afrr_capacity_revenue']
 
+        # IDA revenue: settled at clearing prices from data
+        ida_revenue = 0.0
+        if abs(ida_mw) > 0.1:
+            # I compute revenue from each IDA auction's clearing price
+            step_offset = self._inner._step_day_offset[self._inner.current_step]
+            for ida_num, sched_attr in [(1, 'ida1_schedule'), (2, 'ida2_schedule'), (3, 'ida3_schedule')]:
+                sched = getattr(self._inner, sched_attr, None)
+                if sched is not None and step_offset < len(sched):
+                    pos = float(sched[step_offset])
+                    if abs(pos) > 0.1:
+                        clearing = row.get(f'ida{ida_num}_clearing_price', row.get('price', 100.0))
+                        ida_revenue += pos * clearing * self._time_step
+
         # Availability contract: I track for accounting but EXCLUDE from RL reward
         # It's a constant +99 EUR/step regardless of agent action — adds no learning signal
         availability_revenue = 0.0
@@ -612,11 +635,12 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
         # I compute AGENT-CONTROLLED revenue only (for RL reward)
         # DAM revenue is excluded — DamOptimizer is rule-based, agent can't influence it
+        # IDA revenue is excluded — rule-based schedule, agent can't influence it
         # mFRR revenue is excluded — auto-response, agent can't influence it
         # Including them would dominate the reward with signal the agent can't learn from
         agent_revenue = afrr_energy_revenue + afrr_cap_revenue + xbid_revenue
-        # DAM + mFRR tracked separately for total P&L accounting
-        total_revenue = dam_revenue + agent_revenue + mfrr_revenue
+        # DAM + IDA + mFRR tracked separately for total P&L accounting
+        total_revenue = dam_revenue + ida_revenue + agent_revenue + mfrr_revenue
         # Note: availability_revenue NOT included — it's reported in info dict only
 
         # I account for degradation cost based on actual cycling
@@ -714,6 +738,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
         self._inner.afrr_energy_profit += afrr_energy_revenue
         self._inner.intraday_profit += xbid_revenue
         self._inner.mfrr_profit += mfrr_revenue
+        self._inner.ida_profit += ida_revenue
 
         # ── Phase 7: Advance step ──
 
@@ -744,6 +769,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
             'afrr_capacity_profit': self._inner.afrr_capacity_profit,
             'afrr_energy_profit': self._inner.afrr_energy_profit,
             'mfrr_profit': self._inner.mfrr_profit,
+            'ida_profit': self._inner.ida_profit,
             'total_cycles': self._inner.total_cycles,
             'daily_cycles': self._inner.daily_cycles,
             'net_profit': step_profit,
