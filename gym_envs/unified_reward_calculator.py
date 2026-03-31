@@ -105,7 +105,7 @@ class UnifiedRewardCalculator:
         # Scaling — I raised from 0.001 to 0.01 so that a typical 300 EUR
         # trade produces a reward of 3.0 instead of 0.3, giving the NN a
         # much stronger learning signal without needing VecNormalize reward norm.
-        reward_scale: float = 0.01  # Scale rewards for NN training (was 0.001)
+        reward_scale: float = 0.1  # Scale rewards for NN training (raised from 0.01 for stronger signal)
     ):
         self.degradation_cost = degradation_cost_per_mwh
         self.dam_violation_penalty = dam_violation_penalty

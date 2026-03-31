@@ -244,7 +244,7 @@ class BatteryEnvUnified(gym.Env):
             dam_violation_penalty=self.reward_config.get('dam_violation_penalty', 800.0),
             afrr_nonresponse_penalty=self.reward_config.get('afrr_nonresponse_penalty', 500.0),
             soc_penalty_coeff=self.reward_config.get('soc_penalty_coeff', 0.005),
-            reward_scale=self.reward_config.get('reward_scale', 0.01)
+            reward_scale=self.reward_config.get('reward_scale', 0.1)
         )
 
         # Feature configuration

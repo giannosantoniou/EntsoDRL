@@ -610,9 +610,13 @@ class BatteryEnvUnifiedSAC(gym.Env):
                                     self.AVAILABILITY_CONTRACT_EUR_PER_MW_PER_HOUR *
                                     self._time_step)
 
-        # I compute TRADING revenue only (agent-influenced, for RL reward)
-        total_revenue = (dam_revenue + afrr_energy_revenue + afrr_cap_revenue +
-                        xbid_revenue + mfrr_revenue)
+        # I compute AGENT-CONTROLLED revenue only (for RL reward)
+        # DAM revenue is excluded — DamOptimizer is rule-based, agent can't influence it
+        # mFRR revenue is excluded — auto-response, agent can't influence it
+        # Including them would dominate the reward with signal the agent can't learn from
+        agent_revenue = afrr_energy_revenue + afrr_cap_revenue + xbid_revenue
+        # DAM + mFRR tracked separately for total P&L accounting
+        total_revenue = dam_revenue + agent_revenue + mfrr_revenue
         # Note: availability_revenue NOT included — it's reported in info dict only
 
         # I account for degradation cost based on actual cycling
@@ -630,8 +634,16 @@ class BatteryEnvUnifiedSAC(gym.Env):
         calendar_aging = (self.CALENDAR_AGING_BASE_EUR_PER_STEP +
                          self.CALENDAR_AGING_SOC_PENALTY_FACTOR * soc_deviation ** 2)
 
-        # I compute net profit for this step
+        # I compute net profit for this step (FULL accounting, all markets)
         step_profit = total_revenue - deg_cost - network_cost - calendar_aging
+
+        # I compute AGENT-ONLY profit for RL reward (excludes DAM + mFRR)
+        # Agent's costs are proportional to its share of trading
+        agent_energy = abs(xbid_mw) + abs(afrr_energy_mw)
+        total_energy_traded = abs(net_mw) if abs(net_mw) > 0.1 else 1.0
+        agent_cost_share = min(1.0, agent_energy / total_energy_traded)
+        agent_costs = (deg_cost + network_cost) * agent_cost_share
+        agent_profit = agent_revenue - agent_costs
 
         # ── Phase 5: Build reward ──
 
@@ -681,11 +693,13 @@ class BatteryEnvUnifiedSAC(gym.Env):
             is_selected_for_afrr=self._inner.is_selected_for_afrr,
         )
 
-        reward = reward_info['reward']
+        # I use AGENT-ONLY profit for RL reward (not the full calculator reward)
+        # The calculator reward includes DAM+mFRR which agent can't influence
+        reward_scale = self._inner.reward_calculator.reward_scale
+        reward = agent_profit * reward_scale
 
         # I apply soft penalty
         penalty = self._compute_penalty(decoded)
-        reward_scale = self._inner.reward_calculator.reward_scale
         scaled_penalty = penalty * reward_scale
         reward -= scaled_penalty
 

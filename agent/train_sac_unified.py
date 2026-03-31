@@ -494,7 +494,17 @@ def train_sac_unified(
         )
         # I add ent_coef only for SAC (TD3 uses deterministic policy + noise)
         if algorithm.upper() == "SAC":
-            algo_kwargs["ent_coef"] = ent_coef
+            # I use auto with minimum floor to prevent entropy collapse
+            # "auto_0.05" means: auto-tune but NEVER go below 0.05
+            algo_kwargs["ent_coef"] = "auto_0.05"
+        else:
+            # TD3: I add Gaussian exploration noise (was missing entirely!)
+            from stable_baselines3.common.noise import NormalActionNoise
+            n_actions = train_env.action_space.shape[-1]
+            algo_kwargs["action_noise"] = NormalActionNoise(
+                mean=np.zeros(n_actions),
+                sigma=0.2 * np.ones(n_actions)  # 20% noise on each action
+            )
 
         model = algo_class(**algo_kwargs)
 
@@ -769,7 +779,7 @@ if __name__ == "__main__":
                         help="Total training timesteps")
     parser.add_argument("--n_envs", type=int, default=8,
                         help="Number of parallel environments (default: 8)")
-    parser.add_argument("--lr", type=float, default=3e-4,
+    parser.add_argument("--lr", type=float, default=1e-4,
                         help="Learning rate")
     parser.add_argument("--buffer-size", type=int, default=1_000_000,
                         help="Replay buffer size")
