@@ -489,7 +489,7 @@ def train_sac_unified(
             seed=seed,
             device=device,
             policy_kwargs={
-                "net_arch": dict(pi=[256, 256], qf=[256, 256])
+                "net_arch": dict(pi=[512, 256], qf=[512, 256])
             }
         )
         # I add ent_coef only for SAC (TD3 uses deterministic policy + noise)
