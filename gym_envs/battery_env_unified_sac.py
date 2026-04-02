@@ -39,7 +39,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
     }
     CYCLE_TARGET = 5.0
     XBID_PRICE_OFFSET_MAX = 50.0  # EUR/MWh (±50 for volatile intraday near gate closure)
-    N_ACTIONS = 4  # aFRR_commit, aFRR_price, XBID_mw, XBID_price_offset
+    N_ACTIONS = 8  # 4 daily (DAM blocks) + 4 intraday (aFRR+XBID)
 
     # Fix 1: Network charges (Use-of-System fees)
     # I apply ~4 EUR/MWh per direction (charge and discharge)
@@ -161,21 +161,32 @@ class BatteryEnvUnifiedSAC(gym.Env):
     def _decode_action(self, action: np.ndarray) -> dict:
         """I convert continuous [-1,+1] to absolute MW + price offset.
 
-        Action space (4D):
-          [0] aFRR commitment: 0..max_power MW
-          [1] aFRR price tier: 0.7..1.3 (bid aggressiveness)
-          [2] XBID quantity: -max_power..+max_power MW
-          [3] XBID price offset: -50..+50 EUR/MWh
+        Action space (8D):
+          DAILY (applied at day boundary only):
+          [0] charge_block_start:     0..20 (hour to start charging)
+          [1] discharge_block_start:  4..20 (hour to start discharging)
+          [2] second_cycle:           0 or 1
+          [3] aggressiveness:         0.0..1.0 (MW per block)
 
-        mFRR is NOT controlled by agent (TSO auto-response).
-        DAM is NOT controlled by agent (LP optimizer at day boundary).
+          INTRADAY (applied every step):
+          [4] aFRR commitment:        0..max_power MW
+          [5] aFRR price tier:        0.7..1.3
+          [6] XBID quantity:          -max_power..+max_power MW
+          [7] XBID price offset:      -50..+50 EUR/MWh
         """
         a = np.clip(action, -1.0, 1.0)
         return {
-            'afrr_mw': (a[0] + 1.0) / 2.0 * self._max_power,
-            'afrr_price_tier': 0.7 + (a[1] + 1.0) / 2.0 * 0.6,
-            'xbid_mw': a[2] * self._max_power,
-            'xbid_price_offset': a[3] * self.XBID_PRICE_OFFSET_MAX,
+            # Daily DAM decisions (used at day boundary)
+            'charge_block_start': int((a[0] + 1.0) / 2.0 * 20),       # 0-20
+            'discharge_block_start': int((a[1] + 1.0) / 2.0 * 16 + 4), # 4-20
+            'second_cycle': 1 if a[2] > 0.0 else 0,                    # binary
+            'aggressiveness': (a[3] + 1.0) / 2.0,                      # 0-1
+
+            # Intraday decisions (every step)
+            'afrr_mw': (a[4] + 1.0) / 2.0 * self._max_power,
+            'afrr_price_tier': 0.7 + (a[5] + 1.0) / 2.0 * 0.6,
+            'xbid_mw': a[6] * self._max_power,
+            'xbid_price_offset': a[7] * self.XBID_PRICE_OFFSET_MAX,
         }
 
     def _enforce_constraints(self, d: dict) -> dict:
@@ -269,6 +280,72 @@ class BatteryEnvUnifiedSAC(gym.Env):
         return actual_energy, env.soc - old_soc
 
     # ─── Market determination (NO SoC updates here) ────────────
+
+    def _apply_agent_dam_schedule(self, decoded: dict):
+        """I generate DAM schedule from agent's daily block choices.
+
+        The agent decides:
+          - charge_block_start: which hour to start charging (0-20)
+          - discharge_block_start: which hour to start discharging (4-20)
+          - second_cycle: 0 or 1
+          - aggressiveness: 0-1 (how much MW per block)
+
+        I create a 96-slot (15-min) schedule from these block choices.
+        The DamOptimizer already ran in _check_day_reset() but I OVERRIDE
+        with the agent's choice — the agent controls DAM, not the optimizer.
+        """
+        env = self._inner
+        if env.dam_schedule is None:
+            return  # No day boundary this step
+
+        cs = decoded['charge_block_start']     # 0-20
+        ds = decoded['discharge_block_start']  # 4-20
+        second = decoded['second_cycle']       # 0 or 1
+        agg = decoded['aggressiveness']        # 0-1
+
+        # I ensure discharge starts AFTER charge ends
+        if ds < cs + 4:
+            ds = min(cs + 4, 20)
+
+        sph = env._sph  # Steps per hour (4 for 15-min)
+        n_slots = len(env.dam_schedule)
+        base_power = self._max_power * max(0.3, agg)  # At least 30% power
+
+        # I build schedule: charge block → idle → discharge block
+        schedule = np.zeros(n_slots)
+
+        # Cycle 1: charge at cs, discharge at ds
+        for h in range(4):
+            for q in range(sph):
+                slot = (cs + h) * sph + q
+                if slot < n_slots:
+                    schedule[slot] = -base_power  # Charge (negative = buy)
+                slot = (ds + h) * sph + q
+                if slot < n_slots:
+                    schedule[slot] = base_power   # Discharge (positive = sell)
+
+        # Cycle 2 (if agent chose it AND blocks fit)
+        if second == 1 and ds + 4 + 8 <= 24:
+            cs2 = ds + 4  # Second charge starts after first discharge
+            ds2 = cs2 + 4  # Second discharge
+            if ds2 + 4 <= 24:
+                for h in range(4):
+                    for q in range(sph):
+                        slot = (cs2 + h) * sph + q
+                        if slot < n_slots:
+                            schedule[slot] = -base_power * 0.8  # Slightly less aggressive
+                        slot = (ds2 + h) * sph + q
+                        if slot < n_slots:
+                            schedule[slot] = base_power * 0.8
+
+        # I validate SoC trajectory (cap infeasible commitments)
+        if hasattr(env, '_dam_optimizer') and env._dam_optimizer is not None:
+            schedule = env._dam_optimizer._cap_by_soc_trajectory(
+                schedule, env.soc, n_slots)
+
+        # I override the optimizer's schedule with agent's choice
+        env.dam_schedule = schedule
+        env._dam_schedule_day_id = env._step_day_id[env.current_step]
 
     def _determine_dam(self, row) -> dict:
         """I determine DAM commitment MW and price. No SoC change."""
@@ -494,12 +571,19 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
         This ensures energy balance: energy_in - energy_out = SoC_change × capacity
         """
-        # I decode agent's REAL-TIME decisions (aFRR commitment + XBID only)
+        # I decode agent's decisions (daily DAM + intraday aFRR/XBID)
         decoded = self._decode_action(action)
         decoded = self._enforce_constraints(decoded)
 
-        # I check day boundary (DamOptimizer runs here, resets daily state)
+        # I store daily actions for DAM schedule generation
+        self._last_daily_action = decoded
+
+        # I check day boundary (resets daily state, generates DAM schedule)
         self._inner._check_day_reset()
+
+        # AGENT-CONTROLLED DAM: I override the optimizer schedule with agent's choice
+        # The agent decides charge/discharge block timing via daily actions [D0-D3]
+        self._apply_agent_dam_schedule(decoded)
 
         # I get current market data
         row = self._inner.df.iloc[self._inner.current_step]
@@ -637,14 +721,13 @@ class BatteryEnvUnifiedSAC(gym.Env):
                                     self.AVAILABILITY_CONTRACT_EUR_PER_MW_PER_HOUR *
                                     self._time_step)
 
-        # I compute AGENT-CONTROLLED revenue only (for RL reward)
-        # DAM revenue is excluded — DamOptimizer is rule-based, agent can't influence it
-        # IDA revenue is excluded — rule-based schedule, agent can't influence it
-        # mFRR revenue is excluded — auto-response, agent can't influence it
-        # Including them would dominate the reward with signal the agent can't learn from
-        agent_revenue = afrr_energy_revenue + afrr_cap_revenue + xbid_revenue
-        # DAM + IDA + mFRR tracked separately for total P&L accounting
-        total_revenue = dam_revenue + ida_revenue + agent_revenue + mfrr_revenue
+        # FULL REVENUE: Agent controls ALL markets now
+        # DAM schedule = agent's daily block choice
+        # IDA = rule-based but agent influences indirectly via SoC positioning
+        # XBID + aFRR = agent's intraday decisions
+        # mFRR = auto-response (agent positions SoC to benefit)
+        total_revenue = (dam_revenue + ida_revenue + afrr_energy_revenue +
+                        afrr_cap_revenue + xbid_revenue + mfrr_revenue)
         # Note: availability_revenue NOT included — it's reported in info dict only
 
         # I account for degradation cost based on actual cycling
@@ -664,14 +747,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
         # I compute net profit for this step (FULL accounting, all markets)
         step_profit = total_revenue - deg_cost - network_cost - calendar_aging
-
-        # I compute AGENT-ONLY profit for RL reward (excludes DAM + mFRR)
-        # Agent's costs are proportional to its share of trading
-        agent_energy = abs(xbid_mw) + abs(afrr_energy_mw)
-        total_energy_traded = abs(net_mw) if abs(net_mw) > 0.1 else 1.0
-        agent_cost_share = min(1.0, agent_energy / total_energy_traded)
-        agent_costs = (deg_cost + network_cost) * agent_cost_share
-        agent_profit = agent_revenue - agent_costs
+        full_net_profit = step_profit
 
         # ── Phase 5: Build reward ──
 
@@ -721,10 +797,9 @@ class BatteryEnvUnifiedSAC(gym.Env):
             is_selected_for_afrr=self._inner.is_selected_for_afrr,
         )
 
-        # I use AGENT-ONLY profit for RL reward (not the full calculator reward)
-        # The calculator reward includes DAM+mFRR which agent can't influence
+        # I use FULL profit for RL reward (agent controls ALL markets)
         reward_scale = self._inner.reward_calculator.reward_scale
-        reward = agent_profit * reward_scale
+        reward = full_net_profit * reward_scale
 
         # I apply soft penalty
         penalty = self._compute_penalty(decoded)

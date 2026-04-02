@@ -389,6 +389,8 @@ class BatteryEnvUnified(gym.Env):
             n_obs += 20  # DAM+ID+Imbalance forecast + ISP cascade features (Group 10b)
         if self.enable_full_market:
             n_obs += 13  # IDA/XBID/FreeBid features + ISP1-DAM spread
+        if hasattr(self, '_entsoe3_forecaster') and self._entsoe3_forecaster is not None:
+            n_obs += 31  # EntsoE3 24h predictions + derived features
 
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(n_obs,), dtype=np.float32

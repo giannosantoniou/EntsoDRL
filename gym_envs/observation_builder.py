@@ -65,6 +65,10 @@ class ObservationBuilder:
         if env.enable_full_market:
             self._add_full_market_features(features, env, row, ts)
 
+        # Group 10c: EntsoE3 Price Intelligence (31 features, if available)
+        if hasattr(env, '_entsoe3_forecaster') and env._entsoe3_forecaster is not None:
+            self._add_entsoe3_features(features, env, row, ts)
+
         # I validate and clean
         obs = np.array(features, dtype=np.float32)
         expected_features = 80  # 72 base + 8 trading signals
@@ -74,6 +78,8 @@ class ObservationBuilder:
             expected_features += 20
         if env.enable_full_market:
             expected_features += 13
+        if hasattr(env, '_entsoe3_forecaster') and env._entsoe3_forecaster is not None:
+            expected_features += 31
         assert len(obs) == expected_features, f"Expected {expected_features} features, got {len(obs)}"
 
         obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -549,3 +555,43 @@ class ObservationBuilder:
 
         # ISP Cascade Quality (1 feature)
         features.append(row.get('isp_cascade_spread_up_lag_24h', 0.0) / 100.0)
+
+    def _add_entsoe3_features(self, features, env, row, ts):
+        """Group 10c: EntsoE3 Price Intelligence (31 features).
+
+        I include the 24h predicted prices from the EntsoE3 XGBoost models
+        plus derived features (spread, optimal blocks, confidence).
+        The agent uses these to decide DAM schedule and XBID timing.
+        """
+        # I get the daily forecast (computed once per day, cached)
+        if not hasattr(env, '_entsoe3_daily_cache') or env._entsoe3_daily_cache is None:
+            env._entsoe3_daily_cache = {}
+
+        day_id = env._step_day_id[env.current_step] if env.current_step < len(env._step_day_id) else -1
+        if day_id not in env._entsoe3_daily_cache:
+            try:
+                hourly = env._entsoe3_forecaster.predict(env.df, env.current_step, env._sph)
+                env._entsoe3_daily_cache[day_id] = hourly
+            except Exception:
+                env._entsoe3_daily_cache[day_id] = np.ones(24) * 80.0
+
+        forecast_24h = env._entsoe3_daily_cache[day_id]
+
+        # 24 hourly predicted prices (normalized by /200)
+        for h in range(24):
+            features.append(forecast_24h[h] / 200.0)
+
+        # Derived features (7)
+        fc_mean = np.mean(forecast_24h)
+        fc_max = np.max(forecast_24h)
+        fc_min = np.min(forecast_24h)
+        fc_spread = fc_max - fc_min
+        current_price = row.get('price', 80.0)
+
+        features.append(fc_spread / 200.0)                          # Daily spread
+        features.append((current_price - fc_mean) / 100.0)          # Price vs forecast mean
+        features.append((fc_max - current_price) / 100.0)           # Potential sell upside
+        features.append((current_price - fc_min) / 100.0)           # Potential buy downside
+        features.append(np.std(forecast_24h) / 50.0)                # Forecast volatility
+        features.append(1.0 if fc_spread > 30.0 else 0.0)           # Good trading day?
+        features.append(np.argmax(forecast_24h) / 24.0)             # Predicted peak hour (0-1)
