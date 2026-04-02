@@ -206,7 +206,16 @@ class EntsoE3PriceForecaster:
                         1 if 17 <= target_hour <= 21 else 0,
                         1 if 10 <= target_hour <= 14 else 0])
 
-        return np.array(features, dtype=np.float32)
+        features = np.array(features, dtype=np.float32)
+
+        # I trim to exactly 57 features (models trained on older version with 57)
+        # The extra 6 features were added in later EntsoE3 versions
+        if len(features) > 57:
+            features = features[:57]
+        elif len(features) < 57:
+            features = np.pad(features, (0, 57 - len(features)), constant_values=0.0)
+
+        return features
 
     def _naive_forecast(self, df: pd.DataFrame, current_step: int,
                         sph: int) -> np.ndarray:
