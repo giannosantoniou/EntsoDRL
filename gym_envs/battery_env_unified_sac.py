@@ -65,9 +65,11 @@ class BatteryEnvUnifiedSAC(gym.Env):
     # At SoC 95%: 0.3 + 0.001*2025 = 2.33 EUR/step = 224 EUR/day (reasonable)
 
     # Fix 12: Availability contract revenue
-    # I model the fixed availability payment from EU-funded scheme
-    # ~115,000 EUR/MW/year = ~315 EUR/MW/day = ~13 EUR/MW/hour
-    # For 30 MW: ~394 EUR/hour = ~99 EUR per 15-min step
+    # Realistic: 15 MW available 25% of the time (not full 30MW 24/7)
+    # ~115,000 EUR/MW/year = ~13.15 EUR/MW/hour
+    # Effective: 15 MW × 25% = 3.75 MW equivalent
+    AVAILABILITY_MW = 15.0        # MW committed to availability
+    AVAILABILITY_FRACTION = 0.25  # 25% of the time
     AVAILABILITY_CONTRACT_EUR_PER_MW_PER_HOUR = 13.15  # EUR/MW/h
 
     def __init__(
@@ -629,7 +631,9 @@ class BatteryEnvUnifiedSAC(gym.Env):
         # It's a constant +99 EUR/step regardless of agent action — adds no learning signal
         availability_revenue = 0.0
         if self._enable_availability_contract:
-            availability_revenue = (self._max_power *
+            # Realistic: 15 MW committed, available 25% of the time
+            availability_revenue = (self.AVAILABILITY_MW *
+                                    self.AVAILABILITY_FRACTION *
                                     self.AVAILABILITY_CONTRACT_EUR_PER_MW_PER_HOUR *
                                     self._time_step)
 
