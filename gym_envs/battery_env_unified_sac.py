@@ -837,11 +837,58 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
         # ── Phase 8: Info dict ──
 
+        # I get timestamp for logging
+        step_idx = self._inner.current_step - 1  # Already advanced
+        step_ts = str(self._inner.df.index[step_idx]) if step_idx < len(self._inner.df) else ''
+
+        # I get predicted price for this hour (from EntsoE3 cache)
+        predicted_price = 0.0
+        if hasattr(self._inner, '_entsoe3_daily_cache') and self._inner._entsoe3_daily_cache:
+            day_id = self._inner._step_day_id[step_idx] if step_idx < len(self._inner._step_day_id) else -1
+            if day_id in self._inner._entsoe3_daily_cache:
+                fc = self._inner._entsoe3_daily_cache[day_id]
+                hour = self._inner.df.index[step_idx].hour if step_idx < len(self._inner.df) else 0
+                predicted_price = float(fc[hour]) if hour < len(fc) else 0.0
+
         info = {
+            # State
+            'timestamp': step_ts,
             'soc': self._inner.soc,
+            'dam_price': row.get('price', 0),
+            'predicted_price': predicted_price,
+
+            # Agent decisions
             'dam_commitment_mw': dam_mw,
-            'actual_mw': net_mw,
+            'ida_mw': ida_mw,
+            'afrr_commitment_mw': afrr.get('afrr_commitment_mw', 0),
+            'afrr_energy_mw': afrr_energy_mw,
+            'xbid_mw': xbid_mw,
+            'xbid_price_offset': decoded['xbid_price_offset'],
+            'mfrr_auto_mw': mfrr_mw,
             'net_mw': net_mw,
+
+            # Daily actions
+            'charge_block_start': decoded.get('charge_block_start', 0),
+            'discharge_block_start': decoded.get('discharge_block_start', 0),
+            'second_cycle': decoded.get('second_cycle', 0),
+            'aggressiveness': decoded.get('aggressiveness', 0),
+
+            # Financial
+            'step_dam_revenue': dam_revenue,
+            'step_ida_revenue': ida_revenue,
+            'step_afrr_cap_revenue': afrr_cap_revenue,
+            'step_afrr_energy_revenue': afrr_energy_revenue,
+            'step_xbid_revenue': xbid_revenue,
+            'step_mfrr_revenue': mfrr_revenue,
+            'step_revenue': total_revenue,
+            'step_degradation': deg_cost,
+            'step_network_cost': network_cost,
+            'step_calendar_aging': calendar_aging,
+            'step_availability_revenue': availability_revenue,
+            'step_profit': step_profit,
+            'reward': reward,
+
+            # Cumulative
             'total_profit': self._inner.total_profit,
             'dam_profit': self._inner.dam_profit,
             'intraday_profit': self._inner.intraday_profit,
@@ -851,15 +898,11 @@ class BatteryEnvUnifiedSAC(gym.Env):
             'ida_profit': self._inner.ida_profit,
             'total_cycles': self._inner.total_cycles,
             'daily_cycles': self._inner.daily_cycles,
-            'net_profit': step_profit,
-            'step_revenue': total_revenue,
-            'step_degradation': deg_cost,
-            'step_network_cost': network_cost,
-            'step_calendar_aging': calendar_aging,
-            'step_availability_revenue': availability_revenue,
+
+            # Penalties
             'sac_penalty': penalty,
-            'sac_penalty_scaled': scaled_penalty,
-            'discrete_action': [],
+
+            # Raw decoded actions
             'decoded_mw': {
                 'afrr': decoded['afrr_mw'],
                 'xbid': decoded['xbid_mw'],
@@ -883,6 +926,29 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
     def action_masks(self):
         return self._inner.action_masks()
+
+    @staticmethod
+    def log_episode_to_csv(infos: list, output_path: str):
+        """I save per-step decision logs to CSV for analysis.
+
+        Usage during evaluation:
+            infos = []
+            for step in range(672):
+                obs, reward, done, truncated, info = env.step(action)
+                infos.append(info)
+            BatteryEnvUnifiedSAC.log_episode_to_csv(infos, 'eval_decisions.csv')
+        """
+        import pandas as pd
+
+        # I extract flat columns from info dicts (skip nested 'decoded_mw')
+        rows = []
+        for info in infos:
+            row = {k: v for k, v in info.items() if not isinstance(v, dict)}
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        df.to_csv(output_path, index=False)
+        return df
 
     def set_degradation_cost(self, cost: float):
         self._inner.reward_calculator.degradation_cost = cost
