@@ -123,15 +123,34 @@ class EntsoE3PriceForecaster:
         # ================================================================
         # 1. NEIGHBOR DAM PRICES (19 features)
         # ================================================================
-        # I use REAL data columns where available (not approximations!)
-        serbia = safe_col('serbia_dam_price', safe_col('price', 80.0) * 0.95)
-        # I estimate neighbors from serbia (highly correlated in Balkans)
-        bulgaria = serbia * 0.98
-        italy = safe_col('price', 80.0) * 1.05
-        germany = safe_col('price', 80.0) * 0.90
-        balkans_avg = (serbia + bulgaria) / 2
-        features.extend([bulgaria, italy, serbia, serbia * 0.97,
-                        serbia * 0.99, serbia * 1.01, germany, balkans_avg])
+        # I use REAL neighbor prices where available, APPROXIMATE where not
+        # Neighbor data exists only from 2023+ (parquet starts 2022-12-31)
+        price_now = safe_col('price', 80.0)
+        serbia_real = safe_col('dam_price_rs', 0)
+        serbia = serbia_real if serbia_real > 5.0 else safe_col('serbia_dam_price', price_now * 0.95)
+
+        bg_real = safe_col('dam_price_bg', 0)
+        bulgaria = bg_real if bg_real > 5.0 else serbia * 0.98
+
+        it_real = safe_col('dam_price_it_south', 0)
+        italy = it_real if it_real > 5.0 else price_now * 1.05
+
+        ro_real = safe_col('dam_price_ro', 0)
+        romania = ro_real if ro_real > 5.0 else serbia * 0.99
+
+        hu_real = safe_col('dam_price_hu', 0)
+        hungary = hu_real if hu_real > 5.0 else serbia * 1.01
+
+        germany = price_now * 0.90
+
+        mk_real = safe_col('dam_price_mk', 0)
+        macedonia = mk_real if mk_real > 5.0 else serbia * 0.97
+
+        ba_real = safe_col('dam_price_balkans_avg', 0)
+        balkans_avg = ba_real if ba_real > 5.0 else (serbia + bulgaria) / 2
+
+        features.extend([bulgaria, italy, serbia, macedonia,
+                        romania, hungary, germany, balkans_avg])
 
         # Daily averages
         features.extend([bulgaria, italy, balkans_avg, germany])
@@ -191,20 +210,24 @@ class EntsoE3PriceForecaster:
         # ================================================================
         # 4. GAS PRICES (9 features)
         # ================================================================
-        # I estimate gas from price level (TTF correlation ~0.51 with DAM)
-        # DAM ~100 EUR → gas ~35, DAM ~200 → gas ~50, DAM ~300 → gas ~80
-        price_level = safe_col('price', 80.0)
-        gas_estimate = max(20.0, 15.0 + price_level * 0.25)
-        gas_24h = max(20.0, 15.0 + safe_col('price_mean_24h', 80.0) * 0.25)
-        gas_change = gas_estimate - gas_24h
+        # I use REAL TTF gas price where available, estimate where not
+        gas_real = safe_col('ttf_gas_price', 0)
+        if gas_real < 5.0:
+            # I fallback to estimation (pre-2025 data has no TTF)
+            gas_real = max(20.0, 15.0 + safe_col('price', 80.0) * 0.25)
+        gas_24h = safe_history('ttf_gas_price', 24 * sph, 0)
+        if gas_24h < 5.0:
+            gas_24h = gas_real
+        gas_change = gas_real - gas_24h
+        gas_week = safe_history('ttf_gas_price', 168 * sph, gas_real)
         gas_week_std = safe_col('price_std_24h', 10.0) * 0.3
 
-        features.extend([gas_estimate, gas_change, gas_change * 0.5,
+        features.extend([gas_real, gas_change, gas_real - gas_week,
                          gas_24h, gas_week_std,
-                         gas_estimate * (residual / 3000),
-                         gas_estimate * (1 if 17 <= target_hour <= 21 else 0),
-                         1 if gas_estimate > 50 else 0,
-                         1 if gas_estimate < 25 else 0])
+                         gas_real * (residual / 3000),
+                         gas_real * (1 if 17 <= target_hour <= 21 else 0),
+                         1 if gas_real > 40 else 0,
+                         1 if gas_real < 25 else 0])
 
         # ================================================================
         # 5. TEMPORAL (12 features)
