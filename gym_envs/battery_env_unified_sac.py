@@ -525,29 +525,39 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
     # ─── Penalty computation ──────────────────────────────────────
 
-    def _compute_penalty(self, d: dict) -> float:
-        """I compute soft constraint penalties."""
+    def _compute_penalty(self, d: dict, row=None) -> float:
+        """I compute soft constraint penalties + XBID buy incentive."""
         penalty = 0.0
         soc = self._inner.soc
-        margin = 0.05
 
-        # I only penalize agent-controlled actions (XBID)
+        # FIX 3a: STRONGER SoC penalty below 20% (agent drains battery too much)
+        if soc < 0.20:
+            # I heavily penalize being below 20% — battery needs energy to sell later
+            low_soc_severity = (0.20 - soc) / 0.15  # 0 at 20%, 1 at 5%
+            penalty += 100.0 * low_soc_severity ** 2  # Quadratic, up to 100 EUR
+
+        # Standard margin penalties (near 5% or 95%)
+        margin = 0.05
         net_discharge = max(0, d.get('xbid_mw', 0))
-        net_charge = abs(min(0, d.get('xbid_mw', 0)))
         discharge_intensity = net_discharge / self._max_power
-        charge_intensity = net_charge / self._max_power
 
         if soc < self._min_soc + margin and discharge_intensity > 0:
             proximity = np.clip(1.0 - (soc - self._min_soc) / margin, 0, 1)
             penalty += self.penalties['soc_soft_margin'] * proximity * discharge_intensity
 
-        elif soc > self._max_soc - margin and charge_intensity > 0:
-            proximity = np.clip(1.0 - (self._max_soc - soc) / margin, 0, 1)
-            penalty += self.penalties['soc_soft_margin'] * proximity * charge_intensity
-
+        # Cycle excess
         if self._inner.daily_cycles > self.CYCLE_TARGET:
             excess = self._inner.daily_cycles - self.CYCLE_TARGET
             penalty += self.penalties['cycle_excess'] * (excess ** 1.5)
+
+        # FIX 3b: XBID buy incentive — bonus (negative penalty) for buying cheap
+        if row is not None and d.get('xbid_mw', 0) < -0.5:
+            price = row.get('price', 100)
+            mean_24h = row.get('price_mean_24h', price)
+            if price < mean_24h * 0.85:
+                # I reward buying when price is 15%+ below daily mean
+                buy_bonus = 5.0 * (mean_24h - price) / max(mean_24h, 1.0)
+                penalty -= buy_bonus  # Negative penalty = bonus
 
         return penalty
 
@@ -723,11 +733,13 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
         # FULL REVENUE: Agent controls ALL markets now
         # DAM schedule = agent's daily block choice
-        # IDA = rule-based but agent influences indirectly via SoC positioning
         # XBID + aFRR = agent's intraday decisions
         # mFRR = auto-response (agent positions SoC to benefit)
-        total_revenue = (dam_revenue + ida_revenue + afrr_energy_revenue +
+        # IDA = EXCLUDED from reward (synthetic clearing prices unreliable 2021-2023)
+        #       Still tracked in info dict for accounting
+        total_revenue = (dam_revenue + afrr_energy_revenue +
                         afrr_cap_revenue + xbid_revenue + mfrr_revenue)
+        total_revenue_with_ida = total_revenue + ida_revenue  # For accounting only
         # Note: availability_revenue NOT included — it's reported in info dict only
 
         # I account for degradation cost based on actual cycling
@@ -802,7 +814,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
         reward = full_net_profit * reward_scale
 
         # I apply soft penalty
-        penalty = self._compute_penalty(decoded)
+        penalty = self._compute_penalty(decoded, row=row)
         scaled_penalty = penalty * reward_scale
         reward -= scaled_penalty
 
@@ -832,6 +844,12 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
         if not (terminated or truncated):
             obs = self._inner._obs_builder.build()
+            # FIX 4: I add small noise to observations during TRAINING
+            # This prevents the agent from memorizing exact price patterns
+            # and forces it to learn robust strategies
+            if self._inner.np_random is not None:
+                obs_noise = self._inner.np_random.normal(0, 0.01, size=obs.shape)
+                obs = obs + obs_noise.astype(np.float32)
         else:
             obs = np.zeros(self.observation_space.shape, dtype=np.float32)
 
