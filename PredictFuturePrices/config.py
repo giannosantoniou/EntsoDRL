@@ -29,6 +29,7 @@ class PathConfig:
     entsoe_dir: Path = PACKAGE_ROOT / "data" / "entsoe"
     admie_dir: Path = PACKAGE_ROOT / "data" / "admie"
     admie_cache_dir: Path = PACKAGE_ROOT / "data" / "admie" / "cache"
+    henex_dir: Path = PACKAGE_ROOT / "data" / "henex"
     weather_dir: Path = PACKAGE_ROOT / "data" / "weather"
     commodities_dir: Path = PACKAGE_ROOT / "data" / "commodities"
 
@@ -52,6 +53,7 @@ class PathConfig:
     res_actual_csv: Path = PACKAGE_ROOT / "data" / "admie" / "res_actual.csv"
     weather_csv: Path = PACKAGE_ROOT / "data" / "weather" / "weather_hourly.csv"
     commodity_csv: Path = PACKAGE_ROOT / "data" / "commodities" / "commodity_prices.csv"
+    ida_clearing_csv: Path = PACKAGE_ROOT / "data" / "henex" / "ida_clearing_prices.csv"
 
 
 @dataclass(frozen=True)

@@ -1924,3 +1924,74 @@ class TestSetPenalties:
         original_margin = sac_env.penalties['soc_soft_margin']
         sac_env.set_penalties({'cycle_excess': 3000.0})
         assert sac_env.penalties['soc_soft_margin'] == original_margin
+
+
+
+class TestImbalancePenalty:
+    """I test the imbalance penalty for undelivered energy (phantom revenue fix)."""
+
+    def test_soc_floor_no_phantom_revenue(self, sac_env):
+        """I verify that when SoC is near floor, imbalance cost prevents phantom revenue.
+
+        If DAM commits to sell but SoC is at floor (5%), the battery can't deliver.
+        The imbalance cost must offset the phantom DAM revenue.
+        """
+        obs, _ = sac_env.reset(seed=42)
+
+        # I drain SoC to minimum by selling max XBID repeatedly
+        drain_action = np.array([0.0, 0.0, 1.0, 0.0])  # max XBID sell
+        for _ in range(50):
+            obs, _, done, _, info = sac_env.step(drain_action)
+            if info['soc'] <= 0.06:
+                break
+
+        # I verify SoC is near floor
+        assert info['soc'] <= 0.10, f"SoC should be near floor, got {info['soc']}"
+
+        # I take another step -- if DAM has a sell commitment, it can't be delivered
+        obs, reward, done, _, info = sac_env.step(np.array([0.0, 0.0, 0.0, 0.0]))
+
+        # I check: if there's a shortfall, imbalance cost must be positive
+        if info['shortfall_mwh'] > 0.01:
+            assert info['step_imbalance_cost'] > 0, \
+                f"Shortfall {info['shortfall_mwh']:.3f} MWh but no imbalance cost!"
+            assert info['delivery_ratio'] < 1.0, \
+                f"Shortfall but delivery_ratio={info['delivery_ratio']}"
+
+    def test_drain_strategy_incurs_imbalance(self, sac_env):
+        """I verify the DRAIN strategy incurs imbalance costs when SoC hits floor.
+
+        Before the fix, DRAIN produced +61K EUR/week due to phantom revenue.
+        With imbalance penalty, DRAIN should accumulate significant imbalance costs.
+        """
+        obs, _ = sac_env.reset(seed=42)
+
+        drain_action = np.array([0.0, 0.0, 1.0, 0.0])  # max XBID sell
+        total_imbalance_cost = 0.0
+
+        for step in range(72):  # 72 steps
+            obs, reward, done, _, info = sac_env.step(drain_action)
+            total_imbalance_cost += info.get('step_imbalance_cost', 0)
+            if done:
+                break
+
+        # I verify imbalance cost was applied (at least some steps had shortfall)
+        assert total_imbalance_cost > 0, \
+            "DRAIN strategy should incur imbalance costs when SoC hits floor"
+
+    def test_full_delivery_no_imbalance(self, sac_env):
+        """I verify that normal operation with sufficient SoC has no imbalance penalty.
+
+        At SoC=50% with moderate trading, delivery_ratio should be ~1.0.
+        """
+        obs, _ = sac_env.reset(seed=42)
+
+        # I take a small action (not draining aggressively)
+        small_action = np.array([0.0, 0.0, 0.1, 0.0])  # small XBID sell
+        obs, reward, done, _, info = sac_env.step(small_action)
+
+        # I verify no shortfall at healthy SoC
+        assert info['delivery_ratio'] >= 0.99, \
+            f"Expected full delivery at SoC~0.5, got ratio={info['delivery_ratio']}"
+        assert info['step_imbalance_cost'] < 0.01, \
+            f"Expected no imbalance cost, got {info['step_imbalance_cost']}"

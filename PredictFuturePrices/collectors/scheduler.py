@@ -47,6 +47,7 @@ def run_all_collectors(
         "entsoe_gr_dam": _create_entsoe_gr_dam_collector,
         "entsoe_rs_dam": _create_entsoe_rs_dam_collector,
         "admie_balancing": _create_admie_balancing_collector,
+        "henex_ida_clearing": _create_henex_ida_collector,
     }
 
     # I filter collectors based on market event if provided
@@ -110,6 +111,11 @@ def _create_entsoe_rs_dam_collector():
 def _create_admie_balancing_collector():
     from PredictFuturePrices.collectors.admie_collector import AdmieBalancingCollector
     return AdmieBalancingCollector()
+
+
+def _create_henex_ida_collector():
+    from PredictFuturePrices.collectors.henex_collector import HenexIDACollector
+    return HenexIDACollector()
 
 
 def main():

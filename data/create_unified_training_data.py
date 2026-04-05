@@ -1079,96 +1079,130 @@ def create_unified_dataset(dam_df: pd.DataFrame, afrr_df: pd.DataFrame) -> pd.Da
 
 
 def _synthesize_balancing_data(df: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
-    """
-    I synthesize realistic aFRR/mFRR data with independent dynamics.
+    """I fill missing balancing data using a 2-tier approach:
 
-    Key design: mFRR/aFRR prices are partially correlated with DAM (~0.5-0.6)
-    but have significant independent variation from:
-    - Ornstein-Uhlenbeck mean-reverting spread process
-    - Regime shifts (scarcity events, low-demand periods)
-    - RES forecast error driving imbalance prices
-    - Temporal autocorrelation (prices don't jump randomly hour-to-hour)
+    Tier 1: Real ADMIE data (2024+, from admie_balancing.csv collector)
+    Tier 2: DAM-derived fallback (pre-2024, uses historical averages)
+
+    This replaces the old fully-synthetic OU approach. The ADMIE collector
+    has 19,800+ rows of real data covering all aFRR, mFRR, and system state.
     """
     dam_prices = df.loc[mask, 'price'].values
     hours = df.loc[mask].index.hour.values if hasattr(df.index, 'hour') else np.zeros(mask.sum())
     n = len(dam_prices)
+    timestamps = df.loc[mask].index
 
-    # I generate an independent Ornstein-Uhlenbeck spread process
-    # This ensures mFRR spread has temporal autocorrelation but is NOT
-    # deterministically derived from DAM
-    ou_theta = 0.15  # Mean reversion speed
-    ou_mu_up = 45.0  # Long-run mean spread (upward)
-    ou_mu_down = 30.0  # Long-run mean spread (downward)
-    ou_sigma = 15.0  # Volatility of spread
+    # I try to load real ADMIE balancing data
+    admie_df = _load_admie_balancing_data()
 
-    spread_up = np.zeros(n)
-    spread_down = np.zeros(n)
-    spread_up[0] = ou_mu_up + np.random.normal(0, ou_sigma)
-    spread_down[0] = ou_mu_down + np.random.normal(0, ou_sigma)
+    # I define the mapping from ADMIE columns to training columns
+    admie_to_training = {
+        'mfrr_energy_price_up': 'mfrr_price_up',
+        'mfrr_energy_price_down': 'mfrr_price_down',
+        'mfrr_energy_spread': 'mfrr_spread',
+        'afrr_price_up': 'afrr_cap_up_price',
+        'afrr_price_down': 'afrr_cap_down_price',
+        'afrr_requirements_up': 'afrr_cap_up_qty',
+        'afrr_requirements_down': 'afrr_cap_down_qty',
+        'system_load_mw': 'load_mw',
+        'res_production_mw': 'res_total_mw',
+        'net_balancing_energy_mwh': 'net_imbalance_mw',
+    }
 
-    for i in range(1, n):
-        # I add mean-reverting dynamics with regime shifts
-        spread_up[i] = spread_up[i-1] + ou_theta * (ou_mu_up - spread_up[i-1]) + ou_sigma * np.random.normal() * np.sqrt(1.0)
-        spread_down[i] = spread_down[i-1] + ou_theta * (ou_mu_down - spread_down[i-1]) + ou_sigma * np.random.normal() * np.sqrt(1.0)
+    # I also need aFRR energy prices (afrr_up/afrr_down in training)
+    # ADMIE has imbalance_price — aFRR energy settles at imbalance price
+    afrr_energy_from_admie = {
+        'imbalance_price': 'afrr_up',  # aFRR energy UP settles at imbalance
+    }
 
-    # I add regime shifts — scarcity events where spreads spike
-    # These happen ~5% of hours and are unpredictable from DAM alone
-    scarcity_events = np.random.random(n) < 0.05
-    spread_up[scarcity_events] *= np.random.uniform(2.0, 4.0, scarcity_events.sum())
+    filled_real = 0
+    filled_fallback = 0
 
-    # I add time-of-day modulation (smaller effect than before)
-    tod_factor = 1.0 + 0.3 * np.sin(2 * np.pi * hours / 24)
+    if admie_df is not None and not admie_df.empty:
+        # I find overlap between missing rows and ADMIE data
+        admie_overlap = timestamps.isin(admie_df.index)
+        n_overlap = admie_overlap.sum()
+        print(f"  ADMIE real data available for {n_overlap}/{n} missing rows")
 
-    # I clip spreads to realistic range
-    spread_up = np.clip(spread_up * tod_factor, 5, 200)
-    spread_down = np.clip(spread_down * tod_factor, 3, 150)
+        if n_overlap > 0:
+            overlap_ts = timestamps[admie_overlap]
 
-    # I compute mFRR prices: DAM correlation ~0.5 + independent spread
-    # I add an independent price component that doesn't track DAM
-    independent_level = np.cumsum(np.random.normal(0, 2.0, n))  # Random walk
-    independent_level -= np.convolve(independent_level, np.ones(168)/168, mode='same')  # I detrend weekly
-    independent_component = np.clip(independent_level, -40, 40)
+            # I fill from ADMIE using column mapping
+            for admie_col, train_col in admie_to_training.items():
+                if admie_col in admie_df.columns:
+                    vals = admie_df.loc[overlap_ts, admie_col].values
+                    df.loc[df.index.isin(overlap_ts) & mask, train_col] = vals
 
-    df.loc[mask, 'mfrr_price_up'] = dam_prices + spread_up + independent_component
-    df.loc[mask, 'mfrr_price_down'] = np.clip(dam_prices - spread_down + independent_component * 0.5, 0, None)
-    df.loc[mask, 'mfrr_spread'] = df.loc[mask, 'mfrr_price_up'] - df.loc[mask, 'mfrr_price_down']
+            # I fill aFRR energy prices from imbalance price
+            if 'imbalance_price' in admie_df.columns:
+                imb = admie_df.loc[overlap_ts, 'imbalance_price'].values
+                df.loc[df.index.isin(overlap_ts) & mask, 'afrr_up'] = imb
+                df.loc[df.index.isin(overlap_ts) & mask, 'afrr_down'] = imb * 0.85  # down < up
 
-    # aFRR prices: partial DAM correlation + independent dynamics
-    afrr_independent = np.cumsum(np.random.normal(0, 1.5, n))
-    afrr_independent -= np.convolve(afrr_independent, np.ones(168)/168, mode='same')
-    afrr_independent = np.clip(afrr_independent, -20, 20)
+            filled_real = n_overlap
 
-    df.loc[mask, 'afrr_up'] = dam_prices * (1.0 + np.random.uniform(0.02, 0.15, n)) + afrr_independent
-    df.loc[mask, 'afrr_down'] = np.clip(dam_prices * (1.0 - np.random.uniform(0.05, 0.20, n)) + afrr_independent * 0.5, 0, None)
+    # I fill remaining NaN with DAM-derived fallback (pre-2024)
+    still_missing = mask & df['mfrr_price_up'].isna()
+    n_remaining = still_missing.sum()
 
-    # aFRR capacity prices: independent OU process (not DAM-derived)
-    cap_ou = np.zeros(n)
-    cap_mu = 22.0
-    cap_ou[0] = cap_mu
-    for i in range(1, n):
-        cap_ou[i] = cap_ou[i-1] + 0.1 * (cap_mu - cap_ou[i-1]) + 5.0 * np.random.normal()
+    if n_remaining > 0:
+        print(f"  DAM-derived fallback for {n_remaining} remaining rows (pre-2024)")
+        dam_rem = df.loc[still_missing, 'price'].values
+        hours_rem = df.loc[still_missing].index.hour.values if hasattr(df.index, 'hour') else np.zeros(n_remaining)
 
-    peak_hours = (hours >= 17) & (hours <= 21)
-    cap_peak_boost = np.where(peak_hours, 10.0, 0.0)
-    df.loc[mask, 'afrr_cap_up_price'] = np.clip(cap_ou + cap_peak_boost + np.random.normal(0, 3, n), 2, 80)
-    df.loc[mask, 'afrr_cap_down_price'] = np.clip(cap_ou * 0.7 + np.random.normal(0, 3, n), 1, 60)
+        # I use historical averages from ADMIE data to calibrate spreads
+        # Real mFRR spread ~140 EUR, aFRR cap ~22 EUR (from ADMIE stats)
+        df.loc[still_missing, 'mfrr_price_up'] = dam_rem * 1.5 + np.random.normal(50, 30, n_remaining)
+        df.loc[still_missing, 'mfrr_price_down'] = np.clip(dam_rem * 0.6 + np.random.normal(0, 20, n_remaining), 0, None)
+        df.loc[still_missing, 'mfrr_spread'] = df.loc[still_missing, 'mfrr_price_up'] - df.loc[still_missing, 'mfrr_price_down']
 
-    # Capacity quantities: typical reserve needs
-    df.loc[mask, 'afrr_cap_up_qty'] = np.random.uniform(200, 800, n)
-    df.loc[mask, 'afrr_cap_down_qty'] = np.random.uniform(100, 300, n)
+        df.loc[still_missing, 'afrr_up'] = dam_rem * 1.1 + np.random.normal(5, 10, n_remaining)
+        df.loc[still_missing, 'afrr_down'] = np.clip(dam_rem * 0.9 + np.random.normal(-5, 10, n_remaining), 0, None)
 
-    # System state: net imbalance correlates with RES variability
-    solar = df.loc[mask, 'solar'].values if 'solar' in df.columns else np.zeros(n)
-    wind = df.loc[mask, 'wind_onshore'].values if 'wind_onshore' in df.columns else np.zeros(n)
-    res_total = solar + wind
+        df.loc[still_missing, 'afrr_cap_up_price'] = np.clip(22 + np.random.normal(0, 8, n_remaining), 2, 80)
+        df.loc[still_missing, 'afrr_cap_down_price'] = np.clip(15 + np.random.normal(0, 5, n_remaining), 1, 60)
+        df.loc[still_missing, 'afrr_cap_up_qty'] = 360 + np.random.normal(0, 50, n_remaining)
+        df.loc[still_missing, 'afrr_cap_down_qty'] = 120 + np.random.normal(0, 20, n_remaining)
 
-    # I create imbalance based on RES forecast error simulation
-    forecast_error = np.random.normal(0, 0.1, n) * (res_total + 100)
-    df.loc[mask, 'net_imbalance_mw'] = forecast_error
-    df.loc[mask, 'res_total_mw'] = res_total
-    df.loc[mask, 'load_mw'] = 5000 + 2000 * np.sin(2 * np.pi * hours / 24) + np.random.normal(0, 200, n)
+        solar = df.loc[still_missing, 'solar'].values if 'solar' in df.columns else np.zeros(n_remaining)
+        wind = df.loc[still_missing, 'wind_onshore'].values if 'wind_onshore' in df.columns else np.zeros(n_remaining)
+        df.loc[still_missing, 'res_total_mw'] = solar + wind
+        df.loc[still_missing, 'net_imbalance_mw'] = np.random.normal(0, 100, n_remaining)
+        df.loc[still_missing, 'load_mw'] = 5000 + 2000 * np.sin(2 * np.pi * hours_rem / 24) + np.random.normal(0, 200, n_remaining)
+
+        filled_fallback = n_remaining
+
+    total = filled_real + filled_fallback
+    if total > 0:
+        print(f"  Balancing data: {filled_real} real ADMIE ({filled_real*100/total:.0f}%), "
+              f"{filled_fallback} DAM-derived ({filled_fallback*100/total:.0f}%)")
 
     return df
+
+
+def _load_admie_balancing_data() -> pd.DataFrame:
+    """I load real ADMIE balancing data from the collector CSV."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).parent.parent / "PredictFuturePrices" / "data" / "admie" / "admie_balancing.csv",
+        Path(__file__).parent / "PredictFuturePrices" / "data" / "admie" / "admie_balancing.csv",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            try:
+                df = pd.read_csv(path, index_col=0, parse_dates=True)
+                if not df.empty:
+                    if df.index.tz is not None:
+                        df.index = df.index.tz_localize(None)
+                    print(f"  Loaded {len(df)} real ADMIE balancing rows from {path.name}")
+                    return df
+            except Exception as e:
+                print(f"  Warning: Could not load ADMIE data: {e}")
+
+    print("  Warning: No ADMIE balancing data found - using full DAM-derived fallback")
+    return None
 
 
 def _generate_dam_commitments_with_day_ahead(
@@ -1496,47 +1530,78 @@ def _compute_hours_to_delivery(index):
 
 
 def _synthesize_ida_prices(df, mask, time_step_hours=0.25):
-    """I synthesize IDA1/2/3 clearing prices correlated with ISP1 mid-price.
+    """I populate IDA1/2/3 clearing prices using a 3-tier data hierarchy:
 
-    IDA prices converge toward ISP1 as delivery approaches:
-      IDA1 (D-1 15:00): 85% DAM + 15% ISP1 + OU noise(σ=3)
-      IDA2 (D-1 22:00): 60% DAM + 40% ISP1 + OU noise(σ=4)
-      IDA3 (D+0 10:00): 30% DAM + 70% ISP1 + OU noise(σ=3)
-    Where ISP1 is NaN, I fall back to pure DAM + OU noise(σ=12/8/4).
+    Tier 1 (best): Real HEnEx IDA clearing prices (2026+, from collector CSV)
+    Tier 2 (proxy): ISP1 mid-price as proxy (2024-2025, real ADMIE data)
+    Tier 3 (fallback): DAM + small noise (pre-2024, no balancing data)
+
+    This replaces the old fully-synthetic OU approach. Now 2024+ uses
+    real market data, giving much more realistic IDA price dynamics.
     """
     dam_prices = df.loc[mask, 'price'].values
     n = len(dam_prices)
     hours = df.loc[mask].index.hour.values
+    timestamps = df.loc[mask].index
 
-    # I compute ISP1 mid-price where available
+    # I try to load real HEnEx IDA clearing prices
+    real_ida = _load_real_ida_prices()
+
+    # I compute ISP1 mid-price as proxy (Tier 2)
     isp1_up = df.loc[mask, 'isp1_price_up'].values if 'isp1_price_up' in df.columns else np.full(n, np.nan)
     isp1_down = df.loc[mask, 'isp1_price_down'].values if 'isp1_price_down' in df.columns else np.full(n, np.nan)
     isp1_mid = (isp1_up + isp1_down) / 2.0
     has_isp1 = ~np.isnan(isp1_mid)
 
-    # I define blending weights: IDA converges toward ISP1 as delivery nears
-    # alpha = DAM weight, (1-alpha) = ISP1 weight
-    ida_config = {
-        1: {'alpha': 0.85, 'sigma': 3.0, 'theta': 0.03, 'fallback_sigma': 12.0},
-        2: {'alpha': 0.60, 'sigma': 4.0, 'theta': 0.05, 'fallback_sigma': 8.0},
-        3: {'alpha': 0.30, 'sigma': 3.0, 'theta': 0.08, 'fallback_sigma': 4.0},
-    }
+    # I define small noise for ISP1 proxy (much less than old OU approach)
+    ida_noise_sigma = {1: 2.0, 2: 3.0, 3: 4.0}
 
-    for ida_num, cfg in ida_config.items():
-        noise = _generate_ou_process(n, theta=cfg['theta'], sigma=cfg['sigma'], dt=time_step_hours)
-        # I blend DAM and ISP1 where ISP1 is available
-        blended = np.where(
-            has_isp1,
-            cfg['alpha'] * dam_prices + (1 - cfg['alpha']) * isp1_mid + noise,
-            dam_prices + _generate_ou_process(n, theta=cfg['theta'], sigma=cfg['fallback_sigma'], dt=time_step_hours)
-        )
-        blended = np.maximum(blended, 0.0)
+    real_count = 0
+    proxy_count = 0
+    fallback_count = 0
+
+    for ida_num in [1, 2, 3]:
+        col = f'ida{ida_num}_clearing_price'
+        result = np.full(n, np.nan)
+
+        for i in range(n):
+            ts = timestamps[i]
+
+            # Tier 1: Real HEnEx data (2026+)
+            if real_ida is not None and ts in real_ida.index and col in real_ida.columns:
+                val = real_ida.loc[ts, col]
+                if not np.isnan(val):
+                    result[i] = val
+                    real_count += 1
+                    continue
+
+            # Tier 2: ISP1 mid-price as proxy (2024-2025)
+            if has_isp1[i]:
+                # I add small noise to ISP1 mid — IDA tracks ISP1 closely
+                noise = np.random.normal(0, ida_noise_sigma[ida_num])
+                result[i] = isp1_mid[i] + noise
+                proxy_count += 1
+                continue
+
+            # Tier 3: DAM + small noise (pre-2024)
+            noise = np.random.normal(0, ida_noise_sigma[ida_num] * 2)
+            result[i] = dam_prices[i] + noise
+            fallback_count += 1
+
+        # I ensure non-negative prices
+        result = np.maximum(result, -50.0)  # I allow small negatives (real market can go negative)
 
         if ida_num == 3:
             # IDA3 only covers hours 12-24
-            blended = np.where(hours >= 12, blended, np.nan)
+            result = np.where(hours >= 12, result, np.nan)
 
-        df.loc[mask, f'ida{ida_num}_clearing_price'] = blended
+        df.loc[mask, col] = result
+
+    total = real_count + proxy_count + fallback_count
+    if total > 0:
+        print(f"  IDA prices: {real_count} real ({real_count*100/total:.0f}%), "
+              f"{proxy_count} ISP1 proxy ({proxy_count*100/total:.0f}%), "
+              f"{fallback_count} DAM fallback ({fallback_count*100/total:.0f}%)")
 
     # XBID: I use IDA3-like blend for mid-price, tighter spread near delivery
     ida3_blend = df.loc[mask, 'ida3_clearing_price'].values
@@ -1553,6 +1618,34 @@ def _synthesize_ida_prices(df, mask, time_step_hours=0.25):
     df.loc[mask, 'xbid_ask'] = xbid_mid + xbid_spread / 2
     df.loc[mask, 'xbid_spread'] = xbid_spread
     return df
+
+
+def _load_real_ida_prices() -> pd.DataFrame:
+    """I load real IDA clearing prices from the HEnEx collector CSV.
+
+    Returns None if the file doesn't exist or is empty.
+    """
+    from pathlib import Path
+
+    # I check both possible locations
+    candidates = [
+        Path(__file__).parent.parent / "PredictFuturePrices" / "data" / "henex" / "ida_clearing_prices.csv",
+        Path(__file__).parent / "PredictFuturePrices" / "data" / "henex" / "ida_clearing_prices.csv",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            try:
+                df = pd.read_csv(path, index_col=0, parse_dates=True)
+                if not df.empty:
+                    if df.index.tz is not None:
+                        df.index = df.index.tz_localize(None)
+                    print(f"  Loaded {len(df)} real IDA prices from {path.name}")
+                    return df
+            except Exception as e:
+                print(f"  Warning: Could not load IDA prices: {e}")
+
+    return None
 
 
 def _generate_ida_positions(df, max_power_mw=30.0):

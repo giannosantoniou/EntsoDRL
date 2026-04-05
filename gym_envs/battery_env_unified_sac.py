@@ -1,22 +1,24 @@
 """
-SAC/TD3 Continuous Environment for Multi-Market Battery Trading (v3 — Direct Execution)
+SAC/TD3 Continuous Environment for Multi-Market Battery Trading (v4 — Hybrid Architecture)
 
-I execute market actions in ABSOLUTE MW directly, bypassing the inner env's
-MultiDiscrete action space. This eliminates rounding noise and cascade dependencies.
+I implement a two-layer architecture:
+  Layer 1: EntsoE3 LP Optimizer handles DAM (rule-based, mathematically optimal)
+  Layer 2: SAC agent handles ONLY intraday decisions (learned, adaptive)
+
+The agent does NOT control DAM — that's solved optimally by the LP.
+The agent focuses 100% on real-time intraday decisions where adaptability matters.
 
 Architecture:
-  - I use BatteryEnvUnified for data prep, observation building, and state tracking
-  - I BYPASS its step() — instead, I compute SoC/revenue directly from absolute MW
-  - ObservationBuilder works unchanged (reads my synced state from inner env)
-  - UnifiedRewardCalculator works unchanged (receives my computed results)
+  - DamOptimizer (in _check_day_reset) generates DAM schedule — LOCKED, agent can't override
+  - SAC agent controls ONLY: aFRR commitment/price + XBID quantity/price
+  - ObservationBuilder works unchanged (reads state from inner env)
+  - UnifiedRewardCalculator works unchanged (receives computed results)
 
-Action Space: Box(6,) continuous [-1, +1]
-  [0] aFRR Commitment:  0..max_power MW
-  [1] aFRR Price Tier:  0.7..1.3 multiplier
-  [2] XBID Quantity:    -max_power..+max_power MW (neg=buy)
-  [3] XBID Price Offset: -10..+10 EUR/MWh from mid-price
-  [4] mFRR Quantity:    -max_power..+max_power MW
-  [5] FreeBid Quantity: -max_power..+max_power MW
+Action Space: Box(4,) continuous [-1, +1]
+  [0] aFRR Commitment:   0..max_power MW (0 at neutral, must actively choose)
+  [1] aFRR Price Tier:   0.7..1.3 multiplier
+  [2] XBID Quantity:     -max_power..+max_power MW (neg=buy, pos=sell)
+  [3] XBID Price Offset: -50..+50 EUR/MWh from mid-price
 """
 
 import gymnasium as gym
@@ -39,7 +41,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
     }
     CYCLE_TARGET = 5.0
     XBID_PRICE_OFFSET_MAX = 50.0  # EUR/MWh (±50 for volatile intraday near gate closure)
-    N_ACTIONS = 8  # 4 daily (DAM blocks) + 4 intraday (aFRR+XBID)
+    N_ACTIONS = 4  # Intraday only: aFRR commitment, aFRR price, XBID qty, XBID price
 
     # Fix 1: Network charges (Use-of-System fees)
     # I apply ~4 EUR/MWh per direction (charge and discharge)
@@ -132,11 +134,18 @@ class BatteryEnvUnifiedSAC(gym.Env):
                     f"Expected 1-60 days. Check episode_length vs time_step_hours={self._time_step}."
                 )
 
-        # I define the continuous action space (always 6 dims)
+        # I define the continuous action space (4D intraday only)
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.N_ACTIONS,), dtype=np.float32
         )
-        self.observation_space = self._inner.observation_space
+
+        # I define focused observation space (20 features)
+        # The SAC agent sees ONLY what it needs for aFRR + XBID decisions:
+        # battery state, locked schedule context, real-time market signals
+        self.N_OBS = 20
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(self.N_OBS,), dtype=np.float32
+        )
 
     # ─── Properties for monitoring ─────────────────────────────────
 
@@ -161,32 +170,22 @@ class BatteryEnvUnifiedSAC(gym.Env):
     def _decode_action(self, action: np.ndarray) -> dict:
         """I convert continuous [-1,+1] to absolute MW + price offset.
 
-        Action space (8D):
-          DAILY (applied at day boundary only):
-          [0] charge_block_start:     0..20 (hour to start charging)
-          [1] discharge_block_start:  4..20 (hour to start discharging)
-          [2] second_cycle:           0 or 1
-          [3] aggressiveness:         0.0..1.0 (MW per block)
+        Action space (4D — intraday only):
+          [0] aFRR commitment:   0..max_power MW (negative half = 0)
+          [1] aFRR price tier:   0.7..1.3
+          [2] XBID quantity:     -max_power..+max_power MW
+          [3] XBID price offset: -50..+50 EUR/MWh
 
-          INTRADAY (applied every step):
-          [4] aFRR commitment:        0..max_power MW
-          [5] aFRR price tier:        0.7..1.3
-          [6] XBID quantity:          -max_power..+max_power MW
-          [7] XBID price offset:      -50..+50 EUR/MWh
+        DAM is handled by EntsoE3 LP Optimizer — agent does NOT control it.
         """
         a = np.clip(action, -1.0, 1.0)
         return {
-            # Daily DAM decisions (used at day boundary)
-            'charge_block_start': int((a[0] + 1.0) / 2.0 * 20),       # 0-20
-            'discharge_block_start': int((a[1] + 1.0) / 2.0 * 16 + 4), # 4-20
-            'second_cycle': 1 if a[2] > 0.0 else 0,                    # binary
-            'aggressiveness': (a[3] + 1.0) / 2.0,                      # 0-1
-
-            # Intraday decisions (every step)
-            'afrr_mw': (a[4] + 1.0) / 2.0 * self._max_power,
-            'afrr_price_tier': 0.7 + (a[5] + 1.0) / 2.0 * 0.6,
-            'xbid_mw': a[6] * self._max_power,
-            'xbid_price_offset': a[7] * self.XBID_PRICE_OFFSET_MAX,
+            # I map aFRR so that action=0 means 0 commitment (agent must actively choose)
+            # a[0] in [-1,1]: negative = 0 MW, positive = proportional to max_power
+            'afrr_mw': max(0.0, a[0]) * self._max_power,  # 0..30 MW, zero at neutral
+            'afrr_price_tier': 0.7 + (a[1] + 1.0) / 2.0 * 0.6,
+            'xbid_mw': a[2] * self._max_power,
+            'xbid_price_offset': a[3] * self.XBID_PRICE_OFFSET_MAX,
         }
 
     def _enforce_constraints(self, d: dict) -> dict:
@@ -369,6 +368,8 @@ class BatteryEnvUnifiedSAC(gym.Env):
             'is_selected': False,
             'is_activated': False,
             'settlement_price': 0.0,
+            'selection_prob': 0.0,
+            'clearing_price': 0.0,
         }
 
         if not self.is_prequalified_afrr:
@@ -389,11 +390,13 @@ class BatteryEnvUnifiedSAC(gym.Env):
             # bid << clearing → prob ≈ 1.0 (cheap bid, always wins)
             # bid ≈ clearing → prob ≈ 0.5 (marginal bid)
             # bid >> clearing → prob ≈ 0.0 (expensive bid, never wins)
+            result['clearing_price'] = clearing_price
             if clearing_price > 0.1 and committed > self.MIN_BID_BALANCING_MW:
                 ratio = agent_bid_price / clearing_price  # <1 = cheap, >1 = expensive
                 # I use logistic function: p = 1 / (1 + exp(k*(ratio - 1)))
                 # k=10 gives smooth transition: 0.73→1.00 ratio maps to 95%→50% prob
                 selection_prob = 1.0 / (1.0 + np.exp(10.0 * (ratio - 1.0)))
+                result['selection_prob'] = selection_prob
                 env.is_selected_for_afrr = np.random.random() < selection_prob
             else:
                 env.is_selected_for_afrr = False
@@ -526,47 +529,123 @@ class BatteryEnvUnifiedSAC(gym.Env):
     # ─── Penalty computation ──────────────────────────────────────
 
     def _compute_penalty(self, d: dict, row=None) -> float:
-        """I compute soft constraint penalties + XBID buy incentive."""
+        """I compute soft constraint penalties.
+
+        With inventory mark-to-market in the reward, I no longer need aggressive
+        SoC penalties. The inventory cost naturally penalizes draining the battery
+        without replenishing. I only keep:
+        1. Hard margin penalty — safety near physical limits (5%/95%)
+        2. Cycle excess — battery degradation above 5 cycles/day
+        """
         penalty = 0.0
         soc = self._inner.soc
 
-        # FIX 3a: STRONGER SoC penalty below 20% (agent drains battery too much)
-        if soc < 0.20:
-            # I heavily penalize being below 20% — battery needs energy to sell later
-            low_soc_severity = (0.20 - soc) / 0.15  # 0 at 20%, 1 at 5%
-            penalty += 100.0 * low_soc_severity ** 2  # Quadratic, up to 100 EUR
-
-        # Standard margin penalties (near 5% or 95%)
+        # Hard margin penalty: I penalize being very close to physical limits
+        # This prevents the agent from hitting the 5%/95% hard stops
         margin = 0.05
-        net_discharge = max(0, d.get('xbid_mw', 0))
-        discharge_intensity = net_discharge / self._max_power
-
-        if soc < self._min_soc + margin and discharge_intensity > 0:
+        if soc < self._min_soc + margin:
             proximity = np.clip(1.0 - (soc - self._min_soc) / margin, 0, 1)
-            penalty += self.penalties['soc_soft_margin'] * proximity * discharge_intensity
+            penalty += 30.0 * proximity  # Gentle 30 EUR max, not action-dependent
 
-        # Cycle excess
+        if soc > self._max_soc - margin:
+            proximity = np.clip(1.0 - (self._max_soc - soc) / margin, 0, 1)
+            penalty += 30.0 * proximity  # Symmetric for overcharge
+
+        # Cycle excess: I penalize excessive cycling (degradation)
         if self._inner.daily_cycles > self.CYCLE_TARGET:
             excess = self._inner.daily_cycles - self.CYCLE_TARGET
             penalty += self.penalties['cycle_excess'] * (excess ** 1.5)
 
-        # FIX 3b: XBID buy incentive — bonus (negative penalty) for buying cheap
-        if row is not None and d.get('xbid_mw', 0) < -0.5:
-            price = row.get('price', 100)
-            mean_24h = row.get('price_mean_24h', price)
-            if price < mean_24h * 0.85:
-                # I reward buying when price is 15%+ below daily mean
-                buy_bonus = 5.0 * (mean_24h - price) / max(mean_24h, 1.0)
-                penalty -= buy_bonus  # Negative penalty = bonus
-
         return penalty
+
+    # ─── Focused Observation ─────────────────────────────────────
+
+    def _build_sac_observation(self) -> np.ndarray:
+        """I build a focused 20-feature observation for SAC intraday decisions.
+
+        The agent sees ONLY what matters for aFRR + XBID:
+        1. Battery state (SoC, available capacity)
+        2. Locked schedule context (what DAM+IDA committed for next hours)
+        3. Real-time market signals (prices, spreads, imbalance)
+        4. Time encoding
+        """
+        env = self._inner
+        row = env.df.iloc[env.current_step]
+        ts = env.df.index[env.current_step]
+        sph = env._sph
+
+        obs = np.zeros(self.N_OBS, dtype=np.float32)
+        fi = 0
+
+        # 1. Battery state (2)
+        obs[fi] = env.soc                                         # 0: current SoC [0-1]
+        obs[fi+1] = env.daily_cycles / max(self.CYCLE_TARGET, 1)  # 1: cycle budget used [0-1+]
+        fi += 2
+
+        # 2. Available capacity (2) — how much room for aFRR/XBID
+        dam_commitment = env._get_dam_commitment(env.current_step)
+        remaining = max(0, self._max_power - abs(dam_commitment))
+        obs[fi] = remaining / self._max_power                     # 2: available capacity fraction
+        obs[fi+1] = dam_commitment / self._max_power              # 3: DAM commitment direction
+        fi += 2
+
+        # 3. Locked schedule lookahead (4) — next 4 slots summary
+        schedule_next = np.zeros(4)
+        for i in range(4):
+            step = env.current_step + i
+            if step < len(env.df):
+                schedule_next[i] = env._get_dam_commitment(step)
+        obs[fi] = np.mean(schedule_next) / self._max_power        # 4: mean next-1h commitment
+        obs[fi+1] = np.max(schedule_next) / self._max_power       # 5: max commitment
+        obs[fi+2] = np.min(schedule_next) / self._max_power       # 6: min commitment
+        obs[fi+3] = (np.max(schedule_next) - np.min(schedule_next)) / self._max_power  # 7: variability
+        fi += 4
+
+        # 4. SoC headroom (2) — how much I can buy/sell before hitting limits
+        discharge_mwh = (env.soc - self._min_soc) * self._capacity
+        charge_mwh = (self._max_soc - env.soc) * self._capacity
+        obs[fi] = discharge_mwh / self._capacity                  # 8: discharge headroom
+        obs[fi+1] = charge_mwh / self._capacity                  # 9: charge headroom
+        fi += 2
+
+        # 5. Real-time market prices (4)
+        dam_price = row.get('price', 100)
+        obs[fi] = dam_price / 200.0                               # 10: current DAM price
+        xbid_bid = row.get('xbid_price_bid', dam_price - 1.5)
+        xbid_ask = row.get('xbid_price_ask', dam_price + 1.5)
+        obs[fi+1] = xbid_bid / 200.0                             # 11: XBID bid (sell price)
+        obs[fi+2] = xbid_ask / 200.0                             # 12: XBID ask (buy price)
+        obs[fi+3] = (xbid_bid - xbid_ask) / 50.0                 # 13: XBID spread (negative)
+        fi += 4
+
+        # 6. aFRR market (2)
+        obs[fi] = row.get('afrr_cap_up_price', 20) / 200.0       # 14: aFRR cap price
+        obs[fi+1] = env.afrr_commitment_mw / self._max_power     # 15: current aFRR commitment
+        fi += 2
+
+        # 7. System state (2)
+        obs[fi] = row.get('net_imbalance_mw', 0) / 500.0         # 16: system imbalance
+        obs[fi+1] = row.get('imbalance_price', dam_price) / 200.0  # 17: imbalance price
+        fi += 2
+
+        # 8. Time encoding (2)
+        hour = ts.hour + ts.minute / 60.0
+        obs[fi] = np.sin(2 * np.pi * hour / 24)                  # 18: hour sin
+        obs[fi+1] = np.cos(2 * np.pi * hour / 24)                # 19: hour cos
+        fi += 2
+
+        obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
+        return obs
 
     # ─── Main step ────────────────────────────────────────────────
 
     def reset(self, seed=None, options=None):
-        """I delegate reset to inner env."""
+        """I delegate reset to inner env and build focused observation."""
         self._inner._xbid_price_offset = 0.0
-        obs, info = self._inner.reset(seed=seed, options=options)
+        _, info = self._inner.reset(seed=seed, options=options)
+        # I trigger day reset to generate DAM schedule via LP optimizer
+        self._inner._check_day_reset()
+        obs = self._build_sac_observation()
         return obs, info
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
@@ -581,19 +660,16 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
         This ensures energy balance: energy_in - energy_out = SoC_change × capacity
         """
-        # I decode agent's decisions (daily DAM + intraday aFRR/XBID)
+        # I save raw action for logging before any transformation
+        raw_action = np.clip(action, -1.0, 1.0).copy()
+
+        # I decode agent's INTRADAY decisions only (aFRR + XBID)
         decoded = self._decode_action(action)
         decoded = self._enforce_constraints(decoded)
 
-        # I store daily actions for DAM schedule generation
-        self._last_daily_action = decoded
-
-        # I check day boundary (resets daily state, generates DAM schedule)
+        # I check day boundary (resets daily state, generates DAM schedule via LP optimizer)
+        # DAM schedule is LOCKED — the agent does NOT override it
         self._inner._check_day_reset()
-
-        # AGENT-CONTROLLED DAM: I override the optimizer schedule with agent's choice
-        # The agent decides charge/discharge block timing via daily actions [D0-D3]
-        self._apply_agent_dam_schedule(decoded)
 
         # I get current market data
         row = self._inner.df.iloc[self._inner.current_step]
@@ -668,11 +744,14 @@ class BatteryEnvUnifiedSAC(gym.Env):
         xbid_price_info = self._determine_xbid_price(xbid_mw, decoded['xbid_price_offset'], row)
 
         # I model XBID fill probability (continuous market, not guaranteed)
+        xbid_fill_prob = 0.0
+        xbid_bid_price = row.get('xbid_price_bid', row.get('price', 100.0) - 1.5)
+        xbid_ask_price = row.get('xbid_price_ask', row.get('price', 100.0) + 1.5)
         if abs(xbid_mw) > 0.1:
-            xbid_mid = (row.get('xbid_price_bid', 98.0) + row.get('xbid_price_ask', 102.0)) / 2
+            xbid_mid = (xbid_bid_price + xbid_ask_price) / 2
             price_distance = abs(xbid_price_info['price'] - xbid_mid)
-            fill_prob = np.clip(0.95 - price_distance * 0.02, 0.05, 0.95)
-            if np.random.random() > fill_prob:
+            xbid_fill_prob = np.clip(0.95 - price_distance * 0.02, 0.05, 0.95)
+            if np.random.random() > xbid_fill_prob:
                 xbid_mw = 0.0  # Order not filled
 
         # ── Phase 2: Calculate NET physical MW (already capacity-constrained) ──
@@ -681,6 +760,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
 
         # ── Phase 3: Single SoC update ──
 
+        soc_before = self._inner.soc  # I save SoC before execution for inventory marking
         actual_energy, soc_delta = self._execute_energy(net_mw)
 
         # I track cycles from the SINGLE net SoC change (no double-counting)
@@ -693,6 +773,26 @@ class BatteryEnvUnifiedSAC(gym.Env):
             self._inner.intraday_mwh_sold += abs(actual_energy)
         elif net_mw < -0.1:
             self._inner.intraday_mwh_bought += abs(actual_energy)
+
+        # ── Phase 3.5: Delivery check — imbalance penalty for undelivered energy ──
+        # I compare committed net energy vs actually delivered energy.
+        # In real Greek market (ADMIE), shortfall = buy replacement at imbalance price.
+        # Without this, the agent can commit to sell when SoC=5% and book phantom revenue.
+        committed_energy_mwh = abs(net_mw) * self._time_step
+        actual_energy_mwh = abs(actual_energy)
+        shortfall_mwh = max(0.0, committed_energy_mwh - actual_energy_mwh)
+
+        imbalance_cost = 0.0
+        if shortfall_mwh > 0.01:
+            imb_price = row.get('imbalance_price', dam['dam_price'])
+            # I use max(imbalance, DAM) — short party always pays at least DAM price
+            imbalance_cost = shortfall_mwh * max(imb_price, dam['dam_price'])
+
+        # I compute delivery ratio for per-market actual allocation
+        if abs(net_mw) > 0.1 and committed_energy_mwh > 0.01:
+            delivery_ratio = np.clip(actual_energy_mwh / committed_energy_mwh, 0.0, 1.0)
+        else:
+            delivery_ratio = 1.0
 
         # ── Phase 4: Financial settlement per market ──
         # Each market is settled at its committed MW × its price × time_step
@@ -708,18 +808,27 @@ class BatteryEnvUnifiedSAC(gym.Env):
             mfrr_revenue = mfrr_mw * mfrr['mfrr_price'] * self._time_step
         afrr_cap_revenue = afrr['afrr_capacity_revenue']
 
-        # IDA revenue: settled at clearing prices from data
+        # IDA revenue: settled at clearing prices from data (per-gate breakdown)
         ida_revenue = 0.0
-        if abs(ida_mw) > 0.1:
-            # I compute revenue from each IDA auction's clearing price
-            step_offset = self._inner._step_day_offset[self._inner.current_step]
-            for ida_num, sched_attr in [(1, 'ida1_schedule'), (2, 'ida2_schedule'), (3, 'ida3_schedule')]:
-                sched = getattr(self._inner, sched_attr, None)
-                if sched is not None and step_offset < len(sched):
-                    pos = float(sched[step_offset])
-                    if abs(pos) > 0.1:
-                        clearing = row.get(f'ida{ida_num}_clearing_price', row.get('price', 100.0))
-                        ida_revenue += pos * clearing * self._time_step
+        ida1_step_revenue = 0.0
+        ida2_step_revenue = 0.0
+        ida1_step_mw = 0.0
+        ida2_step_mw = 0.0
+        step_offset = self._inner._step_day_offset[self._inner.current_step]
+        for ida_num, sched_attr in [(1, 'ida1_schedule'), (2, 'ida2_schedule'), (3, 'ida3_schedule')]:
+            sched = getattr(self._inner, sched_attr, None)
+            if sched is not None and step_offset < len(sched):
+                pos = float(sched[step_offset])
+                if abs(pos) > 0.1:
+                    clearing = row.get(f'ida{ida_num}_clearing_price', row.get('price', 100.0))
+                    rev = pos * clearing * self._time_step
+                    ida_revenue += rev
+                    if ida_num == 1:
+                        ida1_step_revenue = rev
+                        ida1_step_mw = pos
+                    elif ida_num == 2:
+                        ida2_step_revenue = rev
+                        ida2_step_mw = pos
 
         # Availability contract: I track for accounting but EXCLUDE from RL reward
         # It's a constant +99 EUR/step regardless of agent action — adds no learning signal
@@ -757,8 +866,21 @@ class BatteryEnvUnifiedSAC(gym.Env):
         calendar_aging = (self.CALENDAR_AGING_BASE_EUR_PER_STEP +
                          self.CALENDAR_AGING_SOC_PENALTY_FACTOR * soc_deviation ** 2)
 
+        # I apply inventory mark-to-market: the SoC change has a VALUE.
+        # Without this, the agent treats initial stored energy as "free" and just drains it.
+        # A real trader accounts for the cost basis of stored energy:
+        #   - Selling 7.5 MWh at 150 EUR → revenue = 1,125 EUR
+        #   - But the battery LOST 7.5 MWh worth reference_price each → cost = 750 EUR
+        #   - Real profit = 375 EUR (the SPREAD, not the gross sale)
+        # Over a full charge→discharge cycle this nets to zero (correct!).
+        # Only draining SoC without replenishing creates a real "inventory cost".
+        soc_after = self._inner.soc
+        soc_change = soc_after - soc_before  # negative = discharged
+        reference_price = row.get('price_mean_24h', row.get('price', 100.0))
+        inventory_cost = -soc_change * self._capacity * reference_price  # positive when SoC drops
+
         # I compute net profit for this step (FULL accounting, all markets)
-        step_profit = total_revenue - deg_cost - network_cost - calendar_aging
+        step_profit = total_revenue - deg_cost - network_cost - calendar_aging - inventory_cost - imbalance_cost
         full_net_profit = step_profit
 
         # ── Phase 5: Build reward ──
@@ -800,7 +922,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
             time_step_hours=self._time_step,
             intraday_energy_mw=xbid_mw,
             mfrr_energy_mw=mfrr_mw,
-            dam_executed_mw=dam_mw,
+            dam_executed_mw=dam_mw * delivery_ratio,  # I pass actual delivery, not committed
             afrr_max_deliverable_mw=min(
                 self._inner.afrr_commitment_mw,
                 (self._inner.soc - self._min_soc) * self._capacity * self._eff_sqrt / self._time_step
@@ -843,15 +965,9 @@ class BatteryEnvUnifiedSAC(gym.Env):
         truncated = self._inner.current_step >= len(self._inner.df) - 2
 
         if not (terminated or truncated):
-            obs = self._inner._obs_builder.build()
-            # FIX 4: I add small noise to observations during TRAINING
-            # This prevents the agent from memorizing exact price patterns
-            # and forces it to learn robust strategies
-            if self._inner.np_random is not None:
-                obs_noise = self._inner.np_random.normal(0, 0.01, size=obs.shape)
-                obs = obs + obs_noise.astype(np.float32)
+            obs = self._build_sac_observation()
         else:
-            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+            obs = np.zeros(self.N_OBS, dtype=np.float32)
 
         # ── Phase 8: Info dict ──
 
@@ -872,12 +988,24 @@ class BatteryEnvUnifiedSAC(gym.Env):
             # State
             'timestamp': step_ts,
             'soc': self._inner.soc,
+            'soc_before': soc_before,
             'dam_price': row.get('price', 0),
             'predicted_price': predicted_price,
+            'price_mean_24h': reference_price,
 
-            # Agent decisions
+            # Raw agent action (before decode/constraints)
+            'raw_action_0_afrr_commit': float(raw_action[0]),
+            'raw_action_1_afrr_price': float(raw_action[1]),
+            'raw_action_2_xbid_qty': float(raw_action[2]),
+            'raw_action_3_xbid_price': float(raw_action[3]),
+
+            # Agent decisions (after decode + constraints)
             'dam_commitment_mw': dam_mw,
             'ida_mw': ida_mw,
+            'ida1_mw': ida1_step_mw,
+            'ida2_mw': ida2_step_mw,
+            'ida1_locked': self._inner.ida1_locked_today,
+            'ida2_locked': self._inner.ida2_locked_today,
             'afrr_commitment_mw': afrr.get('afrr_commitment_mw', 0),
             'afrr_energy_mw': afrr_energy_mw,
             'xbid_mw': xbid_mw,
@@ -885,15 +1013,25 @@ class BatteryEnvUnifiedSAC(gym.Env):
             'mfrr_auto_mw': mfrr_mw,
             'net_mw': net_mw,
 
-            # Daily actions
-            'charge_block_start': decoded.get('charge_block_start', 0),
-            'discharge_block_start': decoded.get('discharge_block_start', 0),
-            'second_cycle': decoded.get('second_cycle', 0),
-            'aggressiveness': decoded.get('aggressiveness', 0),
+            # DAM is LP-controlled (not agent)
+            'dam_source': 'lp_optimizer',
+
+            # Market conditions (what the agent saw/faced)
+            'xbid_bid_price': xbid_bid_price,
+            'xbid_ask_price': xbid_ask_price,
+            'xbid_exec_price': xbid_price_info['price'],
+            'xbid_fill_prob': xbid_fill_prob,
+            'afrr_clearing_price': afrr.get('clearing_price', 0),
+            'afrr_selection_prob': afrr.get('selection_prob', 0),
+            'afrr_is_selected': afrr.get('is_selected', False),
+            'afrr_is_activated': afrr.get('is_activated', False),
+            'mfrr_activated': mfrr.get('activated', False),
 
             # Financial
             'step_dam_revenue': dam_revenue,
             'step_ida_revenue': ida_revenue,
+            'step_ida1_revenue': ida1_step_revenue,
+            'step_ida2_revenue': ida2_step_revenue,
             'step_afrr_cap_revenue': afrr_cap_revenue,
             'step_afrr_energy_revenue': afrr_energy_revenue,
             'step_xbid_revenue': xbid_revenue,
@@ -902,7 +1040,11 @@ class BatteryEnvUnifiedSAC(gym.Env):
             'step_degradation': deg_cost,
             'step_network_cost': network_cost,
             'step_calendar_aging': calendar_aging,
+            'step_inventory_cost': inventory_cost,
             'step_availability_revenue': availability_revenue,
+            'step_imbalance_cost': imbalance_cost,
+            'delivery_ratio': delivery_ratio,
+            'shortfall_mwh': shortfall_mwh,
             'step_profit': step_profit,
             'reward': reward,
 
