@@ -177,12 +177,12 @@ class EntsoE3PriceForecaster:
                 encoder_gas = np.full(encoder_hours, 35.0)
 
             # I extract neighbor DAM prices for target_date (D+1)
-            # Serbia D+1 is available, others use today
+            # Serbia D+1: I read ORIGINAL dam_price_rs at target_start (T+24h)
+            # NOT the _d1 shifted column (that would be D+2!)
             target_start = current_step + 24 * sph  # 24h ahead = tomorrow
             neighbor_rs = np.array([float(df.iloc[min(target_start + h * sph, len(df)-1)].get(
-                'dam_price_rs_d1', df.iloc[min(target_start + h * sph, len(df)-1)].get(
-                    'dam_price_rs', df.iloc[min(target_start + h * sph, len(df)-1)].get(
-                        'serbia_dam_price', 80.0))))
+                'dam_price_rs', df.iloc[min(target_start + h * sph, len(df)-1)].get(
+                    'serbia_dam_price', 80.0)))
                 for h in range(24)])
 
             # Other neighbors: TODAY prices

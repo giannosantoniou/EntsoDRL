@@ -65,8 +65,11 @@ class ObservationBuilder:
         if env.enable_full_market:
             self._add_full_market_features(features, env, row, ts)
 
-        # Group 10c: EntsoE3 Price Intelligence (31 features, if available)
-        if hasattr(env, '_entsoe3_forecaster') and env._entsoe3_forecaster is not None:
+        # Group 10c: Raw Market Intelligence (51 features: Serbia D+1 + Bulgaria + Gas)
+        # I use RAW data directly instead of XGBoost predictions
+        if 'serbia_d1_h00' in env.df.columns:
+            self._add_raw_market_intelligence(features, env, row, ts)
+        elif hasattr(env, '_entsoe3_forecaster') and env._entsoe3_forecaster is not None:
             self._add_entsoe3_features(features, env, row, ts)
 
         # I validate and clean
@@ -78,7 +81,9 @@ class ObservationBuilder:
             expected_features += 20
         if env.enable_full_market:
             expected_features += 13
-        if hasattr(env, '_entsoe3_forecaster') and env._entsoe3_forecaster is not None:
+        if 'serbia_d1_h00' in env.df.columns:
+            expected_features += 51  # 24 Serbia D+1 + 24 Bulgaria + 3 gas
+        elif hasattr(env, '_entsoe3_forecaster') and env._entsoe3_forecaster is not None:
             expected_features += 31
         assert len(obs) == expected_features, f"Expected {expected_features} features, got {len(obs)}"
 
@@ -555,6 +560,32 @@ class ObservationBuilder:
 
         # ISP Cascade Quality (1 feature)
         features.append(row.get('isp_cascade_spread_up_lag_24h', 0.0) / 100.0)
+
+    def _add_raw_market_intelligence(self, features, env, row, ts):
+        """Group 10c: Raw Market Intelligence (51 features).
+
+        I give the agent DIRECT access to:
+        - Serbia D+1 prices (24h) — THE key signal (0.90 correlation)
+        - Bulgaria today prices (24h) — regional context
+        - TTF gas price + trends (3) — generation cost signal
+
+        No XGBoost middleman — the agent sees raw data and learns directly.
+        """
+        # Serbia D+1: 24 hourly prices for tomorrow (normalized by /200)
+        for h in range(24):
+            val = row.get(f'serbia_d1_h{h:02d}', 0)
+            features.append(val / 200.0 if val > 1.0 else 0.0)
+
+        # Bulgaria today: 24 hourly prices (normalized by /200)
+        for h in range(24):
+            val = row.get(f'bulgaria_h{h:02d}', 0)
+            features.append(val / 200.0 if val > 1.0 else 0.0)
+
+        # TTF gas: price + 24h change + 7d change
+        gas = row.get('ttf_gas_price', 0)
+        features.append(gas / 100.0 if gas > 1.0 else 0.35)
+        features.append(row.get('ttf_gas_change_24h', 0) / 50.0)
+        features.append(row.get('ttf_gas_change_7d', 0) / 50.0)
 
     def _add_entsoe3_features(self, features, env, row, ts):
         """Group 10c: EntsoE3 Price Intelligence (31 features).

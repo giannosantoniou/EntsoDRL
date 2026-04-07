@@ -494,16 +494,21 @@ def train_sac_unified(
         )
         # I add ent_coef only for SAC (TD3 uses deterministic policy + noise)
         if algorithm.upper() == "SAC":
-            # I use auto with minimum floor to prevent entropy collapse
-            # "auto_0.05" means: auto-tune but NEVER go below 0.05
-            algo_kwargs["ent_coef"] = "auto_0.05"
+            # I start ent_coef at 1.0 (high exploration) and let SAC auto-tune it
+            # "auto_X" in SB3 sets INITIAL value, NOT a floor — it can drop freely
+            algo_kwargs["ent_coef"] = "auto_1.0"
+            # I set target_entropy to -dim(A)/4 for sustained exploration
+            # History: -dim(A) collapsed, -dim(A)/2 dropped too fast (0.87→0.24 in 1%)
+            # -dim(A)/4 = -1.0 for 4D: maintains ~0.3-0.5 ent_coef throughout training
+            n_act = train_env.action_space.shape[-1]
+            algo_kwargs["target_entropy"] = -float(n_act) / 4.0
         else:
             # TD3: I add Gaussian exploration noise (was missing entirely!)
             from stable_baselines3.common.noise import NormalActionNoise
             n_actions = train_env.action_space.shape[-1]
             algo_kwargs["action_noise"] = NormalActionNoise(
                 mean=np.zeros(n_actions),
-                sigma=0.2 * np.ones(n_actions)  # 20% noise on each action
+                sigma=0.3 * np.ones(n_actions)  # 30% noise for 8D action space
             )
 
         model = algo_class(**algo_kwargs)

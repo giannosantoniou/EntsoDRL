@@ -62,6 +62,7 @@ class BatteryRenderer:
 
         # I keep history for charts
         self.price_history: List[float] = []
+        self.forecast_history: List[float] = []  # I store DAM forecast prices
         self.soc_history: List[float] = []
         self.profit_history: List[float] = []
         self.action_history: List[float] = []  # net_mw
@@ -111,6 +112,7 @@ class BatteryRenderer:
                         self.step_backward = True
                 elif event.key == pygame.K_r:
                     self.price_history.clear()
+                    self.forecast_history.clear()
                     self.soc_history.clear()
                     self.profit_history.clear()
                     self.action_history.clear()
@@ -154,8 +156,11 @@ class BatteryRenderer:
                         self._replay_idx = None  # I caught up, need new step
                 return True  # I need env.step for fresh data
             else:
-                # I just re-draw current frame while paused
-                if self._current_info is not None:
+                # I re-draw current frame while paused
+                # If I am in replay mode, I use the replay position, not live
+                if self._replay_idx is not None and self._info_history:
+                    self._draw_frame(self._info_history[self._replay_idx])
+                elif self._current_info is not None:
                     self._draw_frame(self._current_info)
             self.clock.tick(30)
             return False
@@ -175,12 +180,15 @@ class BatteryRenderer:
 
         # I update chart histories
         self.price_history.append(info.get('dam_price', 100))
+        self.forecast_history.append(info.get('predicted_price', info.get('dam_price', 100)))
         self.soc_history.append(info.get('soc', 0.5))
         self.profit_history.append(info.get('total_profit', 0))
         self.action_history.append(info.get('net_mw', 0))
 
         if len(self.price_history) > self.max_history:
             self.price_history.pop(0)
+        if len(self.forecast_history) > self.max_history:
+            self.forecast_history.pop(0)
             self.soc_history.pop(0)
             self.profit_history.pop(0)
             self.action_history.pop(0)
@@ -333,6 +341,13 @@ class BatteryRenderer:
         title = self.font_medium.render("DAM PRICE (EUR/MWh)", True, WHITE)
         self.screen.blit(title, (chart_x + 10, chart_y + 5))
 
+        # I draw legend: actual (cyan) vs forecast (orange)
+        legend_x = chart_x + chart_w - 200
+        pygame.draw.line(self.screen, CYAN, (legend_x, chart_y + 12), (legend_x + 20, chart_y + 12), 2)
+        self.screen.blit(self.font_tiny.render("Actual", True, CYAN), (legend_x + 25, chart_y + 6))
+        pygame.draw.line(self.screen, ORANGE, (legend_x + 80, chart_y + 12), (legend_x + 100, chart_y + 12), 1)
+        self.screen.blit(self.font_tiny.render("Forecast", True, ORANGE), (legend_x + 105, chart_y + 6))
+
         if len(self.price_history) < 2:
             return
 
@@ -370,6 +385,22 @@ class BatteryRenderer:
 
         if len(points) >= 2:
             pygame.draw.lines(self.screen, CYAN, False, points, 2)
+
+        # I draw forecast line (dashed orange) if available
+        if len(self.forecast_history) >= 2:
+            forecast_points = []
+            for i, fp in enumerate(self.forecast_history):
+                if i < n:
+                    x = cx + int(i / max(n - 1, 1) * cw)
+                    y = cy + ch - int((fp - p_min) / p_range * ch)
+                    y = max(cy, min(cy + ch, y))
+                    forecast_points.append((x, y))
+            # I draw dashed line by drawing segments with gaps
+            if len(forecast_points) >= 2:
+                for i in range(0, len(forecast_points) - 1, 2):
+                    end = min(i + 1, len(forecast_points) - 1)
+                    pygame.draw.line(self.screen, ORANGE,
+                                     forecast_points[i], forecast_points[end], 1)
 
         # I draw current position dot (replay-aware)
         # During replay, I highlight the replay position; otherwise the last point

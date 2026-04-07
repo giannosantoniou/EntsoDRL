@@ -645,6 +645,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
         _, info = self._inner.reset(seed=seed, options=options)
         # I trigger day reset to generate DAM schedule via LP optimizer
         self._inner._check_day_reset()
+        self._initial_soc = self._inner.soc  # I save for end-of-episode settlement
         obs = self._build_sac_observation()
         return obs, info
 
@@ -874,13 +875,15 @@ class BatteryEnvUnifiedSAC(gym.Env):
         #   - Real profit = 375 EUR (the SPREAD, not the gross sale)
         # Over a full charge→discharge cycle this nets to zero (correct!).
         # Only draining SoC without replenishing creates a real "inventory cost".
-        soc_after = self._inner.soc
-        soc_change = soc_after - soc_before  # negative = discharged
-        reference_price = row.get('price_mean_24h', row.get('price', 100.0))
-        inventory_cost = -soc_change * self._capacity * reference_price  # positive when SoC drops
+        # I apply per-market energy cost: XBID energy is valued at DAM price
+        # This means XBID profit = (XBID_price - DAM_price) × MW × dt (spread only)
+        # The agent can't profit from just selling — must find XBID > DAM
+        # DAM revenue is already correctly buy/sell at DAM price (no adjustment needed)
+        dam_price_now = dam['dam_price']
+        xbid_energy_cost = xbid_mw * dam_price_now * self._time_step  # Same sign as revenue
 
         # I compute net profit for this step (FULL accounting, all markets)
-        step_profit = total_revenue - deg_cost - network_cost - calendar_aging - inventory_cost - imbalance_cost
+        step_profit = total_revenue - xbid_energy_cost - deg_cost - network_cost - calendar_aging - imbalance_cost
         full_net_profit = step_profit
 
         # ── Phase 5: Build reward ──
@@ -991,7 +994,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
             'soc_before': soc_before,
             'dam_price': row.get('price', 0),
             'predicted_price': predicted_price,
-            'price_mean_24h': reference_price,
+            'price_mean_24h': row.get('price_mean_24h', row.get('price', 100)),
 
             # Raw agent action (before decode/constraints)
             'raw_action_0_afrr_commit': float(raw_action[0]),
@@ -1040,7 +1043,7 @@ class BatteryEnvUnifiedSAC(gym.Env):
             'step_degradation': deg_cost,
             'step_network_cost': network_cost,
             'step_calendar_aging': calendar_aging,
-            'step_inventory_cost': inventory_cost,
+            'step_xbid_energy_cost': xbid_energy_cost,
             'step_availability_revenue': availability_revenue,
             'step_imbalance_cost': imbalance_cost,
             'delivery_ratio': delivery_ratio,

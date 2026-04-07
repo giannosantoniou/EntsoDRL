@@ -207,13 +207,10 @@ class BatteryEnvUnified(gym.Env):
                 max_soc=max_soc,
                 time_step_hours=time_step_hours,
             )
-            self._dam_bid_simulator = DamBidSimulator(
-                max_power_mw=max_power_mw,
-                capacity_mwh=capacity_mwh,
-                efficiency=efficiency,
-                min_soc=min_soc,
-                max_soc=max_soc,
-            )
+            # I skip DamBidSimulator — LP optimizer schedule is used directly.
+            # Our 30MW BESS is a price-taker in a 5,000MW market: ~100% acceptance.
+            # The EUPHEMIA simulator was overwriting LP results with zeros (bug).
+            self._dam_bid_simulator = None
         else:
             self._dam_optimizer = None
             self._dam_bid_simulator = None
@@ -389,7 +386,11 @@ class BatteryEnvUnified(gym.Env):
             n_obs += 20  # DAM+ID+Imbalance forecast + ISP cascade features (Group 10b)
         if self.enable_full_market:
             n_obs += 13  # IDA/XBID/FreeBid features + ISP1-DAM spread
-        if hasattr(self, '_entsoe3_forecaster') and self._entsoe3_forecaster is not None:
+        # I check for raw market intelligence columns (Serbia D+1, Bulgaria, gas)
+        # Raw data takes precedence over XGBoost predictions
+        if 'serbia_d1_h00' in self.df.columns:
+            n_obs += 51  # 24 Serbia D+1 + 24 Bulgaria + 3 gas features
+        elif hasattr(self, '_entsoe3_forecaster') and self._entsoe3_forecaster is not None:
             n_obs += 31  # EntsoE3 24h predictions + derived features
 
         self.observation_space = spaces.Box(
@@ -586,6 +587,10 @@ class BatteryEnvUnified(gym.Env):
             try:
                 hourly = self._entsoe3_forecaster.predict(self.df, self.current_step, self._sph)
                 if hourly is not None and len(hourly) == 24:
+                    # I cache the forecast for visualization (predicted vs actual)
+                    if not hasattr(self, '_entsoe3_daily_cache'):
+                        self._entsoe3_daily_cache = {}
+                    self._entsoe3_daily_cache[day_id] = hourly
                     # I expand 24h → 96 quarter-hourly (or match n_slots)
                     forecast_96 = self._entsoe3_forecaster.expand_to_quarter_hourly(hourly)
                     return np.maximum(5.0, forecast_96[:length])
